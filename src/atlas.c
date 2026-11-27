@@ -683,19 +683,28 @@ int cmd_atlas_audit(int argc, char **argv) {
 }
 
 /* ---------------------------------------------------------------------------------------------------------------------------------
-   ufsm atlas-rvscore --rv ROOT KEY ...: a predicted recto / verso volume (predict --channel rv: 1 + 254 (1 + p_recto - p_verso) / 2, 0 = CT 0)
-   scored on the CPU (2026-11-27, atlas: the A/B score while scripts/rv/eval.sh's count fields are gone). Two modes, one or both:
-   - GT box: --box z,y,x,nz,ny,nx (voxels of the rv array) --phase ROOT KEY [--phase-div S] --ct ROOT KEY [--iso 64]: over the box's papyrus
-     (CT >= iso) whose GT phase is known (PHASE_* codes, phase voxel = S rv voxels), GT recto = phase < 126; predicted recto = rv > 128.
-     Prints recto recall, verso recall and their mean (balanced side accuracy).
-   - ATLAS patches: --patches INDEX.tsv --ids FILE --axis AXIS.json [--rv-div D] [--d 2] [--every 2]: the patches named in FILE (first
-     column; e.g. those inside an eval slab, never trained), every --every-th node: the grid normal oriented away from the axis, rv sampled at
-     the node +- d voxels along it (rv voxel = D level-0 voxels). The recto face's outer side should read recto (> 128), its inner side not.
-     Prints the node shares: outer recto, inner verso, both, and the mean outer - inner rv. Nodes outside the rv array or on CT 0 (rv 0)
-     are skipped and counted. */
-typedef struct { z3 *z; int64_t o[3], n[3]; uint8_t *buf; } rs_vol;
+   ufsm atlas-rvscore: a prediction scored on the CPU against GT boxes and held ATLAS patches (2026-11-27, atlas: the recto-detection A/B
+   while scripts/rv/eval.sh's count fields are gone; our rv heads and atlas-mini-h in one table). The prediction is one of
+   - --rv ROOT KEY: a recto / verso volume (predict --heads rv: 1 + 254 (1 + p_recto - p_verso) / 2, 0 = CT 0). Its surface is the recto
+     face: a recto voxel (> 128) whose neighbour --face-d (2) voxels towards the axis reads verso (1..128). Needs --axis (level-0 voxels;
+     --axis-div D = level-0 voxels per prediction voxel).
+   - --prob FILE.npy --prob-origin z,y,x: a uint8 surface probability (x 255) on the prediction grid (atlas-mini-h); its surface is
+     p >= t, for t in --thr (0.1..0.9; the best F1 is reported, patches at --patch-thr 0.5).
+   Box mode (--box z,y,x,nz,ny,nx, prediction-grid voxels), over the box voxels whose GT phase is known (--phase ROOT KEY, phase voxel =
+   --phase-div prediction voxels; PHASE_* codes, 255 unknown):
+   - side (--rv, with --ct ROOT KEY [--iso 64]): on papyrus, GT recto = phase < 126, predicted recto = rv > 128: recto / verso recall, mean.
+   - F1 (with --codes ROOT KEY --codes-scale S, S = codes voxel / prediction voxel: 0.5, 1 or 2): GT sheet = winding code != 0 (a
+     prediction voxel is sheet when any of its codes children is). P2 = share of predicted surface voxels within 2 voxels of a GT sheet
+     voxel, R2 = share of GT sheet voxels within 2 voxels of the predicted surface, F2 their harmonic mean (distances over the box +- 16:
+     atlas-mini-h's score.py rule, here on the prediction grid for every scan).
+   Patch mode (--patches INDEX.tsv --ids FILE --axis AXIS.json [--rv-div D] [--every 2]): every --every-th node of the named patches
+   (never trained: e.g. inside an eval slab), the grid normal oriented away from the axis.
+   - orientation (--rv): rv at node +- --d (2) voxels: the share whose outer side reads recto and inner side not ("both").
+   - recall: the share of nodes with a predicted surface voxel within 2 voxels.
+   Rows (tab-separated, tagged --tag) go to stdout or are appended to --out. */
+typedef struct { z3 *z; int64_t o[3], n[3]; uint8_t *buf; int own; } rs_vol;
 static int rs_load(rs_vol *v, const char *root, const char *key, const int64_t o[3], const int64_t n[3]) {
-    store *st = store_open(root); v->z = st ? z3_open(st, key, nullptr) : nullptr;
+    store *st = store_open(root); v->z = st ? z3_open(st, key, nullptr) : nullptr; v->own = 1;
     if (!v->z) { fprintf(stderr, "atlas-rvscore: cannot open %s %s: %s\n", root, key, z3_error()); return -1; }
     const z3_meta *m = z3_meta_of(v->z); int64_t oo[3], nn[3];
     for (int k = 0; k < 3; k++) { oo[k] = o[k] < 0 ? 0 : o[k]; const int64_t e = o[k] + n[k] > m->shape[k] ? m->shape[k] : o[k] + n[k]; nn[k] = e - oo[k]; if (nn[k] <= 0) { fprintf(stderr, "atlas-rvscore: box outside %s\n", key); return -1; } v->o[k] = oo[k]; v->n[k] = nn[k]; }
@@ -708,50 +717,174 @@ static int rs_at(const rs_vol *v, int64_t z, int64_t y, int64_t x) {
     if (z < 0 || y < 0 || x < 0 || z >= v->n[0] || y >= v->n[1] || x >= v->n[2]) return -1;
     return v->buf[((size_t)z * v->n[1] + y) * v->n[2] + x];
 }
-static void rs_free(rs_vol *v) { free(v->buf); if (v->z) z3_close(v->z); memset(v, 0, sizeof *v); }
+static void rs_free(rs_vol *v) { if (v->own) free(v->buf); if (v->z) z3_close(v->z); memset(v, 0, sizeof *v); }
+/* a C-order uint8 .npy (format 1.x / 2.x, descr |u1, 3-D) */
+static int rs_npy(rs_vol *v, const char *path, const int64_t o[3]) {
+    memset(v, 0, sizeof *v); v->own = 1;
+    FILE *f = fopen(path, "rb"); if (!f) { fprintf(stderr, "atlas-rvscore: cannot read %s\n", path); return -1; }
+    unsigned char h[12]; uint32_t hl = 0; int ok = fread(h, 1, 10, f) == 10 && !memcmp(h, "\x93NUMPY", 6);
+    if (ok && h[6] == 1) hl = h[8] | (uint32_t)h[9] << 8;
+    else if (ok && fread(h + 10, 1, 2, f) == 2) hl = h[8] | (uint32_t)h[9] << 8 | (uint32_t)h[10] << 16 | (uint32_t)h[11] << 24;
+    char *hd = ok && hl < 65536 ? calloc(hl + 1, 1) : nullptr;
+    ok = hd && fread(hd, 1, hl, f) == hl;
+    const char *sp = ok ? strstr(hd, "'shape': (") : nullptr; long long s0, s1, s2;
+    ok = ok && strstr(hd, "'|u1'") && strstr(hd, "'fortran_order': False") && sp && sscanf(sp + 10, "%lld, %lld, %lld", &s0, &s1, &s2) == 3;
+    free(hd);
+    if (!ok) { fprintf(stderr, "atlas-rvscore: %s: not a 3-D C-order uint8 npy\n", path); fclose(f); return -1; }
+    v->n[0] = s0; v->n[1] = s1; v->n[2] = s2; for (int k = 0; k < 3; k++) v->o[k] = o[k];
+    const size_t nv = (size_t)s0 * s1 * s2; v->buf = malloc(nv);
+    ok = v->buf && fread(v->buf, 1, nv, f) == nv; fclose(f);
+    if (!ok) { fprintf(stderr, "atlas-rvscore: %s: short read\n", path); return -1; }
+    return 0;
+}
+/* squared Euclidean distance transform (Felzenszwalb-Huttenlocher) of mask m (1 = target) -> d (voxels, sqrt taken at the end) */
+static void rs_edt1(const double *f, int n, double *d, int *v, double *zz) {
+    int k = 0; v[0] = 0; zz[0] = -INFINITY; zz[1] = INFINITY;
+    for (int q = 1; q < n; q++) {
+        double s = ((f[q] + (double)q * q) - (f[v[k]] + (double)v[k] * v[k])) / (2.0 * (q - v[k]));
+        while (s <= zz[k]) { k--; s = ((f[q] + (double)q * q) - (f[v[k]] + (double)v[k] * v[k])) / (2.0 * (q - v[k])); }
+        k++; v[k] = q; zz[k] = s; zz[k + 1] = INFINITY;
+    }
+    k = 0; for (int q = 0; q < n; q++) { while (zz[k + 1] < q) k++; const double dq = q - v[k]; d[q] = dq * dq + f[v[k]]; }
+}
+static void rs_edt(const uint8_t *m, const int64_t n[3], float *d) {
+    const double BIG = 1e18; const size_t nv = (size_t)n[0] * n[1] * n[2]; const int L = (int)(n[0] > n[1] ? (n[0] > n[2] ? n[0] : n[2]) : (n[1] > n[2] ? n[1] : n[2]));
+    for (size_t i = 0; i < nv; i++) d[i] = m[i] ? 0.0f : (float)BIG;
+    double *f = malloc(L * sizeof *f), *o = malloc(L * sizeof *o), *zz = malloc((L + 1) * sizeof *zz); int *v = malloc(L * sizeof *v);
+    for (int ax = 2; ax >= 0; ax--) {   /* one pass per axis over every line along it */
+        const size_t st = ax == 2 ? 1 : ax == 1 ? (size_t)n[2] : (size_t)n[1] * n[2]; const int len = (int)n[ax];
+        const int64_t na = ax == 0 ? n[1] : n[0], nb = ax == 2 ? n[1] : n[2];
+        for (int64_t a = 0; a < na; a++) for (int64_t b = 0; b < nb; b++) {
+            const size_t base = ax == 0 ? (size_t)a * n[2] + b : ax == 1 ? (size_t)a * n[1] * n[2] + b : ((size_t)a * n[1] + b) * n[2];
+            for (int q = 0; q < len; q++) f[q] = d[base + q * st];
+            rs_edt1(f, len, o, v, zz);
+            for (int q = 0; q < len; q++) d[base + q * st] = (float)o[q];
+        }
+    }
+    for (size_t i = 0; i < nv; i++) d[i] = d[i] >= (float)(BIG * 0.5) ? INFINITY : sqrtf(d[i]);
+    free(f); free(o); free(zz); free(v);
+}
+/* the predicted surface over region (o, n) of the prediction grid: rv recto face (axis) or prob >= t */
+typedef struct { const rs_vol *pv; int isrv, t; const au_axis *ax; double adiv, fd; } rs_pred;
+static int rs_surf(const rs_pred *p, int64_t z, int64_t y, int64_t x) {
+    const int r = rs_at(p->pv, z, y, x); if (r <= 0) return 0;
+    if (!p->isrv) return r >= p->t;
+    if (r <= 128) return 0;
+    double cy, cx; au_axis_at(p->ax, (z + 0.5) * p->adiv, &cy, &cx); cy = cy / p->adiv - 0.5; cx = cx / p->adiv - 0.5;
+    const double dy = y - cy, dx = x - cx, l = sqrt(dy * dy + dx * dx); if (!(l > 0)) return 0;
+    const int s = rs_at(p->pv, z, (int64_t)llround(y - p->fd * dy / l), (int64_t)llround(x - p->fd * dx / l));
+    return s > 0 && s <= 128;
+}
+static void rs_surfmask(const rs_pred *p, const int64_t o[3], const int64_t n[3], uint8_t *m) {
+    for (int64_t z = 0; z < n[0]; z++) for (int64_t y = 0; y < n[1]; y++) for (int64_t x = 0; x < n[2]; x++)
+        m[((size_t)z * n[1] + y) * n[2] + x] = (uint8_t)rs_surf(p, o[0] + z, o[1] + y, o[2] + x);
+}
+static int rs_parse6(const char *s, int64_t *b, int nb) {   /* nb comma-separated integers, nothing else */
+    const char *q = s;
+    for (int k = 0; k < nb; k++) { char *e; b[k] = strtoll(q, &e, 10); if (e == q) return -1; if (k + 1 < nb) { if (*e != ',') return -1; q = e + 1; } else if (*e) return -1; }
+    return 0;
+}
 
 int cmd_atlas_rvscore(int argc, char **argv) {
-    const char *rvr = nullptr, *rvk = nullptr;
-    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--rv"))) { rvr = argv[i + 1]; rvk = argv[i + 2]; }
-    if (!rvr) { fprintf(stderr, "usage: ufsm atlas-rvscore --rv ROOT KEY [--box z,y,x,nz,ny,nx --phase ROOT KEY [--phase-div S] --ct ROOT KEY [--iso 64]]\n"
-                                "       [--patches INDEX.tsv --ids FILE --axis AXIS.json [--rv-div D] [--d 2] [--every 2]] [--tag T] [--out F]\n"); return 2; }
+    const char *rvr = nullptr, *rvk = nullptr, *pr = nullptr, *pk = nullptr, *cr = nullptr, *ck = nullptr, *gr = nullptr, *gk = nullptr;
+    for (int i = 2; i + 2 < argc; i++) {
+        if (!strcmp(argv[i], opt_n("--rv"))) { rvr = argv[i + 1]; rvk = argv[i + 2]; }
+        if (!strcmp(argv[i], opt_n("--phase"))) { pr = argv[i + 1]; pk = argv[i + 2]; }
+        if (!strcmp(argv[i], opt_n("--ct"))) { cr = argv[i + 1]; ck = argv[i + 2]; }
+        if (!strcmp(argv[i], opt_n("--codes"))) { gr = argv[i + 1]; gk = argv[i + 2]; }
+    }
+    const char *npy = at_opt(argc, argv, "--prob", nullptr);
+    if (!rvr == !npy) { fprintf(stderr, "usage: ufsm atlas-rvscore (--rv ROOT KEY | --prob F.npy --prob-origin z,y,x) [--axis A.json --axis-div D] [--tag T] [--out F]\n"
+                                "       [--box z,y,x,nz,ny,nx --phase ROOT KEY [--phase-div S] [--ct ROOT KEY --iso 64] [--codes ROOT KEY --codes-scale S]]\n"
+                                "       [--patches INDEX.tsv --ids FILE [--every 2] [--d 2] [--patch-thr 0.5]]\n"); return 2; }
     const char *tag = at_opt(argc, argv, "--tag", "-"), *boxs = at_opt(argc, argv, "--box", nullptr), *idx = at_opt(argc, argv, "--patches", nullptr);
+    const char *axf = at_opt(argc, argv, "--axis", nullptr);
+    const double adiv = atof(at_opt(argc, argv, "--axis-div", at_opt(argc, argv, "--rv-div", "1"))), fd = atof(at_opt(argc, argv, "--face-d", "2"));
+    au_axis ax = {0};
+    if (axf && au_axis_load(&ax, axf)) { fprintf(stderr, "atlas-rvscore: cannot read --axis %s\n", axf); return 2; }
+    if (rvr && !axf) { fprintf(stderr, "atlas-rvscore: --rv needs --axis (the recto face is found towards the axis)\n"); return 2; }
+    if (!(adiv > 0)) { fprintf(stderr, "atlas-rvscore: --axis-div > 0\n"); return 2; }
+    int64_t po[3] = {0, 0, 0};
+    if (npy && rs_parse6(at_opt(argc, argv, "--prob-origin", ""), po, 3)) { fprintf(stderr, "atlas-rvscore: --prob needs --prob-origin z,y,x\n"); return 2; }
+    rs_vol npv = {0};
+    if (npy && rs_npy(&npv, npy, po)) return 1;
+    int thr[16], nthr = 0;
+    { char tb[256]; snprintf(tb, sizeof tb, "%s", at_opt(argc, argv, "--thr", "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9"));
+      for (char *s = strtok(tb, ","); s && nthr < 16; s = strtok(nullptr, ",")) thr[nthr++] = (int)lround(atof(s) * 255); }
+    if (rvr) { nthr = 1; thr[0] = 129; }
+    const char *outp = at_opt(argc, argv, "--out", nullptr); FILE *of = outp ? fopen(outp, "a") : stdout;
+    if (!of) { fprintf(stderr, "atlas-rvscore: cannot write %s\n", outp); rs_free(&npv); return 1; }
     int rc = 0, did = 0;
-    const char *outp = at_opt(argc, argv, "--out", nullptr); FILE *of = outp ? fopen(outp, "a") : stdout;   /* --out F: rows appended to F */
-    if (!of) { fprintf(stderr, "atlas-rvscore: cannot write %s\n", outp); return 1; }
     if (boxs) {
-        int64_t b[6]; if (sscanf(boxs, "%" SCNd64 ",%" SCNd64 ",%" SCNd64 ",%" SCNd64 ",%" SCNd64 ",%" SCNd64, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) { fprintf(stderr, "atlas-rvscore: --box z,y,x,nz,ny,nx\n"); return 2; }
-        const char *pr = nullptr, *pk = nullptr, *cr = nullptr, *ck = nullptr;
-        for (int i = 2; i + 2 < argc; i++) { if (!strcmp(argv[i], opt_n("--phase"))) { pr = argv[i + 1]; pk = argv[i + 2]; } if (!strcmp(argv[i], opt_n("--ct"))) { cr = argv[i + 1]; ck = argv[i + 2]; } }
-        if (!pr || !cr) { fprintf(stderr, "atlas-rvscore: --box needs --phase ROOT KEY and --ct ROOT KEY\n"); return 2; }
-        const int S = atoi(at_opt(argc, argv, "--phase-div", "1")), iso = atoi(at_opt(argc, argv, "--iso", "64"));
-        if (S < 1) { fprintf(stderr, "atlas-rvscore: --phase-div >= 1\n"); return 2; }
+        int64_t b[6]; if (rs_parse6(boxs, b, 6)) { fprintf(stderr, "atlas-rvscore: --box z,y,x,nz,ny,nx\n"); rc = 2; goto done; }
+        if (!pr) { fprintf(stderr, "atlas-rvscore: --box needs --phase ROOT KEY (the known region)\n"); rc = 2; goto done; }
+        const int S = atoi(at_opt(argc, argv, "--phase-div", "1")), iso = atoi(at_opt(argc, argv, "--iso", "64")); const int64_t MG = 16;
+        if (S < 1) { fprintf(stderr, "atlas-rvscore: --phase-div >= 1\n"); rc = 2; goto done; }
+        const int64_t ro[3] = {b[0] - MG, b[1] - MG, b[2] - MG}, rn[3] = {b[3] + 2 * MG, b[4] + 2 * MG, b[5] + 2 * MG};
         rs_vol rv = {0}, ph = {0}, ct = {0};
-        const int64_t po[3] = {b[0] / S, b[1] / S, b[2] / S}, pn[3] = {(b[0] + b[3] + S - 1) / S - b[0] / S, (b[1] + b[4] + S - 1) / S - b[1] / S, (b[2] + b[5] + S - 1) / S - b[2] / S};
-        if (rs_load(&rv, rvr, rvk, b, b + 3) || rs_load(&ph, pr, pk, po, pn) || rs_load(&ct, cr, ck, b, b + 3)) { rs_free(&rv); rs_free(&ph); rs_free(&ct); return 1; }
-        uint64_t rr = 0, rn = 0, vv = 0, vn = 0, skip = 0;
-        for (int64_t z = b[0]; z < b[0] + b[3]; z++) for (int64_t y = b[1]; y < b[1] + b[4]; y++) for (int64_t x = b[2]; x < b[2] + b[5]; x++) {
-            const int c = rs_at(&ct, z, y, x), p = rs_at(&ph, z / S, y / S, x / S), r = rs_at(&rv, z, y, x);
-            if (c < iso || p < 0 || p == 255) continue;
-            if (r <= 0) { skip++; continue; }
-            if (p < 126) { rn++; rr += r > 128; } else { vn++; vv += r <= 128; }
+        const int64_t pho[3] = {b[0] / S, b[1] / S, b[2] / S}, phn[3] = {(b[0] + b[3] + S - 1) / S - b[0] / S, (b[1] + b[4] + S - 1) / S - b[1] / S, (b[2] + b[5] + S - 1) / S - b[2] / S};
+        if (rs_load(&ph, pr, pk, pho, phn) || (rvr && rs_load(&rv, rvr, rvk, ro, rn))) { rs_free(&rv); rs_free(&ph); rc = 1; goto done; }
+        const rs_vol *pv = rvr ? &rv : &npv;
+        if (rvr && cr) {   /* side accuracy on papyrus */
+            if (rs_load(&ct, cr, ck, b, b + 3)) { rs_free(&rv); rs_free(&ph); rs_free(&ct); rc = 1; goto done; }
+            uint64_t rr = 0, rn_ = 0, vv = 0, vn = 0, skip = 0;
+            for (int64_t z = b[0]; z < b[0] + b[3]; z++) for (int64_t y = b[1]; y < b[1] + b[4]; y++) for (int64_t x = b[2]; x < b[2] + b[5]; x++) {
+                const int c = rs_at(&ct, z, y, x), p = rs_at(&ph, z / S, y / S, x / S), r = rs_at(pv, z, y, x);
+                if (c < iso || p < 0 || p == 255) continue;
+                if (r <= 0) { skip++; continue; }
+                if (p < 126) { rn_++; rr += r > 128; } else { vn++; vv += r <= 128; }
+            }
+            const double ra = rn_ ? (double)rr / rn_ : NAN, va = vn ? (double)vv / vn : NAN;
+            fprintf(of, "atlas-rvscore\t%s\tside\t%s\trecto_recall\t%.4f\tverso_recall\t%.4f\tbalanced\t%.4f\tvoxels\t%" PRIu64 "\tskipped\t%" PRIu64 "\n", tag, boxs, ra, va, (ra + va) / 2, rn_ + vn, skip);
+            if (!(rn_ + vn)) rc = 1;
+            rs_free(&ct);
         }
-        const double ra = rn ? (double)rr / rn : NAN, va = vn ? (double)vv / vn : NAN;
-        fprintf(of, "atlas-rvscore\t%s\tbox\t%s\trecto_recall\t%.4f\tverso_recall\t%.4f\tbalanced\t%.4f\tvoxels\t%" PRIu64 "\tskipped\t%" PRIu64 "\n", tag, boxs, ra, va, (ra + va) / 2, rn + vn, skip);
-        if (!(rn + vn)) rc = 1;
-        rs_free(&rv); rs_free(&ph); rs_free(&ct); did = 1;
+        if (gr) {   /* F1 of the surface vs the GT sheets */
+            const double cs = atof(at_opt(argc, argv, "--codes-scale", "1"));
+            const int up = cs < 0.99 ? (int)lround(1 / cs) : 1, dn = cs > 1.01 ? (int)lround(cs) : 1;
+            int64_t go[3], gn[3]; for (int k = 0; k < 3; k++) { go[k] = ro[k] < 0 ? 0 : (ro[k] * up) / dn; gn[k] = ((ro[k] + rn[k]) * up + dn - 1) / dn - go[k]; }
+            rs_vol gv = {0}; if (rs_load(&gv, gr, gk, go, gn)) { rs_free(&rv); rs_free(&ph); rs_free(&gv); rc = 1; goto done; }
+            const size_t nv = (size_t)rn[0] * rn[1] * rn[2];
+            uint8_t *G = calloc(nv, 1), *K = calloc(nv, 1), *P = malloc(nv); float *dg = malloc(nv * sizeof *dg), *dp = malloc(nv * sizeof *dp);
+            if (!G || !K || !P || !dg || !dp) { fprintf(stderr, "atlas-rvscore: out of memory\n"); free(G); free(K); free(P); free(dg); free(dp); rs_free(&rv); rs_free(&ph); rs_free(&gv); rc = 1; goto done; }
+            uint64_t ng = 0;
+            for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++) for (int64_t x = 0; x < rn[2]; x++) {
+                const int64_t Z = ro[0] + z, Y = ro[1] + y, X = ro[2] + x; const size_t i = ((size_t)z * rn[1] + y) * rn[2] + x; int s = 0;
+                for (int a = 0; a < up && !s; a++) for (int c = 0; c < up && !s; c++) for (int e = 0; e < up && !s; e++) s = rs_at(&gv, (Z * up + a) / dn, (Y * up + c) / dn, (X * up + e) / dn) > 0;
+                G[i] = (uint8_t)s;
+                if (Z >= b[0] && Y >= b[1] && X >= b[2] && Z < b[0] + b[3] && Y < b[1] + b[4] && X < b[2] + b[5]) { const int p = rs_at(&ph, Z / S, Y / S, X / S); K[i] = p >= 0 && p != 255; }
+                ng += G[i] && K[i];
+            }
+            rs_edt(G, rn, dg);
+            double bF = -1, bP = 0, bR = 0; int bt = 0; uint64_t bnp = 0;
+            for (int t = 0; t < nthr; t++) {
+                rs_pred sp = {pv, rvr != nullptr, thr[t], &ax, adiv, fd}; rs_surfmask(&sp, ro, rn, P);
+                uint64_t npd = 0, pok = 0, gok = 0;
+                for (size_t i = 0; i < nv; i++) if (P[i] && K[i]) { npd++; pok += dg[i] <= 2; }
+                if (!npd || !ng) { fprintf(of, "atlas-rvscore\t%s\tf1\t%s\tthr\t%.3f\tpred_vox\t0\n", tag, boxs, thr[t] / 255.0); continue; }
+                rs_edt(P, rn, dp);
+                for (size_t i = 0; i < nv; i++) if (G[i] && K[i]) gok += dp[i] <= 2;
+                const double Pp = (double)pok / npd, Rr = (double)gok / ng, F = Pp + Rr > 0 ? 2 * Pp * Rr / (Pp + Rr) : 0;
+                if (nthr > 1) fprintf(stderr, "atlas-rvscore: %s %s thr %.2f P2 %.4f R2 %.4f F2 %.4f\n", tag, boxs, thr[t] / 255.0, Pp, Rr, F);
+                if (F > bF) { bF = F; bP = Pp; bR = Rr; bt = thr[t]; bnp = npd; }
+            }
+            if (bF >= 0) fprintf(of, "atlas-rvscore\t%s\tf1\t%s\tthr\t%.3f\tP2\t%.4f\tR2\t%.4f\tF2\t%.4f\tpred_vox\t%" PRIu64 "\tgt_vox\t%" PRIu64 "\n", tag, boxs, rvr ? 0.5 : bt / 255.0, bP, bR, bF, bnp, ng);
+            else rc = 1;
+            free(G); free(K); free(P); free(dg); free(dp); rs_free(&gv);
+        }
+        rs_free(&rv); rs_free(&ph); did = 1;
     }
     if (idx) {
-        const char *idsf = at_opt(argc, argv, "--ids", nullptr), *axf = at_opt(argc, argv, "--axis", nullptr);
-        const int D = atoi(at_opt(argc, argv, "--rv-div", "1")), ev = atoi(at_opt(argc, argv, "--every", "2")); const double dd = atof(at_opt(argc, argv, "--d", "2"));
-        au_axis ax; if (!idsf || !axf || au_axis_load(&ax, axf) || D < 1 || ev < 1 || !(dd > 0)) { fprintf(stderr, "atlas-rvscore: --patches needs --ids FILE and a readable --axis; --rv-div, --every >= 1, --d > 0\n"); return 2; }
+        const char *idsf = at_opt(argc, argv, "--ids", nullptr);
+        const int ev = atoi(at_opt(argc, argv, "--every", "2")), pt = (int)lround(atof(at_opt(argc, argv, "--patch-thr", "0.5")) * 255); const double dd = atof(at_opt(argc, argv, "--d", "2"));
+        if (!idsf || !axf || ev < 1 || !(dd > 0)) { fprintf(stderr, "atlas-rvscore: --patches needs --ids FILE and --axis; --every >= 1, --d > 0\n"); rc = 2; goto done; }
         char dir[2048]; snprintf(dir, sizeof dir, "%s", idx); char *sl = strrchr(dir, '/'); if (sl) *sl = 0; else snprintf(dir, sizeof dir, ".");
-        FILE *f = fopen(idsf, "r"); if (!f) { fprintf(stderr, "atlas-rvscore: cannot read %s\n", idsf); return 1; }
+        FILE *f = fopen(idsf, "r"); if (!f) { fprintf(stderr, "atlas-rvscore: cannot read %s\n", idsf); rc = 1; goto done; }
         char **ids = nullptr; size_t ni = 0; char ln[4096];
         while (fgets(ln, sizeof ln, f)) { char *t = strtok(ln, "\t\n "); if (!t) continue; ids = realloc(ids, sizeof *ids * (ni + 1)); ids[ni++] = strdup(t); }
         fclose(f); qsort(ids, ni, sizeof *ids, au_scmp);
-        f = fopen(idx, "r"); if (!f) { fprintf(stderr, "atlas-rvscore: cannot read %s\n", idx); return 1; }
-        uint64_t nodes = 0, outr = 0, inv = 0, both = 0, skipped = 0; double dsum = 0; size_t np = 0;
+        f = fopen(idx, "r"); if (!f) { fprintf(stderr, "atlas-rvscore: cannot read %s\n", idx); for (size_t k = 0; k < ni; k++) free(ids[k]); free(ids); rc = 1; goto done; }
+        uint64_t nodes = 0, outr = 0, inv = 0, both = 0, near = 0, skipped = 0; double dsum = 0; size_t np = 0;
         while (fgets(ln, sizeof ln, f)) {
             if (!strncmp(ln, "id\t", 3)) continue;
             char *tok[16]; int nt = 0; for (char *s = strtok(ln, "\t\n"); s && nt < 16; s = strtok(nullptr, "\t\n")) tok[nt++] = s;
@@ -760,11 +893,11 @@ int cmd_atlas_rvscore(int argc, char **argv) {
             char d[2600]; float *X[3]; int w = 0, h = 0, w2, h2; static const char *const nm[3] = {"x.tif", "y.tif", "z.tif"};
             for (int a = 0; a < 3; a++) { snprintf(d, sizeof d, "%s/%s/%s.tifxyz/%s", dir, tok[1], tok[0], nm[a]); X[a] = img_read_f32(d, a ? &w2 : &w, a ? &h2 : &h); }
             if (!X[0] || !X[1] || !X[2] || w2 != w || h2 != h) { fprintf(stderr, "atlas-rvscore: cannot read %s\n", tok[0]); for (int a = 0; a < 3; a++) free(X[a]); rc = 1; continue; }
-            /* the rv block over this patch's bbox + d (rv grid) */
             int64_t o[3], n[3]; const double lo[3] = {atof(tok[12]), atof(tok[11]), atof(tok[10])}, hi[3] = {atof(tok[15]), atof(tok[14]), atof(tok[13])};   /* z y x */
-            for (int k = 0; k < 3; k++) { o[k] = (int64_t)floor((lo[k] - dd - 2) / D); n[k] = (int64_t)ceil((hi[k] + dd + 2) / D) - o[k] + 1; }
+            for (int k = 0; k < 3; k++) { o[k] = (int64_t)floor((lo[k] - dd - 4) / adiv); n[k] = (int64_t)ceil((hi[k] + dd + 4) / adiv) - o[k] + 1; }
             rs_vol rv = {0};
-            if (rs_load(&rv, rvr, rvk, o, n)) { for (int a = 0; a < 3; a++) free(X[a]); rs_free(&rv); skipped++; continue; }
+            if (rvr && rs_load(&rv, rvr, rvk, o, n)) { for (int a = 0; a < 3; a++) free(X[a]); rs_free(&rv); skipped++; continue; }
+            const rs_vol *pv = rvr ? &rv : &npv; rs_pred sp = {pv, rvr != nullptr, rvr ? 129 : pt, &ax, adiv, fd};
             np++;
             for (int r = 1; r + 1 < h; r += ev) for (int c = 1; c + 1 < w; c += ev) {
                 const size_t i = (size_t)r * w + c;
@@ -775,24 +908,35 @@ int cmd_atlas_rvscore(int argc, char **argv) {
                 const double l = sqrt(nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]); if (!(l > 0)) continue;
                 double cy, cx; au_axis_at(&ax, X[2][i], &cy, &cx);
                 if (nr[0] * (X[0][i] - cx) + nr[1] * (X[1][i] - cy) < 0) for (int a = 0; a < 3; a++) nr[a] = -nr[a];   /* outward: away from the axis */
-                int s[2];
-                for (int k = 0; k < 2; k++) {
+                const int64_t qz = (int64_t)floor(X[2][i] / adiv), qy = (int64_t)floor(X[1][i] / adiv), qx = (int64_t)floor(X[0][i] / adiv);
+                if (rs_at(pv, qz, qy, qx) <= 0) { skipped++; continue; }
+                int s[2] = {1, 1};
+                if (rvr) for (int k = 0; k < 2; k++) {
                     const double sg = k ? -dd : dd, px = X[0][i] + sg * nr[0] / l, py = X[1][i] + sg * nr[1] / l, pz = X[2][i] + sg * nr[2] / l;
-                    s[k] = rs_at(&rv, (int64_t)floor(pz / D + 0.5 / D), (int64_t)floor(py / D + 0.5 / D), (int64_t)floor(px / D + 0.5 / D));
+                    s[k] = rs_at(pv, (int64_t)floor(pz / adiv), (int64_t)floor(py / adiv), (int64_t)floor(px / adiv));
                 }
                 if (s[0] <= 0 || s[1] <= 0) { skipped++; continue; }
-                nodes++; outr += s[0] > 128; inv += s[1] <= 128; both += s[0] > 128 && s[1] <= 128; dsum += s[0] - s[1];
+                nodes++;
+                if (rvr) { outr += s[0] > 128; inv += s[1] <= 128; both += s[0] > 128 && s[1] <= 128; dsum += s[0] - s[1]; }
+                int hit = 0;
+                for (int a = -2; a <= 2 && !hit; a++) for (int bb = -2; bb <= 2 && !hit; bb++) for (int e = -2; e <= 2 && !hit; e++)
+                    if (a * a + bb * bb + e * e <= 4) hit = rs_surf(&sp, qz + a, qy + bb, qx + e);
+                near += hit;
             }
             rs_free(&rv); for (int a = 0; a < 3; a++) free(X[a]);
         }
         fclose(f);
-        fprintf(of, "atlas-rvscore\t%s\tpatches\t%zu\tnodes\t%" PRIu64 "\touter_recto\t%.4f\tinner_verso\t%.4f\tboth\t%.4f\tmean_out_minus_in\t%.2f\tskipped\t%" PRIu64 "\n", tag, np,
-               nodes, nodes ? (double)outr / nodes : NAN, nodes ? (double)inv / nodes : NAN, nodes ? (double)both / nodes : NAN, nodes ? dsum / nodes : NAN, skipped);
+        const double N = nodes ? (double)nodes : NAN;
+        if (rvr) fprintf(of, "atlas-rvscore\t%s\tpatches\t%zu\tnodes\t%" PRIu64 "\touter_recto\t%.4f\tinner_verso\t%.4f\tboth\t%.4f\tmean_out_minus_in\t%.2f\trecall2\t%.4f\tskipped\t%" PRIu64 "\n",
+                         tag, np, nodes, outr / N, inv / N, both / N, dsum / N, near / N, skipped);
+        else fprintf(of, "atlas-rvscore\t%s\tpatches\t%zu\tnodes\t%" PRIu64 "\trecall2\t%.4f\tthr\t%.3f\tskipped\t%" PRIu64 "\n", tag, np, nodes, near / N, pt / 255.0, skipped);
         if (!nodes) rc = 1;
         for (size_t k = 0; k < ni; k++) free(ids[k]);
-        free(ids); free(ax.z); free(ax.y); free(ax.x); did = 1;
+        free(ids); did = 1;
     }
+    if (!did && !rc) { fprintf(stderr, "atlas-rvscore: give --box ... and / or --patches ...\n"); rc = 2; }
+done:
     if (outp) fclose(of);
-    if (!did) { fprintf(stderr, "atlas-rvscore: give --box ... and / or --patches ...\n"); return 2; }
+    rs_free(&npv); free(ax.z); free(ax.y); free(ax.x);
     return rc;
 }

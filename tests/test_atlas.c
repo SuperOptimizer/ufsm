@@ -218,32 +218,52 @@ static uint8_t v_ct(int z, int y, int x) { (void)z; (void)y; (void)x; return 100
 static uint8_t v_ph(int z, int y, int x) { (void)y; (void)x; return z < 4 ? 255 : z < 64 ? 50 : 200; }
 static uint8_t v_rvz(int z, int y, int x) { (void)y; (void)x; return z < 60 ? 200 : 50; }
 static uint8_t v_rvx(int z, int y, int x) { (void)z; (void)y; return x > 64 ? 200 : 50; }
-/* atlas-rvscore: a GT box (recto recall 56 / 60: four recto rows predicted verso) and an ATLAS patch on the plane x = 64 with the axis at x = 0 */
+static uint8_t v_codes(int z, int y, int x) { (void)z; (void)y; return x == 65 ? 7 : 0; }
+/* atlas-rvscore: a GT box (side: recto recall 56 / 60, four recto rows predicted verso; F1 of rvx's recto face x = 65..66 vs the GT sheet
+   x = 65: 1; a probability npy with its sheet at x = 67: F1 1 at the best threshold, no surface above 200) and an ATLAS patch on the plane x = 64,
+   the axis at x = 0 */
 static void test_rvscore(const char *tmp) {
-    char ct[600], ph[600], rz[600], rx[600]; snprintf(ct, sizeof ct, "%s/ct", tmp); snprintf(ph, sizeof ph, "%s/ph", tmp); snprintf(rz, sizeof rz, "%s/rvz", tmp); snprintf(rx, sizeof rx, "%s/rvx", tmp);
-    write_vol(ct, v_ct); write_vol(ph, v_ph); write_vol(rz, v_rvz); write_vol(rx, v_rvx);
+    char ct[600], ph[600], rz[600], rx[600], cd[600]; snprintf(ct, sizeof ct, "%s/ct", tmp); snprintf(ph, sizeof ph, "%s/ph", tmp); snprintf(rz, sizeof rz, "%s/rvz", tmp); snprintf(rx, sizeof rx, "%s/rvx", tmp); snprintf(cd, sizeof cd, "%s/codes", tmp);
+    write_vol(ct, v_ct); write_vol(ph, v_ph); write_vol(rz, v_rvz); write_vol(rx, v_rvx); write_vol(cd, v_codes);
     char out[700]; snprintf(out, sizeof out, "%s/rvs.txt", tmp);
-    char *a1[] = {"ufsm", "atlas-rvscore", "--rv", (char *)tmp, "rvz", "--box", "0,0,0,128,128,128", "--phase", (char *)tmp, "ph", "--ct", (char *)tmp, "ct", "--tag", "box", "--out", out};
-    const int r1 = cmd_atlas_rvscore(17, a1);
-    /* the patch: nodes (y, z) = (10 + 2 c, 10 + 2 r) on x = 64 */
-    char ad[700], ix[700], ids[700], axf[700]; snprintf(ad, sizeof ad, "%s/rv/PHercR/p1.tifxyz", tmp); snprintf(ix, sizeof ix, "%s/rv/index.tsv", tmp); snprintf(ids, sizeof ids, "%s/rv/ids.txt", tmp); snprintf(axf, sizeof axf, "%s/rv/axis.json", tmp);
+    char ad[700], ix[700], ids[700], axf[700], npy[700]; snprintf(ad, sizeof ad, "%s/rv/PHercR/p1.tifxyz", tmp); snprintf(ix, sizeof ix, "%s/rv/index.tsv", tmp); snprintf(ids, sizeof ids, "%s/rv/ids.txt", tmp); snprintf(axf, sizeof axf, "%s/rv/axis.json", tmp); snprintf(npy, sizeof npy, "%s/p.npy", tmp);
     enum { W = 40, H = 40 }; static float X[W * H], Y[W * H], Z[W * H];
     for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) { X[r * W + c] = 64; Y[r * W + c] = (float)(10 + 2 * c); Z[r * W + c] = (float)(10 + 2 * r); }
     tifxyz_write(ad, W, H, X, Y, Z, 2, 8.64, -1, "test");
     FILE *f = fopen(ix, "w"); fprintf(f, "id\tscroll\tscan\tum\trows\tcols\tvalid\tquads\tarea_cm2\tarea_cm2_atlas\tx0\ty0\tz0\tx1\ty1\tz1\np1\tPHercR\tR.zarr\t8.64\t40\t40\t1600\t1521\t0\t0\t64\t10\t10\t64\t88\t88\n"); fclose(f);
     f = fopen(ids, "w"); fprintf(f, "p1\n"); fclose(f);
     f = fopen(axf, "w"); fprintf(f, "{\"control_points\": [{\"z\": 0, \"y\": 50, \"x\": 0}, {\"z\": 200, \"y\": 50, \"x\": 0}]}\n"); fclose(f);
-    char *a2[] = {"ufsm", "atlas-rvscore", "--rv", (char *)tmp, "rvx", "--patches", ix, "--ids", ids, "--axis", axf, "--tag", "atlas", "--out", out};
-    const int r2 = cmd_atlas_rvscore(15, a2);
-    CHECK(r1 == 0 && r2 == 0, "atlas-rvscore rc %d %d", r1, r2);
-    f = fopen(out, "r"); char ln[2048]; int ok1 = 0, ok2 = 0;
+    {   /* the npy: 128^3 uint8, 200 on x = 67, 1 elsewhere (0 = no prediction) */
+        f = fopen(npy, "wb"); char hd[128]; int hl = snprintf(hd, sizeof hd, "{'descr': '|u1', 'fortran_order': False, 'shape': (128, 128, 128), }");
+        while ((10 + hl + 1) % 64) hd[hl++] = ' ';
+        hd[hl++] = '\n'; const unsigned char mg[10] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0, (unsigned char)(hl & 255), (unsigned char)(hl >> 8)};
+        fwrite(mg, 1, 10, f); fwrite(hd, 1, (size_t)hl, f);
+        uint8_t *d = malloc(128 * 128 * 128); for (size_t i = 0; i < 128u * 128 * 128; i++) d[i] = i % 128 == 67 ? 200 : 1;
+        fwrite(d, 1, 128u * 128 * 128, f); fclose(f); free(d);
+    }
+    char *a1[] = {"ufsm", "atlas-rvscore", "--rv", (char *)tmp, "rvz", "--box", "16,16,16,96,96,96", "--phase", (char *)tmp, "ph", "--ct", (char *)tmp, "ct", "--axis", axf, "--tag", "box", "--out", out};
+    const int r1 = cmd_atlas_rvscore((int)(sizeof a1 / sizeof *a1), a1);
+    char *a2[] = {"ufsm", "atlas-rvscore", "--rv", (char *)tmp, "rvx", "--patches", ix, "--ids", ids, "--axis", axf, "--tag", "atlas", "--out", out,
+                  "--box", "16,16,16,96,96,96", "--phase", (char *)tmp, "ph", "--codes", (char *)tmp, "codes"};
+    const int r2 = cmd_atlas_rvscore((int)(sizeof a2 / sizeof *a2), a2);
+    char *a3[] = {"ufsm", "atlas-rvscore", "--prob", npy, "--prob-origin", "0,0,0", "--box", "16,16,16,96,96,96", "--phase", (char *)tmp, "ph", "--codes", (char *)tmp, "codes",
+                  "--patches", ix, "--ids", ids, "--axis", axf, "--tag", "npy", "--out", out};
+    const int r3 = cmd_atlas_rvscore((int)(sizeof a3 / sizeof *a3), a3);
+    char *a4[] = {"ufsm", "atlas-rvscore", "--prob", npy, "--prob-origin", "0,0,0", "--box", "16,16,16,96,96,96", "--phase", (char *)tmp, "ph", "--codes", (char *)tmp, "codes", "--thr", "0.9", "--tag", "npy9", "--out", out};
+    const int r4 = cmd_atlas_rvscore((int)(sizeof a4 / sizeof *a4), a4);
+    CHECK(r1 == 0 && r2 == 0 && r3 == 0 && r4 == 1, "atlas-rvscore rc %d %d %d %d", r1, r2, r3, r4);
+    f = fopen(out, "r"); char ln[2048]; int ok1 = 0, ok2 = 0, ok3 = 0, ok4 = 0, ok5 = 0, ok6 = 0;
     while (f && fgets(ln, sizeof ln, f)) {
-        double rr, vr, bal, o, iv, b, dm;
-        const char *p = strstr(ln, "recto_recall\t"); if (p && sscanf(p, "recto_recall\t%lf\tverso_recall\t%lf\tbalanced\t%lf", &rr, &vr, &bal) == 3) ok1 = fabs(rr - 56.0 / 60) < 1e-3 && vr == 1 && fabs(bal - (56.0 / 60 + 1) / 2) < 1e-3;
-        p = strstr(ln, "outer_recto\t"); if (p && sscanf(p, "outer_recto\t%lf\tinner_verso\t%lf\tboth\t%lf\tmean_out_minus_in\t%lf", &o, &iv, &b, &dm) == 4) ok2 = o == 1 && iv == 1 && b == 1 && fabs(dm - 150) < 1e-6;
+        double rr, vr, bal, o, iv, b, dm, rc2, P, R, F;
+        const char *p = strstr(ln, "recto_recall\t"); if (p && sscanf(p, "recto_recall\t%lf\tverso_recall\t%lf\tbalanced\t%lf", &rr, &vr, &bal) == 3) ok1 = fabs(rr - 44.0 / 48) < 1e-3 && vr == 1;
+        p = strstr(ln, "outer_recto\t"); if (p && sscanf(p, "outer_recto\t%lf\tinner_verso\t%lf\tboth\t%lf\tmean_out_minus_in\t%lf\trecall2\t%lf", &o, &iv, &b, &dm, &rc2) == 5) ok2 = o == 1 && iv == 1 && b == 1 && fabs(dm - 150) < 1e-6 && rc2 == 1;
+        p = strstr(ln, "\tP2\t");
+        if (p && sscanf(p, "\tP2\t%lf\tR2\t%lf\tF2\t%lf", &P, &R, &F) == 3) { if (strstr(ln, "\tatlas\t")) ok3 = F == 1; if (strstr(ln, "\tnpy\t")) ok4 = F == 1; }
+        if (strstr(ln, "\tnpy\tpatches\t") && (p = strstr(ln, "recall2\t")) && sscanf(p, "recall2\t%lf", &rc2) == 1) ok5 = rc2 == 0;   /* x = 67 is 3 voxels from the nodes */
+        if (strstr(ln, "\tnpy9\tf1\t") && strstr(ln, "pred_vox\t0")) ok6 = 1;
     }
     if (f) fclose(f);
-    CHECK(ok1 && ok2, "atlas-rvscore rows (%d %d), see %s", ok1, ok2, out);
+    CHECK(ok1 && ok2 && ok3 && ok4 && ok5 && ok6, "atlas-rvscore rows (%d %d %d %d %d %d), see %s", ok1, ok2, ok3, ok4, ok5, ok6, out);
 }
 
 int main(void) {
