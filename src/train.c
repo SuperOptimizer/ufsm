@@ -386,7 +386,7 @@ static int g_ssl_views = 1; static float g_ssl_vshift = 0.125f, g_ssl_vzoom = 1.
 static int g_ssl_proto; static double g_ssl_lnk = 1; static float g_ssl_pts = 0.1f, g_ssl_ptt = 0.04f, g_ssl_pcm = 0.9f, g_ssl_plr = 1e-3f, g_ssl_pema = 0.996f;   /* mgpu: config. --ssl-proto K: DINO prototypes on the side head (ts / tt temperatures, centre momentum, Adam lr, teacher EMA) */
 static int ssl_cell(void) { return (g_lat ? 4 : 1) << g_ssl_lev; }   /* --ssl: voxels per side-head cell (--lat: the 4^3-voxel latent grid below level 0) */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64; static int g_cnt_ns; static float g_cnt_edges[8];   /* --count-strata */   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
-static float g_topo_lambda; static int g_topo_len = 16, g_topo_k = 4;   /* --topo-lambda / --topo-len / --topo-stride: the wrap-count (topology) loss along the label's phase normal (nn_topo_slab; head slabs only, topoloss 2026-11-27) */
+static float g_topo_lambda; static int g_topo_len = 16, g_topo_k = 4;   /* mgpu: config. --topo-lambda / --topo-len / --topo-stride: the wrap-count (topology) loss along the label's phase normal (nn_topo_slab; head slabs only, topoloss 2026-11-27) */
 static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1, g_pg_angle, g_pg_mask;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */

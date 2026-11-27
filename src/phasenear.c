@@ -59,7 +59,7 @@ void phase_near_sample(const fit_fields_buf *F, const int64_t o[3], const int64_
 /* --min-comp N (topoloss 2026-11-27, the survey's "persistence filter" without retraining): predicted sheet components (26-connected
    sheet voxels) of fewer than N voxels are dropped before the distances: tests whether w24's extra wraps are small fragments a
    post-filter removes, or whole spurious sheets. 0: off (the measurement unchanged). */
-static long g_min_comp;
+static long g_min_comp;   /* mgpu: config (set once per measurement call by the one command thread) */
 void phase_near_set_min_comp(long n) { g_min_comp = n > 0 ? n : 0; }
 static void drop_small(uint8_t *mp, const int64_t n[3], long minc) {
     const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];
