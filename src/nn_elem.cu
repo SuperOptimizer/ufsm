@@ -682,7 +682,7 @@ __global__ void ink_neg_k(const uint8_t *ink, size_t vb, size_t n, int D, int H,
         if ((threadIdx.x & 31) == 0) { if (bn) atomicAdd(&cnt[0], (unsigned long long)__popc(bn)); if (bg) atomicAdd(&cnt[1], (unsigned long long)__popc(bg)); if (bt) atomicAdd(&cnt[2], (unsigned long long)__popc(bt)); }
     }
 }
-static unsigned long long *g_inkneg_cnt[64];   /* per device */
+static unsigned long long *g_inkneg_cnt[64];   /* mgpu: per-device (indexed by the calling thread's device) */
 extern "C" void nn_ink_neg(const uint8_t *ink, size_t vb, size_t n, int D, int H, int W, int R, const void *lg, float thr, uint8_t *m, int count) {
     if (!n || (R < 1 && !(thr > 0 && thr < 1))) return;
     int dev = 0; cudaGetDevice(&dev); if (dev < 0 || dev >= 64) dev = 0;

@@ -363,7 +363,7 @@ static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static fl
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
    over the window's rays x L x the source's ink weight; at most --ink-mil-max rays a window (the device buffers; the backward's sort ~300 B per sample) */
 static int g_ink_air;   /* --ink-air S (--ink-head, needs the --rv papyrus plane): unlabelled air voxels on the S-voxel window lattice -> ink 0 targets (nn_ink_air) */
-static int g_inkneg_R, g_inkneg_from, g_inkneg_on; static float g_inkneg_thr;   /* --ink-neg-guard R / --ink-neg-gate T [--ink-neg-from STEP]: unlabelled-is-unknown for the ink negatives (nn_ink_neg), training passes from STEP */
+static int g_inkneg_R, g_inkneg_from, g_inkneg_on; static float g_inkneg_thr;   /* mgpu: config (g_inkneg_on: set by the main loop before each step's GPU threads, as g_ptrunc_on). --ink-neg-guard R / --ink-neg-gate T [--ink-neg-from STEP]: unlabelled-is-unknown for the ink negatives (nn_ink_neg), training passes from STEP */
 static float g_ink_smooth;   /* --ink-smooth EPS (--ink-head): label smoothing of the ink BCE target, t (1 - eps) + eps / 2 (villa: 0.1) */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static float g_contact_w, g_contact_um = 70.f;   /* mgpu: config. --contact-weight W [--contact-um U] (rvsub 2026-11-19): rv and fibre H / V masks x W where labelled sheets touch (spacing <= U) */
