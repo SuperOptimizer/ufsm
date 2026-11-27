@@ -27,6 +27,23 @@ source's training windows from cells marked hard, instead of uniformly over its 
   from hard draws, the share of all its kept windows on hard cells, and that share among the other draws alone (the unboosted rate).
 - test_sampbias: the index of a 4.8 um map on the 9.6 um fixture (exactly the cells below z 128, 8 times each), frac 0.5 -> 0.3-0.7
   of 80 kept windows, off = identical hashes, on changes them; hard-map on a synthetic mf plane + a box (cell values exact).
+  bench_sampler hashes (deterministic fixture runs: plain, a holdout box, the trainer recipe) are the same for origin/master and the branch.
+- **1667 map** (`maps/PHerc1667-mf179.raw` in /vesuvius/ufsm/hardspot): the q2 mf plane (wgraph c7cf, 4635 x 1568 x 1616 field cells,
+  h 2 at 9.596 um), level-7 cells of the 2.399 um scan (290 x 119 x 119, 307 um). 42 s on 6 threads, 0.2 GB RSS. 237738 of 983777
+  material cells are hard (0.24 at share >= 0.1); weights: 36 % of the hard cells >= 224, 17 % at 32-63.
+- **Sampler-only** (CPU, PHerc1667-A48: the stored codesA at 4.8 um, P 256, w24's holdouts, edge-boost / snap-jitter / stick-src on;
+  frac 0.3, 600 kept windows): 18001 of 130018 draw cells hard (0.138; 5150 dropped in held-out boxes)
+
+  | | share |
+  |---|---|
+  | kept windows from hard draws | 0.352 (requested 0.3: hard draws are rejected less; 314 rejections in all) |
+  | kept windows on a hard cell | 0.448 |
+  | the same among the other draws (unboosted rate) | 0.149 |
+
+  So frac 0.3 triples the windows centred on merge-flagged cells. On w24's own source (2.4 um, onfly mesh labels on the CPU) the
+  same map marks 157091 of 1147175 draw cells (0.137); its windows cost ~70 s each on the CPU, too slow for a share count.
+- Only 1667 has a whole-scroll mf plane. Paris 4 / 0139 / 0814 need predicted fields + `ufsm merge-flag`, or per-box error rows
+  (wbench) as `--boxes`.
 
 ## Per-scroll / per-recipe ink eval: worst scroll, leak flags, band-tolerant F1; 1447 is the only scroll clean for every model (2026-11-27, branch inkeval-20261127, inkeval)
 
