@@ -247,6 +247,7 @@ typedef struct {
     uint8_t *auxc;           /* cfg.gpu_input + aux: sample_aux_bytes(B, aux_nc): B nn_aux_hdr, then each window's coarse aux box (nn.h) */
     uint8_t *ct8;            /* cfg.gpu_aug: B x P^3 source-grid CT bytes (sample.h gpu_aug), else nullptr */
     void *aug;               /* cfg.gpu_aug: B scan_ct_rec (scan_augment.h) */
+    void *four;              /* cfg.gpu_aug with SA_FOURIER configured: B scan_four (scan_augment.h), else nullptr */
     float *axr;              /* cfg.axis_rec: B records of SAMPLE_AXR(P) floats */
     int64_t *chid;           /* cfg.chain_p: B chain ids (-1: not in a chain) */
     int *chidx;              /* B: the window's index in its chain (0: the start) */

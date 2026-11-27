@@ -377,7 +377,8 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255, int bank_own) {   /
     b.ct8 = c->gpu_aug ? halloc((size_t)c->B * p3) : nullptr; b.aug = c->gpu_aug ? halloc((size_t)c->B * sizeof(scan_ct_rec)) : nullptr;
     b.auxc = c->gpu_input && c->aux ? halloc(sample_aux_bytes(c->B, c->aux_nc)) : nullptr;   /* (the cascade input: coarse boxes, nn.h nn_aux_hdr) */
     if (b.auxc) memset(b.auxc, 0, sample_aux_bytes(c->B, c->aux_nc));
-    if (b.aug) memset(b.aug, 0, (size_t)c->B * sizeof(scan_ct_rec));   /* (the records' padding is never written: zero, so equal batches hash equal) */
+    if (b.aug) memset(b.aug, 0, (size_t)c->B * sizeof(scan_ct_rec));
+    b.four = c->gpu_aug && c->scan.p[SA_FOURIER] > 0 ? calloc((size_t)c->B, sizeof(scan_four)) : nullptr;   /* (only with the op configured: batches as before without it) */   /* (the records' padding is never written: zero, so equal batches hash equal) */
     const int tmu = sample_tm_unused(c);   /* (slot_skip 4: the unpacked targets and mask are never read) */
     b.t = c->pack_tm || tmu ? nullptr : halloc((size_t)c->B * (c->restore == 1 ? 1 : NCH) * p3);   /* (task restore: the clean CT alone; real pairs: target + input crop) */
     b.m = c->pack_tm || c->restore || tmu ? nullptr : halloc((size_t)c->B * p3);
@@ -422,7 +423,7 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255, int bank_own) {   /
     return b;
 }
 
-static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->auxc) hfree(b->auxc); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); free(b->four); if (b->auxc) hfree(b->auxc); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -3390,6 +3391,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         sample_emb_pap2(ctu, Pz, P, s->pap_level, embp2);
     }
     scan_ct_rec *grec = c->gpu_aug ? (scan_ct_rec *)b->aug + i : nullptr;   /* --gpu-aug: the device's record of this window */
+    if (b->four) memset((scan_four *)b->four + i, 0, sizeof(scan_four));   /* (SA_FOURIER configured: off unless drawn below) */
     if (grec) grec->scan = 0;
     if (c->augment && scan_aug_enabled(&c->scan)) {   /* scanner domains on the source grid; the per-patch z-score follows them, as at inference */
         PROF_MARK(PS_ZSCORE);
@@ -3405,7 +3407,9 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
                          set (0 / 1: every later CPU reader of ctu needs no more with side_air 0, sample_gpu_aug_ok) */
             const scan_aug_cfg *sc_ = &c->scan;   /* (the plan writes the mask only for these ops: seam, air, dropped slices / cutouts that ignore) */
             if ((sc_->p[SA_SEAM] > 0 && !c->sheet && !c->band && !c->side) || sc_->p[SA_AIR] > 0 || (sc_->drop_ignore && (sc_->p[SA_DROPSLICE] > 0 || sc_->p[SA_CUTOUT] > 0))) IGN_REAL();
-            const unsigned on = scan_aug_plan(&c->scan, rnext(r), ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, &grec->plan);
+            const uint64_t sseed = rnext(r);
+            if (b->four) scan_aug_plan_fourier(&c->scan, sseed, ctu, P, (scan_four *)b->four + i);   /* (its own record: the plan's bytes as without it) */
+            const unsigned on = scan_aug_plan(&c->scan, sseed, ctu, ttmp, NCH, ign, P, o, cyz, cxz, s->ax.n > 0, m->chunk, !c->sheet && !c->band && !c->side, &grec->plan);
             grec->scan = on != 0; son = on;
             if (on) {
                 scan_plan_notair(&grec->plan, ctu, b->ct8 + (size_t)i * p3);   /* (the bytes as read into ct8, then ctu = !scan_plan_air in place: one pass) */
@@ -4611,7 +4615,9 @@ static void replay_window(sampler *sp, batch *b, int i, int rep, uint8_t **scr) 
         scan_aug_cfg c2 = c->scan; c2.drop_ignore = 0;
         c2.p[SA_SEAM] = c2.p[SA_AIR] = c2.p[SA_DROPSLICE] = c2.p[SA_CUTOUT] = c2.p[SA_CHUNK] = 0;
         const int chunk[3] = {128, 128, 128};
-        const unsigned on = scan_aug_plan(&c2, rnext(&r), b->ct8 + (size_t)i * p3, nullptr, 0, nullptr, P, o, cyz, cxz, hasax, chunk, 0, &g->plan);
+        const uint64_t sseed = rnext(&r);
+        if (b->four) scan_aug_plan_fourier(&c2, sseed, b->ct8 + (size_t)i * p3, P, (scan_four *)b->four + i);
+        const unsigned on = scan_aug_plan(&c2, sseed, b->ct8 + (size_t)i * p3, nullptr, 0, nullptr, P, o, cyz, cxz, hasax, chunk, 0, &g->plan);
         scan_plan *p = &g->plan; const unsigned lm = 1u << SA_AIR | 1u << SA_DROPSLICE | 1u << SA_CUTOUT | 1u << SA_CHUNK;
         if (!on) { p->mean = old->mean; p->sd = old->sd; p->ns = old->ns; }
         p->P = P; p->on |= old->on & lm;
@@ -5050,7 +5056,7 @@ int sampler_batch_hash(const sampler *sp, const batch *b, const char **names, ui
         }
         free(g);
     }
-    const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
+    const struct { const char *n; const void *p; size_t z; } f[] = {{"ct8", b->ct8, B * p3}, {"aug", b->aug, B * sizeof(scan_ct_rec)}, {"four", b->four, B * sizeof(scan_four)}, {"rad", b->rad, B * NN_RAD_REC(PZ(&sp->cfg))},
         {"side", sdr ? sdr : b->side, B * p3}, {"w4", w4r ? w4r : b->w4, B * p3}, {"wcomp", wcr ? wcr : b->wcomp, B * p3}, {"ink", inkr ? inkr : b->ink, B * p3}, {"tm", b->tm, B * p3}, {"pm", b->pm, B * p3}, {"inkb", b->inkb, B * p3 / 8}, {"aux0", b->aux[0], B * p3}, {"aux1", b->aux[1], B * p3}, {"aux2", b->aux[2], B * p3}, {"aux3", b->aux[3], B * p3},
         {"x16", b->x16, B * (size_t)b->xch * p3 * 2}, {"um", b->um, B * sizeof(float)}, {"src", b->src, B * sizeof(int16_t)}, {"w", b->w, B * NCH}};
     int n = 0;

@@ -343,6 +343,23 @@ static float *gin_buf(size_t n) {
     }
     return t->g;
 }
+int scan_aug_plan_fourier(const scan_aug_cfg *c, uint64_t seed, const uint8_t *ctu, int P, scan_four *f) {
+    memset(f, 0, sizeof *f);
+    if (!(c->strength > 0) || !(c->p[SA_FOURIER] > 0) || P < 4 || P > SA_MAXP) return 0;
+    uint64_t fs = seed ^ UINT64_C(0xf0a1e2b3c4d5e6f7);   /* its own stream: the other ops draw as without it */
+    if (!(uniform(&fs) < c->p[SA_FOURIER])) return 0;
+    const double S4 = c->s[SA_FOURIER] > 0 ? (double)c->s[SA_FOURIER] : c->strength;
+    const double cut = c->fourier_cut > 0 ? c->fourier_cut : SA_FOURIER_CUT, cI = fmin(cut * P, SA_FOURIER_KMAX + 1.0);
+    const int K = (int)floor(cI) < SA_FOURIER_KMAX ? (int)floor(cI) : SA_FOURIER_KMAX;
+    if (K < 1 || K >= P / 2) return 0;
+    f->K = K; f->cut = (float)cI;
+    for (int j = 0; j < 3; j++) f->a[j] = (float)(.7 * S4 * sym1(&fs));
+    f->b = (float)(.35 * S4 * sym1(&fs));
+    const size_t p3 = (size_t)P * P * P; double sum = 0; size_t nz = 0;   /* the material mean (scan_aug_plan's subsample) */
+    for (size_t k = 0; k < p3; k += 7) if (ctu[k]) { sum += ctu[k]; nz++; }
+    f->mean = (float)(nz ? sum / nz : 128);
+    f->on = 1; return 1;
+}
 unsigned scan_aug_plan(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8_t *tgt, int nch, uint8_t *ign, int P,
                        const int64_t o[3], float *cy, float *cx, int hasax, const int chunk[3], int allow_seam, scan_plan *p) {
     memset(p, 0, sizeof *p); p->P = P;   /* (all of it: a reused record holds no stale fields; ~0.7 MB, microseconds) */
@@ -354,16 +371,6 @@ unsigned scan_aug_plan(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8
     unsigned on = 0;
     for (int i = 0; i < SA_N; i++) if (i != SA_FOURIER && c->p[i] > 0 && uniform(&rs) < c->p[i]) on |= 1u << i;
     if (!allow_seam) on &= ~(1u << SA_SEAM);
-    uint64_t fs = seed ^ UINT64_C(0xf0a1e2b3c4d5e6f7);   /* SA_FOURIER: its own stream (the other ops draw as without it) */
-    if (c->p[SA_FOURIER] > 0 && uniform(&fs) < c->p[SA_FOURIER]) {
-        const double cut = c->fourier_cut > 0 ? c->fourier_cut : SA_FOURIER_CUT, cI = fmin(cut * P, SA_FOURIER_KMAX + 1.0), S4 = SO(SA_FOURIER);
-        const int K = (int)floor(cI) < SA_FOURIER_KMAX ? (int)floor(cI) : SA_FOURIER_KMAX;
-        if (K >= 1 && K < P / 2) {
-            on |= 1u << SA_FOURIER; p->four_K = K; p->four_cut = (float)cI;
-            for (int j = 0; j < 3; j++) p->four_a[j] = (float)(.7 * S4 * sym1(&fs));
-            p->four_b = (float)(.35 * S4 * sym1(&fs));
-        }
-    }
     p->on = on;
     if (!on) return 0;
     p->ns = seed ^ UINT64_C(0x5ca1ab1e0ddba11);
@@ -557,9 +564,9 @@ void scan_plan_notair(const scan_plan *p, uint8_t *restrict ctu, uint8_t *restri
 /* SA_FOURIER on the float CT (scan_augment.h): the band's DFT coefficients X(k) = sum_r f(r) e^{-2 pi i k.r / P} (air voxels read as the
    material mean) for |k_d| <= K, kx >= 0 (real input: the kx < 0 half is the conjugate), separably x, y, z one plane at a time; D = X (m - 1);
    f += P^-3 sum_k c_kx Re(D e^{+2 pi i k.r / P}) (c 1 at kx 0, else 2). Double precision, angles from (k r mod P): the device's reference */
-static void fourier_ref(const scan_plan *p, float *F, const uint8_t *Z) {
-    const int P = p->P, K = p->four_K, NK = K + 1, NY = 2 * K + 1; const size_t P2 = (size_t)P * P;
-    const double mean = p->mean;
+static void fourier_ref(const scan_four *f, int P, float *F, const uint8_t *Z) {
+    const int K = f->K, NK = K + 1, NY = 2 * K + 1; const size_t P2 = (size_t)P * P;
+    const double mean = f->mean;
     double *cs = malloc(2 * (size_t)P * sizeof *cs), *X = calloc((size_t)NY * NY * NK * 2, sizeof *X), *rx = malloc((size_t)P * NK * 2 * sizeof *rx),
            *ry = malloc((size_t)NY * NK * 2 * sizeof *ry), *row = malloc((size_t)P * sizeof *row);
     if (!cs || !X || !rx || !ry || !row) abort();
@@ -584,7 +591,7 @@ static void fourier_ref(const scan_plan *p, float *F, const uint8_t *Z) {
                 double *x = X + (((size_t)b * NY + a) * NK + kx) * 2; x[0] += u * c - v * s; x[1] += u * s + v * c; } }
     }
     for (int b = 0; b < NY; b++) for (int a = 0; a < NY; a++) for (int kx = 0; kx < NK; kx++) {
-        double *x = X + (((size_t)b * NY + a) * NK + kx) * 2; const double g = (double)scan_fourier_gain(p, b - K, a - K, kx) - 1;
+        double *x = X + (((size_t)b * NY + a) * NK + kx) * 2; const double g = (double)scan_fourier_gain(f, b - K, a - K, kx) - 1;
         x[0] *= g; x[1] *= g;
     }
     const double s3 = 1.0 / ((double)P * P2);
@@ -605,9 +612,10 @@ static void fourier_ref(const scan_plan *p, float *F, const uint8_t *Z) {
 #undef FMOD
     free(cs); free(X); free(rx); free(ry); free(row);
 }
-void scan_aug_exec(const scan_plan *p, uint8_t *ctu, void *scratch) {
-    const unsigned on = p->on;
-    if (!on) return;
+void scan_aug_exec(const scan_plan *p, uint8_t *ctu, void *scratch) { scan_aug_exec_f(p, nullptr, ctu, scratch); }
+void scan_aug_exec_f(const scan_plan *p, const scan_four *f, uint8_t *ctu, void *scratch) {
+    const unsigned on = p->on; const scan_four *fo = f && f->on ? f : nullptr;
+    if (!on && !fo) return;
     const int P = p->P; const size_t P2 = (size_t)P * P, p3 = P2 * P;
     const double mean = p->mean, sd = p->sd;
     uint64_t ns = p->ns;
@@ -627,7 +635,7 @@ void scan_aug_exec(const scan_plan *p, uint8_t *ctu, void *scratch) {
     if (on & 1u << SA_AIR) { const float level = p->air_level; for (size_t k = 0; k < p3; k++) if (Z[k]) { F[k] = level; Z[k] = 0; } }
     if (p->bop_on[0]) bop_apply(F, P, 0, &p->bop[0], tmp);
     bop_apply_yx(F, P, p->bop_on[1] ? &p->bop[1] : nullptr, p->bop_on[2] ? &p->bop[2] : nullptr, tmp);
-    if (on & 1u << SA_FOURIER) fourier_ref(p, F, Z);
+    if (fo) fourier_ref(fo, P, F, Z);
     if (on & 1u << SA_BIAS) {   /* smooth multiplicative field: exp(N(0, b)) on a 3..5 grid, linearly interpolated */
         const int g = p->bias_g; const float *G = p->bias_G;
         int *ix = malloc(P * sizeof *ix); float *wx = malloc(P * sizeof *wx), crow[5]; if (!ix || !wx) abort();
@@ -782,8 +790,10 @@ unsigned scan_aug_apply(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint
                         const int64_t o[3], float *cy, float *cx, int hasax, const int chunk[3], int allow_seam, void *scratch) {
     if (!scan_aug_enabled(c) || P < 4 || P > SA_MAXP) return 0;
     scan_plan *p = malloc(sizeof *p); if (!p) abort();
+    scan_four f; scan_aug_plan_fourier(c, seed, ctu, P, &f);   /* (on the input bytes, before the seam moves them) */
     const unsigned on = scan_aug_plan(c, seed, ctu, tgt, nch, ign, P, o, cy, cx, hasax, chunk, allow_seam, p);
-    if (on) scan_aug_exec(p, ctu, scratch);
+    if (f.on) p->P = P;   /* (a plan without ops returns before setting more than P) */
+    if (on || f.on) scan_aug_exec_f(p, &f, ctu, scratch);
     free(p);
-    return on;
+    return on | (f.on ? 1u << SA_FOURIER : 0);
 }

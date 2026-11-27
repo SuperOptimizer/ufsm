@@ -82,18 +82,24 @@ typedef struct {
     int nchunk, chunk_b0[SA_MAXBOX][3], chunk_b1[SA_MAXBOX][3];   /* SA_CHUNK: boxes that read as air */
     int hist_on; double hist_alpha; float hist_ct[256];          /* SA_HIST: the target CDF */
     uint64_t ns;                        /* the per-voxel noise stream's seed (noise, cnoise, dropped slices, noisy cutouts, in that order) */
-    int four_K; float four_cut, four_a[3], four_b;   /* SA_FOURIER: index box half-size, band edge (index units), knots, anisotropy */
 } scan_plan;
+/* SA_FOURIER's decisions, a record of its own beside the plan (scan_plan and scan_ct_rec keep their layout and bytes with the op off:
+   batch / record hashes and replays compare across binaries): on, the index box half-size K, the band edge (index units), knots,
+   anisotropy, the input's material mean (air reads as it). scan_aug_plan never sets SA_FOURIER; scan_aug_plan_fourier draws it from
+   its own stream of the same seed */
+typedef struct { int on, K; float cut, a[3], b, mean; } scan_four;
+int scan_aug_plan_fourier(const scan_aug_cfg *c, uint64_t seed, const uint8_t *ctu, int P, scan_four *f);   /* f->on (0: f zeroed) */
+void scan_aug_exec_f(const scan_plan *p, const scan_four *f, uint8_t *ctu, void *scratch);   /* scan_aug_exec and the fourier op (f nullptr / off: none) */
 /* SA_FOURIER's gain at integer frequency (kz, ky, kx): 1 outside the band and at DC */
 #ifdef __CUDACC__
 __host__ __device__
 #endif
-static inline float scan_fourier_gain(const scan_plan *p, int kz, int ky, int kx) {
-    const float k2 = (float)(kz * kz + ky * ky + kx * kx), c = p->four_cut;
+static inline float scan_fourier_gain(const scan_four *p, int kz, int ky, int kx) {
+    const float k2 = (float)(kz * kz + ky * ky + kx * kx), c = p->cut;
     if (k2 <= 0 || k2 >= c * c) return 1.f;
     const float r = sqrtf(k2) / c * 3.f; const int j = r < 1 ? 0 : r < 2 ? 1 : 2; const float t = r - (float)j;
-    const float a0 = p->four_a[j], a1 = j < 2 ? p->four_a[j + 1] : 0.f;
-    return expf(a0 + t * (a1 - a0) + p->four_b * (3.f * (float)(kz * kz) / k2 - 1.f));
+    const float a0 = p->a[j], a1 = j < 2 ? p->a[j + 1] : 0.f;
+    return expf(a0 + t * (a1 - a0) + p->b * (3.f * (float)(kz * kz) / k2 - 1.f));
 }
 unsigned scan_aug_plan(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8_t *tgt, int nch, uint8_t *ign, int P,
                        const int64_t o[3], float *cy, float *cx, int hasax, const int chunk[3], int allow_seam, scan_plan *p);

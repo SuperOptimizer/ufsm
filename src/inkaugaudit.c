@@ -157,8 +157,10 @@ static void *aa_worker(void *arg) {
                 if (!C->none) {
                     memset(ign, 0, p3); for (int z = 0; z < P; z++) { cy[z] = -1e4f; cx[z] = -1e4f; }   /* (no axis: ring centres at a random point outside) */
                     const int chunk[3] = {128, 128, 128};
-                    const unsigned on = scan_aug_plan(&C->cfg, amix((uint64_t)ti * 1000003u + (uint64_t)ci * 7919u + (uint64_t)si), u, nullptr, 0, ign, P, T->o, cy, cx, 0, chunk, 0, pl);
-                    if (on) scan_aug_exec(pl, u, scr);
+                    const uint64_t sd = amix((uint64_t)ti * 1000003u + (uint64_t)ci * 7919u + (uint64_t)si); scan_four f;
+                    scan_aug_plan_fourier(&C->cfg, sd, u, P, &f);
+                    const unsigned on = scan_aug_plan(&C->cfg, sd, u, nullptr, 0, ign, P, T->o, cy, cx, 0, chunk, 0, pl);
+                    if (on || f.on) scan_aug_exec_f(pl, &f, u, scr);
                 }
                 double s1 = 0, s2 = 0; size_t nm = 0;   /* the window z-score over material (train's draw() normalisation) */
                 for (size_t k = 0; k < p3; k++) if (u[k]) { s1 += u[k]; s2 += (double)u[k] * u[k]; nm++; }

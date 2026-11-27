@@ -191,17 +191,18 @@ static void test_fourier(void) {
         memset(v0.ign, 0, N); v1 = v0;
         scan_aug_cfg c = one(SA_FOURIER, 1); c.fourier_cut = .2f;   /* (cut P 9.6: K 9) */
         scan_plan *pl = malloc(sizeof *pl);
+        scan_four f4, *pf = &f4; const int fon = scan_aug_plan_fourier(&c, seed, v1.ct, P, &f4);
         const unsigned on = scan_aug_plan(&c, seed, v1.ct, v1.tgt, NCHT, v1.ign, P, O, v1.cy, v1.cx, 1, CHUNK, 1, pl);
-        CHECK(on == 1u << SA_FOURIER && pl->four_K == 9, "fourier fires with K = floor(cut P)");
-        scan_aug_exec(pl, v1.ct, scratch);
+        CHECK(fon && f4.on && f4.K == 9 && on == 0, "fourier fires with K = floor(cut P), in its own record (the plan holds no op)");
+        scan_aug_exec_f(pl, &f4, v1.ct, scratch);
         const double noise = sqrt((double)N / 12); int bad_hi = 0, bad_band = 0, nband = 0;
         static const int ks[][3] = {{2, 1, 0}, {0, 1, 1}, {-3, 0, 1}, {3, 0, -1}, {-1, 0, 1}, {0, 0, 0}, {0, 12, 0}, {10, 1, 1}, {5, 5, 5}, {7, 7, 0}, {0, 20, 3}, {13, 2, 9}};
         for (size_t i = 0; i < sizeof ks / sizeof *ks; i++) {
             double r0, i0, r1, i1; dft_at(v0.ct, ks[i][0], ks[i][1], ks[i][2], &r0, &i0); dft_at(v1.ct, ks[i][0], ks[i][1], ks[i][2], &r1, &i1);
             const int kx = ks[i][2] < 0 ? -ks[i][2] : ks[i][2], sg = ks[i][2] < 0 ? -1 : 1;   /* (the plan's gain is even: m(-k) = m(k)) */
-            const double g = scan_fourier_gain(pl, sg * ks[i][0], sg * ks[i][1], kx), k2 = (double)ks[i][0] * ks[i][0] + ks[i][1] * ks[i][1] + ks[i][2] * ks[i][2];
+            const double g = scan_fourier_gain(pf, sg * ks[i][0], sg * ks[i][1], kx), k2 = (double)ks[i][0] * ks[i][0] + ks[i][1] * ks[i][1] + ks[i][2] * ks[i][2];
             const double a0 = hypot(r0, i0);
-            if (k2 == 0 || k2 >= (double)pl->four_cut * pl->four_cut) { if (hypot(r1 - r0, i1 - i0) > 6 * noise) bad_hi++; }
+            if (k2 == 0 || k2 >= (double)pf->cut * pf->cut) { if (hypot(r1 - r0, i1 - i0) > 6 * noise) bad_hi++; }
             else if (a0 > 200 * noise) { nband++; const double qr = (r1 * r0 + i1 * i0) / (a0 * a0), qi = (i1 * r0 - r1 * i0) / (a0 * a0);
                 if (fabs(qr - g) > .02 * g || fabs(qi) > .02 * g) { bad_band++; fprintf(stderr, "fourier k (%d %d %d): ratio %.4f%+.4fi, gain %.4f\n", ks[i][0], ks[i][1], ks[i][2], qr, qi, g); } }
         }
@@ -212,8 +213,7 @@ static void test_fourier(void) {
         scan_plan *pa = malloc(sizeof *pa), *pb = malloc(sizeof *pb); v1 = v0; v2 = v0;
         scan_aug_plan(&a, seed, v1.ct, v1.tgt, NCHT, v1.ign, P, O, v1.cy, v1.cx, 1, CHUNK, 1, pa);
         scan_aug_plan(&b, seed, v2.ct, v2.tgt, NCHT, v2.ign, P, O, v2.cy, v2.cx, 1, CHUNK, 1, pb);
-        pb->on &= ~(1u << SA_FOURIER); pb->four_K = 0; pb->four_cut = 0; memset(pb->four_a, 0, sizeof pb->four_a); pb->four_b = 0;
-        CHECK(!memcmp(pa, pb, sizeof *pa), "fourier on leaves the other ops' plan unchanged");
+        CHECK(!memcmp(pa, pb, sizeof *pa), "fourier on leaves the other ops' plan unchanged (byte for byte)");
         free(pa); free(pb); free(pl);
     }
 }
@@ -293,9 +293,10 @@ int main(void) {
             c.drop_ignore = (int)(seed & 1);
             fill(&v0, 1, 0); v1 = v0; v2 = v0;
             run(&c, 900 + seed * 41 + (uint64_t)op, &v1, (int)(seed & 1), 1);
-            const unsigned on = scan_aug_plan(&c, 900 + seed * 41 + (uint64_t)op, v2.ct, v2.tgt, NCHT, v2.ign, P, O, v2.cy, v2.cx, (int)(seed & 1), CHUNK, 1, pl);
+            scan_four f4; scan_aug_plan_fourier(&c, 900 + seed * 41 + (uint64_t)op, v2.ct, P, &f4);
+            const unsigned on = scan_aug_plan(&c, 900 + seed * 41 + (uint64_t)op, v2.ct, v2.tgt, NCHT, v2.ign, P, O, v2.cy, v2.cx, (int)(seed & 1), CHUNK, 1, pl) | (f4.on ? 1u << SA_FOURIER : 0);
             if (on) scan_plan_air(pl, v2.ct, air);
-            if (on) scan_aug_exec(pl, v2.ct, scratch);
+            if (on) scan_aug_exec_f(pl, &f4, v2.ct, scratch);
             bad_same += !same(&v1, &v2);
             if (on) for (size_t k = 0; k < N; k++) { bad_air += (v2.ct[k] == 0) != (air[k] != 0); nair += air[k] != 0; }
         }

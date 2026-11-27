@@ -40,9 +40,10 @@ static void lb_sum(void *c_, void *d, int n, int type, void *st) {
     pthread_barrier_wait(&c->bar);
     free(c->hb[me]);
 }
-typedef struct { const uint8_t *ct8; const void *rec, *rad_h; void *rad_d, *out; int P, z0, nz; nn_zcomm zc; } ct_job;
+typedef struct { const uint8_t *ct8; const void *rec, *rad_h; void *rad_d, *out; int P, z0, nz; nn_zcomm zc; const scan_four *four; } ct_job;
 static void *ct_rank(void *j_) {
     ct_job *j = j_; t_rank = j->zc.rank;
+    nn_aug_set_fourier(j->four);   /* (per thread: each rank's) */
     nn_aug_ct_z(j->ct8, j->rec, j->rad_h, j->rad_d, j->P, j->z0, j->nz, j->out, &j->zc, 0);   /* (stream 0: the two ranks' work serialised on the device) */
     nn_sync();
     return nullptr;
@@ -216,6 +217,7 @@ int main(int argc, char **argv) {
             const uint64_t seed = 91 + 1009 * (uint64_t)(op + 2) + 31 * sv; const int warped = (op + sv) % 2 == 0;
             memcpy(cin, ct, p3); memset(ign, 0, p3); memcpy(cyy, cy0, sizeof cyy); memcpy(cxx, cx0, sizeof cxx);
             uint8_t *tg = malloc(2 * p3); memcpy(tg, tgt, 2 * p3);
+            scan_four f4; scan_aug_plan_fourier(&c, seed, cin, P, &f4); nn_aug_set_fourier(&f4);   /* (SA_FOURIER: its own record) */
             const unsigned on = scan_aug_plan(&c, seed, cin, tg, 2, ign, P, o, cyy, cxx, sv, chunk, 1, pl); free(tg);
             sym sy = sym_of((int)((seed * 7) % 48)); spatial_aug sa = {0};
             if (warped) { spatial_aug_make(&sa, seed, P, 10, 1, 1, 1); spatial_aug_zoom(&sa, .8); }
@@ -233,7 +235,7 @@ int main(int argc, char **argv) {
                 loop_ctx lc; pthread_barrier_init(&lc.bar, nullptr, 2);
                 ct_job J[2]; pthread_t th[2];
                 for (int r = 0; r < 2; r++) {
-                    J[r] = (ct_job){.ct8 = cin_p, .rec = rec, .rad_h = rad_h, .rad_d = rad_d, .out = Hr[r], .P = P, .z0 = ranges[rg][r][0], .nz = ranges[rg][r][1]};
+                    J[r] = (ct_job){.ct8 = cin_p, .rec = rec, .rad_h = rad_h, .rad_d = rad_d, .out = Hr[r], .P = P, .z0 = ranges[rg][r][0], .nz = ranges[rg][r][1], .four = &f4};
                     J[r].zc = (nn_zcomm){.ctx = &lc, .rank = r, .nrank = 2, .slot = r, .peer_z0 = ranges[rg][1 - r][0], .peer_nz = ranges[rg][1 - r][1], .xchg = lb_xchg, .sum = lb_sum};
                 }
                 nn_aug_stage_reset(); nn_sync();
@@ -249,23 +251,26 @@ int main(int argc, char **argv) {
             }
             nct++;
         }
+        nn_aug_set_fourier(nullptr);
         {   /* the negative control: the mixture case with the exchanges dropped must differ (the split depends on them) */
             scan_aug_cfg c = {.strength = 1.f, .drop_ignore = 1, .hist = g_t, .nhist = 1}; for (int i = 0; i < SA_N; i++) c.p[i] = .6f;
             memcpy(cin, ct, p3); memset(ign, 0, p3); memcpy(cyy, cy0, sizeof cyy); memcpy(cxx, cx0, sizeof cxx);
             uint8_t *tg = malloc(2 * p3); memcpy(tg, tgt, 2 * p3);
+            scan_four f4; scan_aug_plan_fourier(&c, 4242, cin, P, &f4); nn_aug_set_fourier(&f4);
             const unsigned on = scan_aug_plan(&c, 4242, cin, tg, 2, ign, P, o, cyy, cxx, 1, chunk, 1, pl); free(tg);
             sym sy = sym_of(5); rad_record(rad_h, o, P, P, 1, sy, cyy, cxx, nullptr); nn_h2d(rad_d, rad_h, NN_RAD_REC(P));
             memset(rec, 0, sizeof *rec); rec->scan = on != 0; rec->xfmt = 1; if (on) rec->plan = *pl; memcpy(cin_p, cin, p3);
             nn_aug_stage_reset(); nn_aug_ct(cin_p, rec, rad_d, P, Hd, 0); nn_d2h(Hw, Hd, 2 * p3);
             loop_ctx lc; pthread_barrier_init(&lc.bar, nullptr, 2); ct_job J[2]; pthread_t th[2];
             for (int r = 0; r < 2; r++) {
-                J[r] = (ct_job){.ct8 = cin_p, .rec = rec, .rad_h = rad_h, .rad_d = rad_d, .out = Hr[r], .P = P, .z0 = ranges[0][r][0], .nz = ranges[0][r][1]};
+                J[r] = (ct_job){.ct8 = cin_p, .rec = rec, .rad_h = rad_h, .rad_d = rad_d, .out = Hr[r], .P = P, .z0 = ranges[0][r][0], .nz = ranges[0][r][1], .four = &f4};
                 J[r].zc = (nn_zcomm){.ctx = &lc, .rank = r, .nrank = 2, .slot = r, .peer_z0 = ranges[0][1 - r][0], .peer_nz = ranges[0][1 - r][1], .xchg = lb_xchg, .sum = lb_sum};
             }
             g_lb_break = 1; nn_aug_stage_reset(); nn_sync();
             for (int r = 0; r < 2; r++) pthread_create(&th[r], nullptr, ct_rank, &J[r]);
             for (int r = 0; r < 2; r++) pthread_join(th[r], nullptr);
             g_lb_break = 0; pthread_barrier_destroy(&lc.bar);
+            nn_aug_set_fourier(nullptr);
             size_t nd = 0; for (int r = 0; r < 2; r++) { nn_d2h(Hz, Hr[r], 2 * (size_t)J[r].nz * p2); for (size_t k = 0; k < (size_t)J[r].nz * p2; k++) nd += Hz[k] != Hw[(size_t)J[r].z0 * p2 + k]; }
             CHECK(on && nd > 0, "negative control: the split without its exchanges still matched (on %x, %zu voxels differ)", on, nd);
             printf("test_aug_z: negative control: the split without its exchanges differs on %zu voxels (on %x)\n", nd, on);

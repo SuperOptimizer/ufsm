@@ -63,9 +63,10 @@ int main(int argc, char **argv) {
         const uint64_t seed = 77 + 1009 * (uint64_t)(op + 2) + 31 * sv; const int hasax = sv & 1, warped = (op + sv) % 2 == 0;
         memcpy(cin, ct, p3); memset(ign, 0, p3); memcpy(cy, cy0, sizeof cy); memcpy(cx, cx0, sizeof cx);
         uint8_t *tg = malloc(2 * p3); memcpy(tg, tgt, 2 * p3);
-        const unsigned on = scan_aug_plan(&c, seed, cin, tg, 2, ign, P, o, cy, cx, hasax, chunk, 1, pl);
+        scan_four f4; scan_aug_plan_fourier(&c, seed, cin, P, &f4);   /* (SA_FOURIER: its own record, on the bytes before the seam) */
+        const unsigned on0 = scan_aug_plan(&c, seed, cin, tg, 2, ign, P, o, cy, cx, hasax, chunk, 1, pl), on = on0 | (f4.on ? 1u << SA_FOURIER : 0);
         memcpy(cpu, cin, p3);
-        if (on) scan_aug_exec(pl, cpu, scr);
+        if (on) scan_aug_exec_f(pl, &f4, cpu, scr);
         size_t nz; double sum, sq; u8_stats(cpu, p3, &nz, &sum, &sq);
         const double mean = sum / (double)p3, var = sq / (double)p3 - mean * mean, sd = sqrt(var > 0 ? var : 0) + 1e-3;
         sym sy = sym_of((int)((seed * 7) % 48)); spatial_aug sa = {0};
@@ -77,9 +78,9 @@ int main(int argc, char **argv) {
         else write_x_ct(cpu, P, P, (float)mean, (float)(1.0 / sd), sy, 0, 1.f, 0.f, 0.f, &r, 1, Hc);
         rad_record(rad_h, o, P, P, hasax, sy, cy, cx, warped ? &sa : nullptr);
         nn_h2d(rad_d, rad_h, NN_RAD_REC(P));
-        memset(rec, 0, sizeof *rec); rec->scan = on != 0; rec->xfmt = 1; if (on) rec->plan = *pl;
+        memset(rec, 0, sizeof *rec); rec->scan = on0 != 0; rec->xfmt = 1; if (on0) rec->plan = *pl;
         memcpy(cin_p, cin, p3);
-        nn_aug_ct(cin_p, rec, rad_d, P, Hd, 0);
+        nn_aug_set_fourier(&f4); nn_aug_ct(cin_p, rec, rad_d, P, Hd, 0); nn_aug_set_fourier(nullptr);
         nn_aug_last_bytes(gpu, P); nn_d2h(Hg, Hd, 2 * p3);
         size_t zbad = 0, big = 0; double ad = 0; int mx = 0;
         for (size_t k = 0; k < p3; k++) {

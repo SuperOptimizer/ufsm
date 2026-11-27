@@ -31,6 +31,7 @@ typedef struct {
     const void *key; int ks0, ks1;  /* key: the host plane whose source planes [ks0, ks1) the staging buffer holds unchanged */
     double *fX; float2 *fD, *fR, *ftw; float *fW, *fV; int fP, fK; size_t fR_n;   /* SA_FOURIER: the band, its change, a chunk's y / z partials, tables */
 } aug_dev;
+static thread_local const scan_four *g_four_h;   /* nn_aug_set_fourier: the next window's SA_FOURIER record (per calling thread) */
 static size_t g_four_resv;   /* mgpu: config (set once before the planner). SA_FOURIER: the bytes nn_aug_device_bytes adds (nn_aug_fourier_reserve) */
 static aug_dev g_ad[16];   /* per device, two slots (nn_zcomm.slot: two ranks on one device in the tests) */
 static int lw_keyed(const aug_dev *a, const void *h, int s0, int s1) { return a->key == h && a->ks0 == s0 && a->ks1 == s1; }
@@ -627,11 +628,11 @@ __global__ void four_fz_k(const float2 *R, double *X, const float2 *tw, int P, i
         re += (double)r.x * w.x - (double)r.y * w.y; im += (double)r.x * w.y + (double)r.y * w.x; }
     X[2 * i] += re; X[2 * i + 1] += im;
 }
-__global__ void four_gain_k(const double *X, float2 *D, const scan_plan *p, int K) {   /* D = X (m - 1) */
+__global__ void four_gain_k(const double *X, float2 *D, scan_four fo, int K) {   /* D = X (m - 1) */
     const int NK = K + 1, NY = 2 * K + 1; const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)NY * NY * NK) return;
     const int kx = (int)(i % NK), a = (int)(i / NK % NY), b = (int)(i / ((size_t)NK * NY));
-    const double g = (double)scan_fourier_gain(p, b - K, a - K, kx) - 1;
+    const double g = (double)scan_fourier_gain(&fo, b - K, a - K, kx) - 1;
     D[i] = make_float2((float)(X[2 * i] * g), (float)(X[2 * i + 1] * g));
 }
 /* inverse z: R[zl][a][kx] = sum_b D[b][a][kx] e^{+i kz z} */
@@ -668,6 +669,7 @@ static void four_get(aug_dev *a, int P, int K) {
     CK(cudaMemcpy(a->fV, h + 2 * P + 2 * (size_t)P * NK, (size_t)P * NK * 8, cudaMemcpyHostToDevice)); free(h);
     a->fP = P; a->fK = K; a->fR_n = nzc * NY * NK;
 }
+extern "C" void nn_aug_set_fourier(const void *f) { g_four_h = (const scan_four *)f; }
 extern "C" void nn_aug_fourier_reserve(int P, int K) { g_four_resv = K > 0 ? four_bytes(P, K, (size_t)P) : 0; }
 
 /* ---- the scanner ops of a plan on F (16-bit, the input bytes loaded) over the source planes [oa, ob) of the window, stream s. F and
@@ -692,7 +694,7 @@ static int aug_plan_halo(const scan_plan *p, int P) {
     return h;
 }
 static int zc_owner(int P, int nrank, int z) { return nrank > 1 && z >= P / 2 ? 1 : 0; }
-static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, uint8_t *in, int oa, int ob, int h, const nn_zcomm *zc, cudaStream_t s) {
+static void aug_scan(aug_dev *a, const scan_plan *p, const scan_four *fo, int P, __half *F, uint8_t *in, int oa, int ob, int h, const nn_zcomm *zc, cudaStream_t s) {
     const size_t P2 = (size_t)P * P, k0 = (size_t)oa * P2, k1 = (size_t)ob * P2, n = k1 - k0; const unsigned on = p->on; const unsigned nb = nblk(n, 256);
     const int split = zc && zc->nrank > 1, rk = split ? zc->rank : 0, nr = split ? 2 : 1;
     const uint64_t hp = (uint64_t)(P + 1) / 2; uint64_t q = 0;   /* the noise stream's calls so far */
@@ -713,20 +715,20 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, uint8_t *
         if (g_bop_line) { aug_bop_uniq_k<<<1, 1, 0, s>>>(&pd->bop[2], P, a->uw, a->ui, a->nu); aug_bop_xu_k<<<nblk(re - rb, R), 256, (size_t)R * P * 2, s>>>(F, &pd->bop[2], P, R, a->uw, a->ui, a->nu, rb, re); }
         else aug_bop_x_k<<<(unsigned)(re - rb), 128, (size_t)P * 4, s>>>(F, &pd->bop[2], P, rb);
     }
-    if (on & 1u << SA_FOURIER) {   /* (the air rule: scan_aug_exec's Z at this point, the input's zeros unless SA_AIR) */
-        const int K = p->four_K, NK = K + 1, NY = 2 * K + 1; four_get(a, P, K);
+    if (fo) {   /* (the air rule: scan_aug_exec's Z at this point, the input's zeros unless SA_AIR) */
+        const int K = fo->K, NK = K + 1, NY = 2 * K + 1; four_get(a, P, K);
         const size_t nzm = four_chunk(a, P, K) < (size_t)P ? four_chunk(a, P, K) : (size_t)P, nx = (size_t)NY * NY * NK;
         if (nzm < 1) { fprintf(stderr, "nn_aug: the fourier op's chunk holds no plane (P %d, K %d)\n", P, K); abort(); }
         float2 *Rx = (float2 *)a->cn; const int air = !(on & 1u << SA_AIR);
         CK(cudaMemsetAsync(a->fX, 0, nx * 16, s));
         for (int z = oa; z < ob; z += (int)nzm) {
             const int nzc = z + (int)nzm < ob ? (int)nzm : ob - z; const int M = nzc * P;
-            four_gemm_k<0><<<dim3(nblk(2 * NK, 32), nblk(M, 64)), 256, 0, s>>>(F, a->fW, (float *)Rx, nullptr, M, 2 * NK, P, in, air, (float)p->mean, (size_t)z * P2);
+            four_gemm_k<0><<<dim3(nblk(2 * NK, 32), nblk(M, 64)), 256, 0, s>>>(F, a->fW, (float *)Rx, nullptr, M, 2 * NK, P, in, air, fo->mean, (size_t)z * P2);
             four_fy_k<<<nblk((size_t)nzc * NY * NK, 128), 128, 0, s>>>(Rx, a->fR, a->ftw, P, K, nzc);
             four_fz_k<<<nblk(nx, 128), 128, 0, s>>>(a->fR, a->fX, a->ftw, P, K, z, nzc);
         }
         zc_sum(zc, a->fX, (int)(2 * nx), 1, s);
-        four_gain_k<<<nblk(nx, 128), 128, 0, s>>>(a->fX, a->fD, pd, K);
+        four_gain_k<<<nblk(nx, 128), 128, 0, s>>>(a->fX, a->fD, *fo, K);
         for (int z = oa; z < ob; z += (int)nzm) {
             const int nzc = z + (int)nzm < ob ? (int)nzm : ob - z; const int M = nzc * P;
             four_iz_k<<<nblk((size_t)nzc * NY * NK, 128), 128, 0, s>>>(a->fD, a->fR, a->ftw, P, K, z, nzc);
@@ -843,8 +845,14 @@ extern "C" void nn_aug_ct_z(const uint8_t *ct8_h, const void *rec_h_, const void
     CK(cudaMemcpyAsync(a->rec, rec_h, offsetof(scan_ct_rec, plan), cudaMemcpyHostToDevice, s));
     nn_ptick_fine("    x ct bytes h2d");
     const size_t xb = 2;   /* (a half / bfloat16 channel) */
-    if (rec_h->scan) {
-        CK(cudaMemcpyAsync(a->plan, &rec_h->plan, sizeof(scan_plan), cudaMemcpyHostToDevice, s));
+    const scan_four *fo = g_four_h && g_four_h->on ? g_four_h : nullptr;
+    if (rec_h->scan || fo) {
+        const scan_plan *ph = &rec_h->plan;
+        if (!rec_h->scan) {   /* (the fourier op alone: a plan without ops, P set; pageable: the copy completes before the call returns) */
+            static thread_local scan_plan *zp; if (!zp && !(zp = (scan_plan *)calloc(1, sizeof *zp))) abort();
+            zp->P = P; ph = zp;
+        }
+        CK(cudaMemcpyAsync(a->plan, ph, sizeof(scan_plan), cudaMemcpyHostToDevice, s));
         __half *F;
         if (fb - fa <= nz) F = (__half *)ct16 - (size_t)fa * P2;   /* (the CT channel's buffer as the work volume, as before) */
         else {   /* (a range narrower than the work planes: its own buffer) */
@@ -852,7 +860,7 @@ extern "C" void nn_aug_ct_z(const uint8_t *ct8_h, const void *rec_h_, const void
             if (a->fw_n < need) { if (a->fw) { CK(cudaStreamSynchronize(s)); cudaFree(a->fw); } CK(cudaMalloc(&a->fw, need)); a->fw_n = need; }
             F = (__half *)a->fw - (size_t)fa * P2;
         }
-        aug_scan(a, &rec_h->plan, P, F, in, oa, ob, h, zc, s);
+        aug_scan(a, ph, fo, P, F, in, oa, ob, h, zc, s);
         if (split) {   /* the peer's scanned bytes of the planes this rank's warp reads (and ours of the peer's: its bound from its range) */
             int ps0, ps1; nn_aug_src_range(rad_h, P, zc->peer_z0, zc->peer_nz, &ps0, &ps1);
             const int poa = (1 - rk) * (P / 2), pob = poa + P / 2;

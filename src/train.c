@@ -703,7 +703,7 @@ static void ssl2_upload(gpu_state *d, const batch *b, int i, int P, int async) {
     ssl2_teacher_rec(b->rad, d->radth[i], P, sh, zoom);
     memcpy(d->ssl2rec[i], b->aug, offsetof(scan_ct_rec, plan)); d->ssl2rec[i]->scan = 0; d->ssl2rec[i]->jitter = 0;   /* (no scanner plan: nn_aug_ct reads it only with scan) */
     if (async) nn_h2d_copy_stream(d->radtb[i], d->radth[i], NN_RAD_REC(P)); else nn_h2d(d->radtb[i], d->radth[i], NN_RAD_REC(P));
-    nn_aug_ct(b->ct8, d->ssl2rec[i], d->radtb[i], P, d->xtb[i], async);
+    nn_aug_set_fourier(nullptr); nn_aug_ct(b->ct8, d->ssl2rec[i], d->radtb[i], P, d->xtb[i], async);
     const long nm = ssl2_map(b->rad, d->radth[i], P, ssl_cell(), d->maph[i]); d->ssl2_cells = (double)nm / g_ssl_S;
     if (async) nn_h2d_copy_stream(d->mapb[i], d->maph[i], g_ssl_S * 3 * sizeof(float)); else nn_h2d(d->mapb[i], d->maph[i], g_ssl_S * 3 * sizeof(float));
     d->ssl2b[i] = 1;
@@ -984,10 +984,10 @@ static void ct_upload(const batch *b, void *x, void *rad, int B, int P, int asyn
         if (lz_range(P, &z0, &nz)) {   /* --split z: this half's planes; the scanner ops exchange halos / carries / statistics through split.c */
             const int r = split_side();
             const nn_zcomm zc = {nullptr, r, 2, g_split_same ? r : 0, split_z0(1 - r, P), g_Pz, nullptr, zc_xchg, zc_sum};
-            nn_aug_ct_z(b->ct8, (const scan_ct_rec *)b->aug, b->rad, rad, P, z0, nz, x, &zc, async);
+            nn_aug_set_fourier(b->four); nn_aug_ct_z(b->ct8, (const scan_ct_rec *)b->aug, b->rad, rad, P, z0, nz, x, &zc, async);
             return;
         }
-        for (int s = 0; s < B; s++) nn_aug_ct(b->ct8 + (size_t)s * p3, (const scan_ct_rec *)b->aug + s, (const char *)rad + (size_t)s * NN_RAD_REC(g_Pw), P, (char *)x + (size_t)s * p3 * xbytes(), async);
+        for (int s = 0; s < B; s++) nn_aug_set_fourier(b->four ? (const scan_four *)b->four + s : nullptr), nn_aug_ct(b->ct8 + (size_t)s * p3, (const scan_ct_rec *)b->aug + s, (const char *)rad + (size_t)s * NN_RAD_REC(g_Pw), P, (char *)x + (size_t)s * p3 * xbytes(), async);
         return;
     }
     if (async) nn_h2d_copy_stream(x, bx(b), (size_t)B * g_xs * p3 * xbytes()); else nn_h2d(x, bx(b), (size_t)B * g_xs * p3 * xbytes());
