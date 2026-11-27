@@ -31,7 +31,7 @@ typedef struct {
     const void *key; int ks0, ks1;  /* key: the host plane whose source planes [ks0, ks1) the staging buffer holds unchanged */
     double *fX; float2 *fD, *fR, *ftw; float *fW, *fV; int fP, fK; size_t fR_n;   /* SA_FOURIER: the band, its change, a chunk's y / z partials, tables */
 } aug_dev;
-static size_t g_four_resv;   /* SA_FOURIER: the bytes nn_aug_device_bytes adds (nn_aug_fourier_reserve) */
+static size_t g_four_resv;   /* mgpu: config (set once before the planner). SA_FOURIER: the bytes nn_aug_device_bytes adds (nn_aug_fourier_reserve) */
 static aug_dev g_ad[16];   /* per device, two slots (nn_zcomm.slot: two ranks on one device in the tests) */
 static int lw_keyed(const aug_dev *a, const void *h, int s0, int s1) { return a->key == h && a->ks0 == s0 && a->ks1 == s1; }
 static void lw_setkey(aug_dev *a, const void *h, int s0, int s1) { a->key = h; a->ks0 = s0; a->ks1 = s1; }
