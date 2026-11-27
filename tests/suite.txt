@@ -158,6 +158,7 @@ test_score_par                                 |              |     8 | ./$B/tes
 test_grid_sparse                               | gpu,smoke    |     2 | ./$B/test_grid_sparse
 test_density_lambda                            | gpu          |    40 | ./$B/test_density_lambda ./$B/ufsm ./$B/make_wind_fixture
 test_coreline                                  | smoke        |     2 | ./$B/test_coreline
+test_umbfind                                   |              |     5 | ./$B/test_umbfind
 test_fit_w4                                    | gpu          |    16 | ./$B/test_fit_w4
 test_repair                                    |              |    90 | UFSM_TEST_QUICK=1 ./$B/test_repair
 test_repair~full                               | slow         |   475 | ./$B/test_repair
@@ -255,6 +256,7 @@ test_chunk_map                                 | smoke        |     2 | ./$B/tes
 test_wrapxsec                                  | smoke        |     2 | ./$B/test_wrapxsec
 test_wraprays                                  | smoke        |     2 | ./$B/test_wraprays
 test_ink_blend_block                           |              |     5 | ./$B/test_ink_blend_block
+test_ink_proto                                 | gpu          |     3 | ./$B/test_ink_proto
 test_tile_list                                 |              |     1 | ./$B/test_tile_list
 test_http_reader                               |              |    29 | python3 tests/test_http_reader.py
 test_checkpoint_runtime                        | smoke        |     1 | ./$B/test_checkpoint_runtime

@@ -800,6 +800,8 @@ void nn_rv_fuse(void *lg, size_t n, int h16);   /* predict --channel rv: [recto 
 void nn_ink_targets(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m);   /* train --ink-head: ink prob254 (255 unknown) -> target t (x255) and mask m (known) */
 void nn_ink_targets_smooth(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m, float eps);   /* the same, label-smoothed: t (1 - eps) + eps / 2 (train --ink-smooth) */
 void nn_ink_air(const uint8_t *pap, size_t n, int z0, int H, int W, int S, float eps, uint8_t *t, uint8_t *m);   /* train --ink-air S: unlabelled air voxels on the S-lattice -> ink 0 (the smoothed 0), mask 1 */
+void nn_ink_neg(const uint8_t *ink, size_t vb, size_t n, int D, int H, int W, int R, const void *lg, float thr, uint8_t *m, int count);   /* train --ink-neg-guard R / --ink-neg-gate T: label negatives within R voxels of a positive, or (lg: fp16 logits) with p > T, leave the slab mask m (ink: the window plane, slab = [vb, vb + n)); count: + nn_ink_neg_counts */
+void nn_ink_neg_counts(unsigned long long out[3]);   /* known negatives, guard drops, gate drops since the last call (all devices) */
 void nn_phase_trunc(const void *lc, const void *ls, const uint8_t *t, uint8_t *m, size_t n, float tau, float kappa);   /* robust phase loss: confident (>= kappa) predictions off their label by > tau turns leave the mask (fp16 logits) */
 void nn_phase_trunc_counts(unsigned long long out[2]);   /* labelled voxels / dropped since the last call */
 void nn_sheet_mask_z(const uint8_t *phase, int d, int h, int w, int s, float lo, float hi, uint8_t *m, int z0, int z1);   /* train --sheet-mask: the phase mask of phase-0 (labelled sheet) voxels x ramp(local spacing LO..HI voxels), planes [z0, z1) of the window into m (planes of z1 - z0) */

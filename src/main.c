@@ -55,6 +55,7 @@ int cmd_z3_fetch(int argc, char **argv);    /* src/z3fetch.c */
 int cmd_surf_resample(int argc, char **argv);   /* src/surfresample.c */
 int cmd_ink_blend(int argc, char **argv);   /* src/ingest.c */
 int cmd_ink_seam(int argc, char **argv);   /* src/inkseam.c */
+int cmd_ink_proto(int argc, char **argv);   /* src/inkproto.c */
 int cmd_ingest_kaggle(int argc, char **argv);
 int cmd_ingest_mesh(int argc, char **argv);
 int cmd_ls(int argc, char **argv);
@@ -95,6 +96,8 @@ int cmd_ink_cover(int argc, char **argv);
 int cmd_self_gate(int argc, char **argv);
 int cmd_stitch(int argc, char **argv);   /* src/stitch.c */
 int cmd_coreline(int argc, char **argv);   /* src/coreline.c */
+int cmd_umbilicus(int argc, char **argv);   /* src/umbfind.c */
+int cmd_axis_diff(int argc, char **argv);   /* src/umbfind.c */
 int cmd_coreline_check(int argc, char **argv);   /* src/coreline_check.c */
 int cmd_render_sheets(int argc, char **argv);   /* src/render.c */
 int cmd_sheet_pbr(int argc, char **argv);       /* src/sheetpbr.c */
@@ -173,10 +176,13 @@ static int usage(void) {
         "  ufsm mirror  <root> <array-key> <out-dir> [--threads 4] [--mbps 0] [--link-from DIR] [--verify N]  local copy of one array's shard files\n"
         "  ufsm scanprep <root> <group-key> --level L --out PREFIX [...]   per-scan object mask + CT statistics (src/scanprep.h)\n"
         "  ufsm axis    <root> <ct-group-key> <out.json> [--cache DIR]  -> per-z centroid axis (umbilicus stand-in)\n"
+        "  ufsm umbilicus OUT.json --um0 UM (--ct-root R --ct-key K --level L | --fields DIR) [--ref AXIS]   umbilicus by sheet-normal voting (villa port)\n"
+        "  ufsm axis-diff A.json B.json --um0 UM   per-z distance of two umbilicus files (mm: median, p90, max)\n"
         "  ufsm ingest-labels <root> <zarr-key> <out-dir> --um U   HF/S3 zarr v2 labels -> volcomp pyramid\n"
         "  ufsm z3-recode <group-dir> <out-group> --um U --lut FILE [--hist 1]   a local prob254 pyramid through a LUT (255 kept), value histogram\n"
         "  ufsm z3-fetch ROOT KEY --cache DIR --box z,y,x,dz,dy,dx [--scale F] [--margin 128] [--threads 16]   the box's chunks into a z3 chunk cache (no decode)\n"
         "  ufsm surf-resample SRC-SURFS SRC-MAPS DST-SURFS OUT [--suffix _reader3.tif] [--max-dist 4] [--scale 1]   a map on one surface set resampled onto another (3-D)\n"
+        "  ufsm ink-proto label OUT --teacher ROOT KEY --cos ROOT KEY --ct ROOT KEY --ct-um U --level L   prototype x teacher 3-D ink labels (predict --proto-seed / --proto)\n"
         "  ufsm ink-blend <out> --um U --tile S,S,S --grids z,y,x:... <in1> <in2> ...   overlapping uint8 predicts (predict --grid-origin) blended with sin^2 tile weights\n"
         "  ufsm phase-cmp A.json B.json [--boxes 24] [--P 256]   per source: the share of B's known on-the-fly phase voxels A leaves unknown (e.g. rmax 80 vs 160)\n"
         "  ufsm phase-near GT.json SOURCE FIELDS-DIR --box z,y,x,nz,ny,nx   predicted phase-0 sheets vs the GT sheets on the level-0 grid (um; fields of any level upsampled)\n"
@@ -5054,6 +5060,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "z3-fetch")) return cmd_z3_fetch(argc, argv);
     if (!strcmp(cmd, "surf-resample")) return cmd_surf_resample(argc, argv);
     if (!strcmp(cmd, "ink-blend")) return cmd_ink_blend(argc, argv);
+    if (!strcmp(cmd, "ink-proto")) return cmd_ink_proto(argc, argv);
     if (!strcmp(cmd, "ink-seam")) return cmd_ink_seam(argc, argv);
     if (!strcmp(cmd, "ingest-kaggle")) return cmd_ingest_kaggle(argc, argv);
     if (!strcmp(cmd, "ingest-mesh")) return cmd_ingest_mesh(argc, argv);
@@ -5148,6 +5155,8 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);
     if (!strcmp(cmd, "coreline") && argc > 2 && !strcmp(argv[2], "check")) return cmd_coreline_check(argc, argv);
     if (!strcmp(cmd, "coreline")) return cmd_coreline(argc, argv);
+    if (!strcmp(cmd, "umbilicus")) return cmd_umbilicus(argc, argv);
+    if (!strcmp(cmd, "axis-diff")) return cmd_axis_diff(argc, argv);
     if (!strcmp(cmd, "render-sheets")) return cmd_render_sheets(argc, argv);
     if (!strcmp(cmd, "sheet-pbr")) return cmd_sheet_pbr(argc, argv);
     if (!strcmp(cmd, "overlay-red")) return cmd_overlay_red(argc, argv);
