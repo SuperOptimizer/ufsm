@@ -256,7 +256,23 @@ at w320).
   since it still uses each window's statistics, but the checkpoint carries pooled running statistics for a window-independent predict.
 - Training on the running statistics (a finite warm) is only for its own A/B: the 11-14 admuon control blew up at the switch.
 - For R11P: post-hoc pooled statistics (`predict --gn-save` at w768, then `--gn-frozen`), A/B on HOLD against window mode, and the seam
-  jump on PHerc1203 (gn/gnab.sh, gn1203.sh). Results follow when they land.
+  jump on PHerc1203 (gn/gnab6.sh, gn1203f.sh).
+- **Result (11-26 night): no.** `--gn-frozen` gains nothing on HOLD, and it does not remove the 1203 seams. The statistics were pooled
+  over 64 w768 windows of the scan, per rung. HOLD AUC, window / frozen (frozen − window ± SE):
+
+  | scroll, rung | w576 | pair | w768 | pair |
+  |---|---|---|---|---|
+  | 1667, 1.1 | .868 / .851 | −0.017 ± 0.035 | .896 / .863 | −0.034 ± 0.029 |
+  | 1667, 2.2 | .874 / .858 | −0.016 ± 0.023 | .860 / .846 | −0.014 ± 0.022 |
+  | P4, 1.1 | .888 / .889 | +0.002 ± 0.008 | .891 / .891 | −0.001 ± 0.008 |
+  | P4, 2.2 | .848 / .862 | +0.014 ± 0.027 | .864 / .859 | −0.005 ± 0.016 |
+
+- PHerc1203, w576 / h32, 2 x 2 x 6 tiles around perf's point. ink-seam jump at the window seams is 4.76 with each window's own
+  statistics, 3.55 frozen on 1203, and 4.82 frozen on 1667 at 2.258 um; off the seams (offset 256) it is ~0 for all three.
+- So per-window statistics explain only ~25 % of the seam. The rest is edge context: halo 32 is far below the receptive field, and the
+  border voxels see zero-padded context. That fits `--seamless 2` taking the jump to 0.11 (unroll's ab640c).
+- The fix is a larger halo or seamless, not frozen statistics.
+- w1024 at level 0 does not fit a 16 GB card (an 18.25 GB slab buffer; predict stops with an OOM error, rc 1).
 
 ## PHerc1203 status: every read so far shows no text; card 0 stops reading this band (2026-11-26, unroll)
 
