@@ -63,15 +63,16 @@ static tsum topo_host(const float *lc, const float *ls, const uint8_t *ph, const
 }
 /* the label: concentric sheets ~10 voxels apart around an axis outside the box (normals mostly in the plane, as in a scroll), a little z tilt */
 static double wt(int z, int y, int x) { const double r = sqrt((y + 30.0) * (y + 30.0) + (x - 20.0) * (x - 20.0)); return r / 10.0 + 0.02 * z; }
-static double bump(int z, int y, int x) {   /* one extra turn over ~6 voxels across a radius band, in the half y < 24 only */
-    (void)z; if (y >= 24) return 0; const double r = sqrt((y + 30.0) * (y + 30.0) + (x - 20.0) * (x - 20.0)), u = (r - 52.0) / 6.0;
-    return u <= 0 ? 0 : u >= 1 ? 1 : u * u * (3 - 2 * u);
+static double bump(int z, int y, int x, double sgn) {   /* in the half y < 24 only, across a radius band: + one extra turn over ~6 voxels (smoothstep);
+                                                          - one turn removed over the 10 voxels of a label turn (linear: the phase stands still there, a missed sheet) */
+    (void)z; if (y >= 24 || sgn == 0) return 0; const double r = sqrt((y + 30.0) * (y + 30.0) + (x - 20.0) * (x - 20.0)), u = (r - 52.0) / (sgn > 0 ? 6.0 : 10.0);
+    return u <= 0 ? 0 : u >= 1 ? sgn : sgn > 0 ? u * u * (3 - 2 * u) : -u;
 }
 /* logits of a phasor r e^{2 pi i v}: per channel the logit of (1 + component) / 2 */
 static void mk_logits(float *lc, float *ls, double sgn, double noise) {
     for (int z = Z0; z < Z1; z++) for (int y = 0; y < H; y++) for (int x = 0; x < Wd; x++) {
         const size_t i = ((size_t)(z - Z0) * H + y) * Wd + x;
-        const double v = wt(z, y, x) + sgn * bump(z, y, x) + noise * (2 * urand() - 1), r = 0.55 + 0.4 * urand();
+        const double v = wt(z, y, x) + bump(z, y, x, sgn) + noise * (2 * urand() - 1), r = 0.55 + 0.4 * urand();
         const double pc = 0.5 + 0.5 * r * cos(2 * M_PI * v), ps = 0.5 + 0.5 * r * sin(2 * M_PI * v);
         lc[i] = (float)log(pc / (1 - pc)); ls[i] = (float)log(ps / (1 - ps));
     }
