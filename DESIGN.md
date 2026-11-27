@@ -329,7 +329,7 @@ of another w4_d x um are left out with a DEFAULTED line. The output's w4_d is in
 | fz-phn: w24 phase + normals | -0.015 [-0.072, +0.030] | -0.015 [-0.056, +0.014] | -0.056 [-0.122, +0.019] | -0.028 [-0.044, -0.009] |
 | **fz-phb: phase = complex mean of both (resultant), the rest try9** | **+0.025 [+0.001, +0.065]** | **+0.015 [+0.003, +0.038]** | +0.007 [-0.042, +0.068] | -0.003 [-0.015, +0.012] |
 | fz-w24c: w24, winding mod 4 + spacing from try9 | -0.015 [-0.071, +0.030] | -0.015 [-0.056, +0.014] | -0.055 [-0.122, +0.020] | -0.027 [-0.044, -0.009] |
-| **fz-phbm: phase mean with --conf mean (the mean input confidence as the length), the rest try9: the recipe** | **+0.032 [+0.003, +0.078]** | **+0.023 [+0.005, +0.050]** | +0.020 [-0.006, +0.069] | -0.001 [-0.010, +0.013] |
+| **fz-phbm: phase mean with --conf mean (the mean input confidence as the length), the rest try9 (box +0.032, region -0.033: not production)** | **+0.032 [+0.003, +0.078]** | **+0.023 [+0.005, +0.050]** | +0.020 [-0.006, +0.069] | -0.001 [-0.010, +0.013] |
 | fz-phbw: phase mean, weights try9 1 : w24 2 | +0.035 [+0.009, +0.064] | | -0.009 [-0.071, +0.064] (14 of 16) | |
 
 - fz-phb box by box:
@@ -338,13 +338,29 @@ of another w4_d x um are left out with a DEFAULTED line. The output's w4_d is in
   - the other boxes within +-0.02.
   The resultant mean lowers the confidence where the two nets disagree. On C4 w24's phase is wrong (w24-phase-only 0.727), the confidence
   cancels and the fitter loses the phase term there.
-- **Recipe (fz-phbm):** `ufsm field-blend OUT T9 W24 --weights 1,0 --plane-w phase=1,1 --conf mean`. --conf mean keeps try9's
-  confidence: C4 holds (0.905), C14 0.543 -> 0.916, C22 0.781 -> 0.882, C24 0.924 -> 0.944; no box loses more than 0.015 (C3).
+- **fz-phbm: box +0.032, region -0.033: not production.** `ufsm field-blend OUT T9 W24 --weights 1,0 --plane-w phase=1,1 --conf mean`
+  keeps try9's confidence on the boxes: C4 holds (0.905), C14 0.543 -> 0.916, C22 0.781 -> 0.882, C24 0.924 -> 0.944; no box loses more
+  than 0.015 (C3). But at region scale it loses:
+  - The 1667 comparison unroll (unroll, arm B vs A, the same 16 GT boxes): ids right 0.786 vs try9's 0.819.
+  - Under the unroll's own fit (wbench box fit with the box's count-field ref, --ref-snap 1, globwind's arm.sh) it loses on the 20 boxes
+    too: mean ids -0.025 vs bl-t9.snap.
+  - Likely cause, from phase-near on the pn1 crops: the blend places GT sheets closer (GT -> pred p50 C10 16.8 -> 16.1, C12 19.8 -> 16.8
+    um) but keeps part of w24's extra wraps (sheet voxels C10 311k -> 436k, C12 229k -> 314k; pred -> GT within 1 voxel 0.26 -> 0.21 on
+    C10). The plain box fit forgives extra wraps; the count-field integration does not.
 - **Snap** (`field-blend --snap R`, fb_phase_snap, test_fblend test_snap; lead: "try9 counts the sheets, w24 places them"): in[0]'s phase
   turned to in[1]'s where the two sheets lie within R um (|dphi| / 2 pi x in[0]'s spacing), else in[0]'s; in[0]'s confidence kept. It
   cannot add a wrap. phase-near (unrollperf, pn1 / pn2) showed why that matters: w24 places GT sheets slightly closer (GT -> pred p50
   13.1 vs 16.8 um on C10) but adds 3-4x the phase wraps, confidently (conf > 0.6 on C10: pred -> GT p50 19.8 um vs try9's 4.8).
-  The R sweep (4.8 / 9.6 / 14.4 um) on wbench and phase-near: below when scored.
+  No effect at any R (wbench A - B vs bl-t9, ids):
+
+  | R | packed ids | packed p05x | control ids |
+  |---|---|---|---|
+  | 4.8 um | -0.001 [-0.002, -0.000] | -0.000 | |
+  | 9.6 um | +0.000 [-0.003, +0.004] | +0.003 [+0.000, +0.007] | -0.005 [-0.015, +0.000] |
+  | 14.4 um | +0.000 [-0.005, +0.006] | | -0.005 [-0.015, +0.000] |
+
+  phase-near GT -> pred p50 (try9 -> R 14.4): C10 16.8 -> 15.2, C12 19.8 -> 17.6, C19 12.0 -> 12.0, C2 19.8 -> 19.3 um; pred -> GT
+  unchanged. Dropped (lead 11-27): the fusion line ends here; the conditioned net is the test.
 - w24's phase alone is broken on the Paris 4 PH1-3 boxes (ids 0.10-0.13, try9 0.12-0.21). It also fails C10 and C12 (0.29 / 0.53). Swapping
   the phase therefore loses the controls.
 - Rows: /vesuvius/ufsm/wbench/res/fz-*.tsv. Kit: /vesuvius/ufsm/condnet/fuse.sh and wbfuse.sh.
