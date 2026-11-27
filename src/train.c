@@ -136,6 +136,7 @@ typedef struct {
     int gl_inside;               /* lean: the logit gradient lives in the model's gradient buffers (setup checked the batch overlap) */
     char *bat_lo, *bat_hi;       /* lean: the batch's bytes inside the model's buffers (a logit gradient placed later must avoid them) */
     int gl_inplace;              /* the logit gradient over the fp16 logits (g_gl_inplace) */
+    float *topo_acc; double *topo_ds, topo_h[8], topo_loss; unsigned topo_off, topo_win;   /* --topo-lambda: slab logit gradient (2 planes x slab, fp32), sums (statistics pass 0..3, gradient pass 4..7: nn_topo_slab), loss, the window's lattice offset, windows so far */
     float *pg_acc; double pg_h[2], pg_loss;   /* --pgrad-lambda: slab logit gradient (2 planes x slab, fp32), sums w loss / w (hs_ds + 56: + 20..54 hold the normal loss stats), loss */
     float *latg; void *latgl;   /* --lat: the fp32 coarse logit gradient the head slabs accumulate, its 16-bit copy for the backward */
     void *lgc, *latgc; float *fpart;          /* g_lat_hs: a slab's cell logits (hs_z / 4 + 2 planes); the finished planes' 16-bit gradient for unet_head_bwd_z (latg / latgl: rolling, the same planes) */
@@ -385,6 +386,7 @@ static int g_ssl_views = 1; static float g_ssl_vshift = 0.125f, g_ssl_vzoom = 1.
 static int g_ssl_proto; static double g_ssl_lnk = 1; static float g_ssl_pts = 0.1f, g_ssl_ptt = 0.04f, g_ssl_pcm = 0.9f, g_ssl_plr = 1e-3f, g_ssl_pema = 0.996f;   /* mgpu: config. --ssl-proto K: DINO prototypes on the side head (ts / tt temperatures, centre momentum, Adam lr, teacher EMA) */
 static int ssl_cell(void) { return (g_lat ? 4 : 1) << g_ssl_lev; }   /* --ssl: voxels per side-head cell (--lat: the 4^3-voxel latent grid below level 0) */
 static float g_count_lambda; static int g_count_K = 1024, g_count_L = 64; static int g_cnt_ns; static float g_cnt_edges[8];   /* --count-strata */   /* --count-lambda / -segments / -length: the count loss (nn_count_loss) */
+static float g_topo_lambda; static int g_topo_len = 16, g_topo_k = 4;   /* --topo-lambda / --topo-len / --topo-stride: the wrap-count (topology) loss along the label's phase normal (nn_topo_slab; head slabs only, topoloss 2026-11-27) */
 static float g_pg_lambda, g_pg_dist[4] = {2.f}; static int g_pg_nd = 1, g_pg_angle, g_pg_mask;   /* --pgrad-lambda / --pgrad-dist (D[,D...], up to 4): the phase wavenumber loss (nn_pgrad_slab; head slabs only) */
 /* --task papyrus: papyrus vs void inside the scroll, labels made by the sampler from the clean CT at a random cutoff per patch
    (src/papyrus.h) in target channel 0; --pap-cond 1 conditions the stem bias on that cutoff in input units (batch.um, unet_set_cond) */
@@ -1476,7 +1478,7 @@ static int g_hgs_on = -1;   /* mgpu: env */
    UFSM_HGS_CHECK=1: the host function on read-back copies of the same scratches, compared bit for bit (a sync per window) */
 static int hgs_choose(gpu_state *d, int nmil) {
     if (g_hgs_on < 0) g_hgs_on = !getenv("UFSM_HGSCALE") || ufsm_env_on("UFSM_HGSCALE");
-    if (!g_hgs_on || !d->hs_train || !d->hgsd || !nn_get_loss_grad_h16() || !g_unwrap2 || !g_side || (g_lat && !g_lat_hs) || g_pg_lambda > 0 || g_fibn
+    if (!g_hgs_on || !d->hs_train || !d->hgsd || !nn_get_loss_grad_h16() || !g_unwrap2 || !g_side || (g_lat && !g_lat_hs) || g_pg_lambda > 0 || g_topo_lambda > 0 || g_fibn
         || g_single || unet_l0_3buf(d->u)) return 0;   /* (--single: no side / normal / winding fins to bound; three level-0 buffers: the head's backward is
                                                      unet's whole GN-recomputing one, which does not divide a plane scale out) */
     const int si = d->srcb[d->cur];
@@ -1600,6 +1602,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
     const int hz = hsg > 0 && pass && d->hs_train && g_lat_hs && (d->hsz_pass++ % hsg) == 0;
     if (hz) nn_zero(d->hsz, 15 * sizeof(unsigned long long));
     if (!pass && nmil) { nn_zero(d->milacc, (size_t)nmil * d->mil_k * sizeof(float)); nn_zero(d->milloss, sizeof(double)); }
+    if (!pass && g_topo_lambda > 0) { nn_zero(d->topo_ds, 8 * sizeof(double)); d->topo_off = d->hs_train ? (d->topo_win++ * 2654435761u) >> 7 : 0u; }   /* (a training window's lattice offset, the same in both passes; validation: 0) */
     if (!pass) { nn_zero(d->hs_ent, HE_N * sizeof(double)); nn_zero(d->hs_ds, 128 * sizeof(double)); if (g_unwrap2) nn_zero(d->w4ds, nn_wind4_sums()); if (g_fibn) nn_zero(d->fibacc, 2 * sizeof(double)); }
     const int ssl_skip = g_lat && d->ssl_win && !getenv("UFSM_SSL_SLABS");   /* --ssl, an unlabelled window: no supervised term, so no slabs (the losses
                                                                                finalise from zero sums; the coarse gradient stays zero; the streamed head's
@@ -1829,7 +1832,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             else if (!g_single) nn_loss_stats_acc_e(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, d->hs_ds + 20, d->hs_ent + HE_NORM);
             if (g_fibn) nn_fibn(LGC(g_norm_ch), ns, fib, D, H, W, z0, z1, g_fibn_r, g_fibn_thr, g_fibn_unsup ? d->nm : nullptr, d->fibacc, nullptr, nullptr, 0, 0);   /* (the window's fibre voxels: the gradient's mean) */
             FT("  s normal stats");
-            if (g_pg_lambda > 0) nn_pgrad_slab(d->hs_train ? nullptr : LGC(g_side_ch), d->hs_train ? nullptr : LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 56, nullptr);   /* (training: the pair weights only; the loss sum comes from the gradient pass, + 58) */
+            if (g_pg_lambda > 0) nn_pgrad_slab(d->hs_train ? nullptr : LGC(g_side_ch), d->hs_train ? nullptr : LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 56, nullptr);
+            if (g_topo_lambda > 0) nn_topo_slab(d->hs_train ? nullptr : LGC(g_side_ch), d->hs_train ? nullptr : LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_topo_len, g_topo_k, d->topo_off, d->topo_ds, nullptr);   /* (training: the ray weights only) */   /* (training: the pair weights only; the loss sum comes from the gradient pass, + 58) */
             PT("losses");
             if (pipe) nn_event_record(d->evl_free[sj & 1], 0);
             continue;
@@ -1869,7 +1873,8 @@ static void head_slab_pass(gpu_state *d, int pass) {
             FIBH_TARGETS(); FIBH_LOSS_S(1, fw);   /* (x fw in the gradient kernels: no separate scale pass over the 9 channels) */
         }
         if (g_pad_ch >= 0 && !g_single && LUPN > g_pad_ch) nn_zero(LGC(g_pad_ch), (size_t)(g_cout - g_pad_ch) * ns * 2);   /* (the pad outputs: no gradient; LUPN: not upsampled or adjoined at all) */
-        if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 58, d->pg_acc);   /* (before the BCE gradient overwrites the logits; its sums go to + 58: the logged loss of a training step) */
+        if (g_pg_lambda > 0) nn_pgrad_slab(LGC(g_side_ch), LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_pg_dist, g_pg_nd, g_pg_angle, g_pg_mask, d->hs_ds + 58, d->pg_acc);
+        if (g_topo_lambda > 0) nn_topo_slab(LGC(g_side_ch), LGC(g_side_ch + 1), sdb, d->sidem, D, H, W, z0, z1, g_norm_s, g_topo_len, g_topo_k, d->topo_off, d->topo_ds + 4, d->topo_acc);   /* (before the BCE gradient overwrites the logits; the loss sums of the step into + 4) */   /* (before the BCE gradient overwrites the logits; its sums go to + 58: the logged loss of a training step) */
         const float lside = g_side_lambda * src_head_w(si, g_rv == 1 ? SH_RV : SH_PHASE);   /* (x 1: the same floats) */
         if (!fside && !g_single) nn_loss_grad_only_s(LGC(g_side_ch), st, sm, d->sidew, two, 0.f, LGC(g_side_ch), d->sscratch, lside);   /* (x lside in the kernel) */
         FT("  g side grad");
@@ -1878,6 +1883,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             nn_loss_grad_only_s(LGC(g_rv_ch), d->rvt, d->rvm, d->sidew, two, 0.f, LGC(g_rv_ch), d->rvscratch, lrv);
         }
         if (g_pg_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->pg_acc, ns, d->hs_ds + 56, g_pg_lambda);
+        if (g_topo_lambda > 0) nn_pgrad_apply(LGC(g_side_ch), LGC(g_side_ch + 1), d->topo_acc, ns, d->topo_ds, g_topo_lambda * src_head_w(si, SH_PHASE));   /* (x lambda / the statistics pass's sum w) */
         if (g_fibn) { nn_zero(d->fibnl, sizeof(unsigned)); nn_fibn(LGC(g_norm_ch), ns, fib, D, H, W, z0, z1, g_fibn_r, g_fibn_thr, g_fibn_unsup ? d->nm : nullptr, d->fibacc, d->fiblist, d->fibnl, d->fibcap, 1); }   /* (reads the logits: before the in-place gradient) */
         const float lnorm = g_norm_lambda * src_head_w(si, SH_NORMAL), ldens = g_dens_lambda * src_head_w(si, SH_DENSITY);
         if (!fuse && !g_single) nn_loss_grad_only_s(LGC(g_norm_ch), d->nt, d->nm, d->nw, seven, 0.f, LGC(g_norm_ch), d->nscratch, ldens == lnorm ? lnorm : 1.f);   /* (one weight: x lnorm in the kernel) */
@@ -2837,6 +2843,9 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
     d->pg_loss = 0;
     if (g_pg_lambda > 0 && g_head_slab) { nn_d2h(d->pg_h, d->hs_ds + 56, 2 * sizeof(double)); if (d->hs_train) nn_d2h(d->pg_h, d->hs_ds + 58, sizeof(double));   /* (training: the loss sum of the gradient pass) */
         d->pg_loss = d->pg_h[1] > 0 ? g_pg_lambda * d->pg_h[0] / d->pg_h[1] : 0; }
+    d->topo_loss = 0;
+    if (g_topo_lambda > 0 && g_head_slab) { nn_d2h(d->topo_h, d->topo_ds, 8 * sizeof(double)); if (d->hs_train) { d->topo_h[0] = d->topo_h[4]; d->topo_h[2] = d->topo_h[6]; d->topo_h[3] = d->topo_h[7]; }   /* (training: the gradient pass's sums over the statistics pass's weight) */
+        d->topo_loss = d->topo_h[1] > 0 ? g_topo_lambda * d->topo_h[0] / d->topo_h[1] : 0; }
     d->count_loss = 0;
     if (g_count_lambda > 0) { nn_d2h(d->cnt_h, d->cnt_out, 21 * sizeof(float)); d->count_loss = g_count_lambda * d->cnt_h[0]; }
     d->cond_loss = 0;
@@ -2894,7 +2903,7 @@ static double fetch_loss(gpu_state *d, int B, int P, float dice_w, float *out) {
         const float sb = out[CH_SHEET], sd = out[cout + CH_SHEET], act = out[2 * cout];
         out[CH_RECTO] = na ? rb / na : 0; out[CH_SHEET] = sb; out[NCH + CH_RECTO] = na ? rd / na : 0; out[NCH + CH_SHEET] = sd; out[2 * NCH] = act;
     }
-    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss+d->ink_loss+d->mil_loss+d->norm_loss+d->cond_loss+d->pap_loss+d->count_loss+d->pg_loss+d->ds_loss+d->w4_loss+d->emb_loss+d->ssl_loss+d->ssl_heads_loss+d->rv_loss+d->fib_loss;
+    return (active ? loss / active : 0)+d->sheet_loss+d->aff_loss+d->verso_loss+d->side_loss+d->ink_loss+d->mil_loss+d->norm_loss+d->cond_loss+d->pap_loss+d->count_loss+d->pg_loss+d->topo_loss+d->ds_loss+d->w4_loss+d->emb_loss+d->ssl_loss+d->ssl_heads_loss+d->rv_loss+d->fib_loss;
 }
 
 /* --split z: forward, loss and backward of one window on both GPUs (src/split.h) */
@@ -3282,6 +3291,12 @@ int cmd_train(int argc, char **argv) {
           while (*pd && g_pg_nd < 4) { char *e; g_pg_dist[g_pg_nd] = strtof(pd, &e); if (e == pd) { bad = 1; break; } bad |= !(g_pg_dist[g_pg_nd] >= 1 && g_pg_dist[g_pg_nd] <= 16); g_pg_nd++; pd = *e == ',' ? e + 1 : e; if (*e && *e != ',') { bad = 1; break; } }
           if (*pd || !g_pg_nd) bad = 1;
           if (!(g_pg_lambda >= 0) || bad) { fprintf(stderr,"--pgrad-lambda >= 0, --pgrad-dist D[,D...] (1..16, up to 4)\n"); return 2; } }
+        /* --topo-lambda L (> 0): the wrap-count (topology) loss (nn_topo_slab): from every --topo-stride K-th voxel per axis (4) a ray along
+           the label's phase normal, up to --topo-len N unit steps each way (16), the predicted phase's total turns against the label's,
+           huber (1 turn), weighted by the phase mask: an extra sheet (or a phase dithering across 0) and a missed one each cost about a
+           turn, where the per-voxel BCE pays only the few voxels of the slip. Head-slab path only; off (0): no kernel runs */
+        g_topo_lambda = (float)atof(opt(argc,argv,"--topo-lambda","0")); g_topo_len = atoi(opt(argc,argv,"--topo-len","16")); g_topo_k = atoi(opt(argc,argv,"--topo-stride","4"));
+        if (!(g_topo_lambda >= 0) || g_topo_len < 2 || g_topo_len > 64 || g_topo_k < 1 || g_topo_k > 32) { fprintf(stderr,"--topo-lambda >= 0, --topo-len 2..64, --topo-stride 1..32\n"); return 2; }
         /* --count-lambda L (> 0): the count loss: per step --count-segments K segments of --count-length voxels along the true sheet
            normal, |log| of the predicted density integral over the true turns (nn_count_loss); needs --density-code 1 */
         {   /* --count-strata E1,..,En (um, ascending, n <= 8): count segments drawn evenly from the n + 1 GT spacing bins (default off) */
@@ -4732,6 +4747,9 @@ int cmd_train(int argc, char **argv) {
         if (g_lat_dec && !g_lat_hs) { fprintf(stderr, "--lat-dec: the latent head stream (not UFSM_LAT_CHECK / UFSM_LAT_HEAD_STREAM=0)\n"); return 2; }
         if (g_fstem && !g_lat_hs) { fprintf(stderr, "--fstem: the latent head stream (head slabs of a multiple of 4 planes; not UFSM_LAT_CHECK / UFSM_LAT_HEAD_STREAM=0)\n"); return 2; }
         if (g_pg_lambda > 0 && !g_head_slab) { fprintf(stderr, "--pgrad-lambda needs the head-slab loss path (task unwrap2, B 1, no --split / --verso)\n"); return 2; }
+        if (g_topo_lambda > 0 && (!g_head_slab || !g_unwrap2 || g_side != 2 || g_rv == 1 || g_single || g_lsplit || (g_lat_fuse && g_lat_guide == 5))) {
+            fprintf(stderr, "--topo-lambda needs the head-slab loss path with the phase pair (task unwrap2, B 1, not --rv 1 / --single / --split z / the fused guided side head)\n"); return 2; }
+        if (g_topo_lambda > 0) fprintf(stderr, "--topo-lambda %g: wrap-count rays from every %d-th voxel per axis, up to %d steps each way along the label's phase normal (rays end at a head-slab seam: %d planes per slab)\n", g_topo_lambda, g_topo_k, g_topo_len, g_hs_z);
         if (g_valP == P && !getenv("UFSM_VALP_FORCE")) g_valP = 0;   /* (UFSM_VALP_FORCE=1: the separate validation network at the training size, a test) */
         if (g_valP) {   /* --val-P: the plain recto-style losses on whole cube windows; validation on GPU 0 */
             if (g_valP < 0 || g_valP > P || g_valP % (1 << (cfg.nlev - 1))) { fprintf(stderr, "--val-P: a positive multiple of %d, at most P (the windows go up through "
@@ -5189,6 +5207,7 @@ int cmd_train(int argc, char **argv) {
                                         g_hs_z / 4 + 2, (double)nq * (LNC * (LGFC < LNC ? 6 : 4) + LGFC * 4) / 1e6, (double)(p3 / 64) * (LNC * 4 + LGFC * 4) / 1e9);
                 } else if (g_lat) { const size_t nc = (size_t)LNC * (g_Pz / 4) * (P / 4) * (P / 4); d->latg = nn_malloc(nc / LNC * LGFC * 4); d->latgl = nn_malloc(nc * 2); }
                 if (g_pg_lambda > 0) { d->pg_acc = nn_malloc(2 * tp3 * sizeof(float)); nn_zero(d->pg_acc, 2 * tp3 * sizeof(float)); }
+                if (g_topo_lambda > 0) { d->topo_acc = nn_malloc(2 * tp3 * sizeof(float)); nn_zero(d->topo_acc, 2 * tp3 * sizeof(float)); d->topo_ds = nn_malloc(8 * sizeof(double)); nn_zero(d->topo_ds, 8 * sizeof(double)); }
                 unet_set_head_cb(d->u, head_slab_cb, d);
                 if (g == 0) fprintf(stderr, "head slabs: %d planes per slab (%.0f MB of logits and targets instead of %.2f GB)\n", g_hs_z,
                                     (double)tp3 * (2 * g_cout + 11) / 1e6, (double)B * p3 * (2 * g_cout + 11) / 1e9);
@@ -5427,6 +5446,10 @@ int cmd_train(int argc, char **argv) {
     if (sc.phase_near_um > 0) {   /* the phase supervision radius */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
         snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"phase_near_um\":%.9g}",sc.phase_near_um);
+    }
+    if (g_topo_lambda > 0) {   /* the wrap-count loss */
+        size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
+        snprintf(runtime_extra+n-1,sizeof runtime_extra-n+1,",\"topo_loss\":{\"lambda\":%.9g,\"len\":%d,\"stride\":%d}}",g_topo_lambda,g_topo_len,g_topo_k);
     }
     if (g_count_lambda > 0) {   /* the count loss */
         size_t n=strlen(runtime_extra); runtime_extra[n-1]=0;
@@ -5761,7 +5784,7 @@ int cmd_train(int argc, char **argv) {
     const int mix_every = opt_atoi("--mix-every", opt(argc, argv, "--mix-every", "0")); double *mixn = nullptr, *mixrv = nullptr, *mixrvn = nullptr, *mixh = nullptr;   /* mixh: per source phase / wind4 / normal bce sums + counts (4 x 2) */
     double acc_ssl = 0, acc_sslv = 0, acc_ssls = 0, acc_sslc = 0, acc_ssln = 0, acc_sslm = 0, acc_pr[4] = {0};   /* (acc_sslm: --ssl-views 2, the mapped share of the cells) */
     double acc_sslh[SSLH_MAX] = {0}, acc_sslhg[SSLH_MAX] = {0};   /* (+ --ssl-heads: per head loss, targeted share of its channels' cells) */   /* --ssl: cosine part, hinge, std, targeted cells, unlabelled windows (all GPUs) */
-    double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_cbin[18] = {0}, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0, acc_rv = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
+    double acc_emb = 0, acc_embc = 0, acc_ds = 0, acc_vbce = 0, acc_vdice = 0, acc_side = 0, acc_ink = 0, acc_norm = 0, acc_cond = 0, acc_ck = 0, acc_cr = 0, acc_pap = 0, acc_cnt = 0, acc_cnr = 0, acc_cbin[18] = {0}, acc_w4 = 0, acc_w4w = 0, acc_w4a = 0, acc_pg = 0, acc_rv = 0, acc_topo = 0, acc_tope = 0, acc_topd = 0, acc_topn = 0;   /* (acc_pg: --pgrad-lambda loss; acc_cnt / acc_cnr: --count-lambda loss, Tp / Tg) verso channel, side channel; --cond (loss, known / right counts); --pap-head */
     double acc_siden = 0, acc_normn = 0, acc_w4n = 0;   /* windows that carry side / phase, normal, wind4 labels (their loss > 0): the logged means are over them, as ink / fib */
     double acc_fh[2] = {0}, acc_fhn = 0;   /* --fib-head: mask / direction bce sums, windows with known fibre labels */
     double acc_kl[8] = {0}, acc_kln[8] = {0};   /* head slabs: the KL (bce - the targets' entropy) of phase / side, rv, normal, wind4, ink, fibre, fibre direction; [7] the phase angle error */
@@ -6182,6 +6205,7 @@ int cmd_train(int argc, char **argv) {
         if (g_fibn && G[0].fib_h[0] > 0) { acc_fib += G[0].fib_h[1] / G[0].fib_h[0]; acc_fibv += G[0].fib_h[0]; acc_fibn += 1; }
         if (g_ink2 && G[0].iout[2] > 0) acc_inkn += 1;
         if (g_unwrap2 && G[0].w4_loss > 0) { acc_w4 += G[0].w4h[0]; acc_w4w += G[0].w4h[5]; acc_w4a += G[0].w4h[1]; acc_w4n += 1; } acc_pg += G[0].pg_loss;
+        if (g_topo_lambda > 0 && G[0].topo_h[1] > 0) { acc_topo += G[0].topo_h[0] / G[0].topo_h[1]; acc_tope += G[0].topo_h[2] / G[0].topo_h[1]; acc_topd += G[0].topo_h[3] / G[0].topo_h[1]; acc_topn += 1; }
         { const float kv[8] = {G[0].kl_side, G[0].kl_rv, G[0].kl_norm, G[0].kl_w4, G[0].kl_ink, G[0].kl_fib[0], G[0].kl_fib[1], G[0].ang_side};
           for (int k = 0; k < 8; k++) if (isfinite(kv[k])) { acc_kl[k] += kv[k]; acc_kln[k] += 1; } }
         if (g_ds) acc_ds += G[0].ds_loss;
@@ -6411,6 +6435,8 @@ int cmd_train(int argc, char **argv) {
                         if (g_ink2 && na < sizeof affs) snprintf(affs + na, sizeof affs - na, " ink %.3g", g_hmul[SH_INK]); }
             if (g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " normal bce %.4f (%.0f%% of windows) wind4 bce %.4f (worst gauge %.4f) acc %.3f (%.0f%% of windows)", acc_normn > 0 ? acc_norm / acc_normn : 0.0, 100.0 * acc_normn / nok,
                                                 acc_w4n > 0 ? acc_w4 / acc_w4n : 0.0, acc_w4n > 0 ? acc_w4w / acc_w4n : 0.0, acc_w4n > 0 ? acc_w4a / acc_w4n : 0.0, 100.0 * acc_w4n / nok); if (g_pg_lambda > 0) { na = strlen(affs); snprintf(affs + na, sizeof affs - na, " pgrad %.4f", acc_pg / nok); } }
+            if (g_topo_lambda > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " topo %.4f (count errors %.4f, dT %+.4f turn, %.0f%% of windows)", acc_topn > 0 ? acc_topo / acc_topn : 0.0,
+                                                                     acc_topn > 0 ? acc_tope / acc_topn : 0.0, acc_topn > 0 ? acc_topd / acc_topn : 0.0, 100.0 * acc_topn / nok); acc_topo = acc_tope = acc_topd = acc_topn = 0; }
             if (g_fibn) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " fibn %.4f (%.0f%% of windows, %.0f vox)", acc_fibn > 0 ? acc_fib / acc_fibn : 0.0, 100.0 * acc_fibn / nok, acc_fibn > 0 ? acc_fibv / acc_fibn : 0.0); }
             if (g_ink2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f (%.0f%% of windows)", acc_inkn > 0 ? acc_ink / acc_inkn : 0.0, 100.0 * acc_inkn / nok); }
             if (g_mil) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink mil %.4f (%.0f%% of windows, %.0f rays)", acc_miln > 0 ? acc_mil / acc_miln : 0.0, 100.0 * acc_miln / nok, acc_miln > 0 ? acc_milr / acc_miln : 0.0); acc_mil = acc_miln = acc_milr = 0; }

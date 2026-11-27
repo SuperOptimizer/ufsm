@@ -227,6 +227,8 @@ ufsm_exe(test_patchsolve SUITE tests/test_patchsolve.c OBJS patchsolve tracebox 
          sheet ct_augment scan_augment spatial_augment crush scrollaug cover json store zarr3 sources band_onfly fuse fiberraster afv regmap
          srpair zarr2 tiff z3w hf zipr view reg sample_emb embz NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_pgrad SUITE tests/test_pgrad.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_topo SUITE tests/test_topo.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_topo_train SUITE tests/test_topo_train.c LIBS m DEPS ufsm make_wind_fixture)
 ufsm_exe(test_phase_check SUITE tests/test_phase_check.c OBJS phase_check LIBS m)
 ufsm_exe(test_phase_interp SUITE tests/test_phase_interp.c OBJS sample scannorm sample_emb embz edt band sheet ct_augment scan_augment
          spatial_augment crush scrollaug cover sources band_onfly fuse fiberraster afv reg regmap zarr2 srpair view zarr3 store json z3w

@@ -832,6 +832,12 @@ void nn_count_loss(const void *dens_logits, const uint8_t *phase, int d, int h, 
 void nn_pgrad_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, const float *dist,
                    int nd, int angle, int mask, double *sums, float *acc);   /* dist: nd (1..4) partner distances, each its own pairs; angle: angular gradient only; mask: reliable label pairs only */
 void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const double *sums, float lambda);
+/* train --topo-lambda: the wrap-count (topology) loss over a head slab [z0, z1) (src/nn_loss.cu topo_k): rays along the label's phase normal from
+   every k-th voxel per axis (the lattice shifted by off), up to len steps each way, huber(predicted - label total phase turns) per ray. lc / ls,
+   phase, wm as nn_pgrad_slab; sums (4 device doubles, accumulated): sum w loss, sum w, sum w of count errors (> 0.5 turn), sum w (Tp - Tg);
+   lc = ls = nullptr: sums[1] only; acc (2 x slab floats, zero; nullptr: none): the gradient of sum w loss, added by nn_pgrad_apply(..., sums, lambda) */
+void nn_topo_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, int len, int k,
+                  unsigned off, double *sums, float *acc);
 void nn_cond_targets(const uint8_t *wind, size_t n, uint8_t *t, uint8_t *m);   /* --cond: winding mod 14 (band.h band_winding) -> 4 targets: cos / sin of 2 pi q / 14 and 2 pi q / 2 (x255, 4 planes), mask (known) */
 void nn_cond_acc(const void *lg, int lg_h16, const uint8_t *wind, size_t n, unsigned long long *cnt);   /* --cond: known / right-turn counts of the 14-turn head (cnt: 2 device u64, accumulated) */
 void nn_pap_targets(const uint8_t *pl, const uint8_t *pm, size_t n, uint8_t *t, uint8_t *m);   /* --pap-head: gap labels (0 / 1 / 255 ignored) -> target, mask (not ignored, inside the scroll) */

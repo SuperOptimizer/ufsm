@@ -34,6 +34,8 @@ test_lat_head~FP8                              | gpu          |        4 | TLH_F
 test_inksurf                                   | gpu          |        7 | UFSM_TEST_QUICK=1 ./$B/test_inksurf
 test_inksurf~full                              | gpu,slow     |       15 | ./$B/test_inksurf
 test_pgrad                                     | gpu          |     1 | ./$B/test_pgrad
+test_topo                                      | gpu          |     2 | ./$B/test_topo
+test_topo_train                                | gpu          |    40 | ./$B/test_topo_train ./$B/ufsm ./$B/make_wind_fixture
 test_gyrec                                     | gpu          |     1 | ./$B/test_gyrec
 test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
 test_phase_pool                                |              |     3 | UFSM_PHASE_POOL_SLAB=90000 ./$B/test_phase_pool $TMPDIR/phase_pool
