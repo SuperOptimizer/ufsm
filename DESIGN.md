@@ -434,7 +434,8 @@ at w320).
   HOLD at rung 1.1, w832 h160 − w768 h32, paired: 1667 .903 vs .896 = +0.006 ± 0.010, P4 .895 vs .891 = +0.003 ± 0.006
   (predict 136 vs 105 s). The CT for this HOLD check is a local copy re-staged for it (r11/ctl/stage3.sh, 39 GB).
 - **Verdict:** a larger halo is AUC-neutral and cuts the seam ~4x, but `--seamless 2` is ~10x lower again at 1.3x the time.
-  Seamless 2 stays the seam fix; no predict default changed.
+  Seamless 2 stays the seam fix. Decision (lead): `--seamless 2` is the default of the production ink renders (scripts/unroll/unroll.sh's predict
+  ink pass, INKSEAM=2; INKSEAM=0 = the old --feather pass); window / halo unchanged. Unroll's R11P section reads (sect24*) already ran it.
 - A first run of this A/B on an old branch build (before perf's blend-region fix f7478578) showed seamless 2 at off256 7.64, i.e.
   pass b's own seams. That was the stale binary, not a current bug.
 
