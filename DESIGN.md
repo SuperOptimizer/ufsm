@@ -6,6 +6,64 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## try9 + w24 at fit time: a phase mean helps the packed boxes; train --cond-fields for a try9-conditioned 2.4 um net (2026-11-27, branch condnet-20261127, condnet)
+
+w24 (native 2.4 um, P 640 = 1.5 mm field of view) loses wbench to try9 (9.6 um, 6.1 mm) at step 2000 (packed ids -0.122, controls -0.168).
+The idea under test: try9 counts the sheets and w24 places them.
+
+**Fit-time fusion** (`field-blend --plane-w GROUP=w1,w2:..`). The two kept field sets (bl-t9 at 9.6 um, w24-2000 at 2.4 um) lie on the same
+19.2 um cells, so fusing them needs no resampling. Per plane group (phase, normal, sp, w, w4, r) each input gets its own weight. An input of
+weight 0 is left out of the plane, also under `--weights` (before, a weight-0 input still counted in the material max). Winding mod 4 planes
+of another w4_d x um are left out with a DEFAULTED line. The output's w4_d is in the first input's voxels: 64 x 2.4 um becomes 16 x 9.6 um
+(test_fblend test_fuse). Scored with the pinned fitter on the same 20 clean boxes, paired against bl-t9. A - B [95 % CI]:
+
+| variant | packed ids (4) | packed p05x | control ids (16) | control p05x |
+|---|---|---|---|---|
+| fz-ph: w24 phase, the rest try9 | -0.003 [-0.048, +0.039] | -0.002 [-0.039, +0.028] | -0.054 [-0.125, +0.025] (15) | -0.017 [-0.031, +0.001] |
+| fz-phn: w24 phase + normals | -0.015 [-0.072, +0.030] | -0.015 [-0.056, +0.014] | -0.056 [-0.122, +0.019] | -0.028 [-0.044, -0.009] |
+| **fz-phb: phase = complex mean of both (resultant), the rest try9** | **+0.025 [+0.001, +0.065]** | **+0.015 [+0.003, +0.038]** | +0.007 [-0.042, +0.068] | -0.003 [-0.015, +0.012] |
+| fz-w24c: w24, winding mod 4 + spacing from try9 | -0.015 [-0.071, +0.030] | -0.015 [-0.056, +0.014] | -0.055 [-0.122, +0.020] | -0.027 [-0.044, -0.009] |
+
+- fz-phb box by box:
+  - C14 0.543 -> 0.924 and C22 0.781 -> 0.866;
+  - C4 0.912 -> 0.695;
+  - the other boxes within +-0.02.
+  The mean lowers the confidence where the two nets disagree, so the fitter leans on its other terms there.
+- w24's phase alone is broken on the Paris 4 PH1-3 boxes (ids 0.10-0.13, try9 0.12-0.21). It also fails C10 and C12 (0.29 / 0.53). Swapping
+  the phase therefore loses the controls.
+- Rows: /vesuvius/ufsm/wbench/res/fz-*.tsv. Kit: /vesuvius/ufsm/condnet/fuse.sh and wbfuse.sh.
+
+**try9-conditioned net** (`train --cond-fields 1 [--cond-drop 0.3]`, `predict --cond-fields DIR[,DIR..] | none`).
+- Input: another model's fit-field sets on the scan, a source's `"cond": {"fields": [DIR, ..]}`. They enter as a second 32-channel MX input
+  block of a latent net (unet_cfg.cond_ch = 11, cin 32 -> 64, header key "cond_ch").
+- The 11 channels (sample_cond.h):
+  - pc, ps;
+  - w, sp, dq;
+  - the three winding mod 4 differences as dq-weighted (cos, sin) per output axis, permuted and sine-negated under the window's cube symmetry.
+- Sampling: the sampler pulls them onto 8^3-voxel cells through the window's symmetry and warp, with the --distill cell coordinates.
+  `nn_cond_mx` upsamples them x2 trilinearly onto the latent cells and writes MX block 1. `nn_input_latc` writes block 0 into the 64-channel
+  tensor.
+- Missing data: a dropped window (probability --cond-drop), an echo / replay and cells outside the sets all read 0.
+- Warm start: init-from a net without the block zero-initialises the stem's new columns (copy_conv_in), so the donor's function is kept.
+- Predict: fills channels 32-63 of its 16-bit input (nn_cond_h16); there is no --tta.
+- Tests:
+  - test_gpu_input cond_check: the trainer chain equals predict's byte for byte, plus a host reference;
+  - test_cond_net: the warm-started net equals the donor bit for bit for random planes (MX-fp8 rn and the fp4 lean-2 preset), the new columns
+    get a gradient, and the header round-trips;
+  - test_sample_cond (CPU): positions, trilinear, the symmetry channel map, a second set.
+- Coverage: `ufsm occ-tiles` writes per-source predict tile lists near the sampler's labelled cells.
+
+| source | 512^3 tiles at 9.6 um (margin 64) | Gvox |
+|---|---|---|
+| Paris4 june / july (same CT) | 2334 / 3444 | 313 / 462 |
+| 1667 | 585 | 78 |
+| 0139 twin | 736 | 99 |
+| 0814 twin | 341 | 46 |
+
+- Cost: at ~19 Mvox/s for try9 fit fields (the wbench --boxes rate, 5060 Ti) that is 6-10 h of card time.
+- Disk: ~18 GB at 19.2 um cells with q8 phase.
+- The predicts wait for the lead's go.
+
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
 
 - Why: under -std=c23, phasecmp.c called floor / ceil / llround without <math.h> (fixed in b32c16ca). mcc took them as int f()
