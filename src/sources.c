@@ -641,6 +641,26 @@ static sources *sources_load_(const char *path) {
             }
             fclose(mf);
         }
+        const json *hj = json_get(e, "hard");   /* {"map": RAW, "frac": F}: hard-spot draws (ufsm hard-map; grid, lev, um in RAW.json) */
+        if (hj) {
+            const char *hp = json_str(json_get(hj, "map"), nullptr); s->hard_frac = (float)json_num(json_get(hj, "frac"), -1);
+            char jp[1200]; snprintf(jp, sizeof jp, "%s.json", hp ? hp : "");
+            FILE *jf = hp ? fopen(jp, "rb") : nullptr; char jb[4096] = {0}; size_t jn = jf ? fread(jb, 1, sizeof jb - 1, jf) : 0; if (jf) fclose(jf);
+            json *g = jn ? json_parse(jb, jn) : nullptr; size_t tot = 1;
+            for (int d = 0; d < 3; d++) { s->hard_grid[d] = g ? (int64_t)json_num(json_at(json_get(g, "grid"), (size_t)d), 0) : 0; tot *= (size_t)(s->hard_grid[d] > 0 ? s->hard_grid[d] : 0); }
+            s->hard_lev = g ? (int)json_num(json_get(g, "lev"), -1) : -1; s->hard_um = g ? json_num(json_get(g, "um"), 0) : 0;
+            const char *hct = g ? json_str(json_get(g, "ct"), "") : "";   /* (the map's scan, when it names one: the same CT basename) */
+            if (hct && *hct) { char a[512]; snprintf(a, sizeof a, "%s", src_base(hct));
+                if (strcmp(a, src_base(s->ct_key))) { fprintf(stderr, "sources: %s: the hard map %s is of the scan %s, not this source's %s\n", s->name, hp, a, src_base(s->ct_key)); json_free(g); json_free(j); sources_free(S); return nullptr; } }
+            json_free(g);
+            FILE *hf = tot && hp && s->hard_lev >= 0 && s->hard_lev < 20 && s->hard_um > 0 ? fopen(hp, "rb") : nullptr;
+            s->hard = hf ? malloc(tot) : nullptr;
+            if (!s->hard || fread(s->hard, 1, tot, hf) != tot || !(s->hard_frac >= 0 && s->hard_frac <= 1)) {
+                fprintf(stderr, "sources: %s: cannot read the hard map %s (and %s with its grid, lev and um), or \"frac\" missing / outside [0, 1]\n", s->name, hp ? hp : "?", jp);
+                if (hf) { fclose(hf); } json_free(j); sources_free(S); return nullptr;
+            }
+            fclose(hf);
+        }
         { const json *zb = json_get(e, "zboost"); if (zb) { s->zb_below = (int64_t)json_num(json_get(zb, "below"), 0); s->zb_k = (float)json_num(json_get(zb, "k"), 1); } }
         const json *mj = json_get(e, "mask");   /* {"map": RAW, "min": 2}: ufsm scanprep's cell mask (grid and lev in RAW.json) */
         if (mj) {
@@ -679,6 +699,12 @@ static sources *sources_load_(const char *path) {
             if (gj && gj->type == J_ARR) for (size_t k = 0; k < gj->n && s->nemb < 8; k++) { const char *g = json_str(json_at(gj, k), nullptr); if (g) s->emb_grp[s->nemb++] = strdup(g); }
             s->emb_name = strdup(json_str(json_get(ej, "name"), "pca64")); s->emb_level = (int)json_num(json_get(ej, "level"), -1);
             if (!s->nemb || s->emb_level < 0) { fprintf(stderr, "sources: %s: \"emb\" needs \"groups\": [DIR, ...] and \"level\" >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
+        }
+        const json *cj = json_get(e, "cond");   /* {"fields": [DIR, ...]}: train --cond-fields conditioning planes (sample_cond.h) */
+        if (cj) {
+            const json *fj = json_get(cj, "fields");
+            if (fj && fj->type == J_ARR) for (size_t k = 0; k < fj->n && s->ncond < 16; k++) { const char *g = json_str(json_at(fj, k), nullptr); if (g) s->cond_dir[s->ncond++] = strdup(g); }
+            if (!s->ncond) { fprintf(stderr, "sources: %s: \"cond\" needs \"fields\": [DIR, ...]\n", s->name); json_free(j); sources_free(S); return nullptr; }
         }
         const json *ho = json_get(e, "holdout"); int hbad = 0;
         if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) hbad = src_add_hold(s, ho, 0, 0);
@@ -741,7 +767,7 @@ void sources_free(sources *S) {
         for (int l = 0; l < MAXLEV; l++) z3_close(s->ct[l]);
         for (int l = 0; l < MAXLEV; l++) z3_close(s->lv[l]);
         for (int l = MAXLEV - 1; l >= 0; l--) { z3_close(s->phase_pl[l]); z3_close(s->phase_ign_pl[l]); }   /* (the pooled views borrow phase / ignore: closed first) */
-        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->hold_rej); free(s->hold_nos); free(s->focus); free(s->mask); srpair_free(s->srp);
+        if (s->band != s->phase) z3_close(s->band); z3_close(s->phase); z3_close(s->wind); z3_close(s->aux); z3_close(s->phase_ign); z3_close(s->phase_wt); free(s->box); free(s->hold); free(s->hold_rej); free(s->hold_nos); free(s->focus); free(s->mask); free(s->hard); srpair_free(s->srp);
         for (int c = 0; c < NTG; c++) {
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt[c][l]);
             for (int l = 0; l < MAXLEV; l++) z3_close(s->tgt_val[c][l]);
@@ -764,6 +790,7 @@ void sources_free(sources *S) {
         free(s->lv_key); if (s->lv_s) store_close(s->lv_s);
         for (int k = 0; k < s->nxs; k++) free(s->xs_map[k]);
         for (int k = 0; k < s->nemb; k++) free(s->emb_grp[k]);
+        for (int k = 0; k < s->ncond; k++) free(s->cond_dir[k]);
         free(s->emb_name);
         store_close(s->s);
     }

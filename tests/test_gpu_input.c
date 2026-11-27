@@ -103,6 +103,49 @@ static int latc_check(const uint16_t *h4, const void *d_h1, const void *d_rec, i
     return bad;
 }
 
+/* train / predict --cond-fields (2026-11-27, unet_cfg.cond_ch): a 64-channel latent input, block 0 the C = 29 cell channels, block 1 the 11
+   conditioning planes (int8 on cells of 2^3 latent cells, x2 trilinear): the trainer's chain (nn_input_latc into the 64-channel MX tensor, then
+   nn_cond_mx) against predict's (nn_lat_input_x + nn_cond_h16 into a 16-bit window, nn_h16_to_mx), byte for byte; the 16-bit conditioning values
+   against a host trilinear reference; nn_cond_mx without planes (a dropped window) = zero planes */
+static int cond_check(const uint16_t *h4, const void *d_h1, const void *d_rec, int D, int P, int bits) {
+    const int C = 29, K = 11, d = D / 4, p = P / 4, gd = (d + 1) / 2, gp = (p + 1) / 2; const size_t S = (size_t)D * P * P, cv = (size_t)d * p * p, gc = (size_t)gd * gp * gp;
+    static float bas[29 * 64], gain[29]; static uint64_t rs = 0x9876543210fedcbaull;
+    for (int c = 0; c < C; c++) { gain[c] = c ? 0.5f + 0.25f * (c % 9) : 0.125f; for (int k = 0; k < 64; k++) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; bas[c * 64 + k] = c ? (float)((rs >> 40) * (1.0 / 16777216.0) - 0.5) * 0.3f : 0.125f; } }
+    int8_t *cd = malloc((size_t)K * gc); for (size_t q = 0; q < (size_t)K * gc; q++) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; cd[q] = (int8_t)((int)(rs >> 56) % 128 - 64 + (int)(rs >> 40 & 63)); }
+    float *d_bas = nn_malloc(sizeof bas), *d_gain = nn_malloc(sizeof gain); nn_h2d(d_bas, bas, sizeof bas); nn_h2d(d_gain, gain, sizeof gain);
+    const shape5 cs = {1, 64, d, p, p}; const size_t mb = nn_mx_bytes(cs, bits), nb = (size_t)64 * cv * 2;
+    void *d_h4 = nn_malloc(4 * S * 2), *d_x = nn_malloc(nb), *d_a = nn_malloc(mb), *d_b = nn_malloc(mb), *d_c = nn_malloc(mb), *d_cd = nn_malloc((size_t)K * gc), *d_z = nn_malloc(nb);
+    nn_set_storage(d_a, mb, bits); nn_set_storage(d_b, mb, bits); nn_set_storage(d_c, mb, bits);
+    nn_h2d(d_cd, cd, (size_t)K * gc); nn_h2d(d_h4, h4, 4 * S * 2);
+    nn_lat_input_x(d_h4, d, p, p, d_bas, d_gain, C, 0.25f, d_x); nn_cond_h16(d_x, cs, d_cd, K, gd, gp, gp); nn_h16_to_mx(d_x, cs, d_a);
+    nn_input_latc(d_h1, cs, d_rec, d_bas, d_gain, C, 0.25f, d_b); nn_cond_mx(d_b, cs, d_cd, K, gd, gp, gp);
+    uint8_t *a = malloc(mb), *b = malloc(mb); nn_d2h(a, d_a, mb); nn_d2h(b, d_b, mb);
+    int bad = memcmp(a, b, mb) != 0;
+    uint16_t *xh = malloc(nb); nn_d2h(xh, d_x, nb); size_t off = 0;
+    for (int k = 0; k < 32; k++) for (size_t v = 0; v < cv; v++) {
+        const int z = (int)(v / ((size_t)p * p)), y = (int)(v / p % p), x = (int)(v % p); const int ii[3] = {z, y, x}, gn[3] = {gd, gp, gp};
+        float ref = 0.f;
+        if (k < K) {
+            int i0[3]; float fr[3];
+            for (int a3 = 0; a3 < 3; a3++) { const float c3 = (ii[a3] + 0.5f) * 0.5f - 0.5f; i0[a3] = (int)floorf(c3); fr[a3] = c3 - i0[a3]; }
+            for (int t = 0; t < 8; t++) {
+                int q3[3] = {i0[0] + (t >> 2), i0[1] + ((t >> 1) & 1), i0[2] + (t & 1)};
+                for (int a3 = 0; a3 < 3; a3++) q3[a3] = q3[a3] < 0 ? 0 : q3[a3] >= gn[a3] ? gn[a3] - 1 : q3[a3];
+                const float w = ((t >> 2) ? fr[0] : 1 - fr[0]) * (((t >> 1) & 1) ? fr[1] : 1 - fr[1]) * ((t & 1) ? fr[2] : 1 - fr[2]);
+                ref += w * cd[(size_t)k * gc + ((size_t)q3[0] * gp + q3[1]) * gp + q3[2]];
+            }
+            ref /= 127.f;
+        }
+        if (fabsf(h2f(xh[(size_t)(32 + k) * cv + v]) - ref) > 1e-3f * (1.f + fabsf(ref))) off++;
+    }
+    if (off) bad |= 2;
+    /* a dropped window: no planes = zero planes */
+    nn_zero(d_cd, (size_t)K * gc); nn_input_latc(d_h1, cs, d_rec, d_bas, d_gain, C, 0.25f, d_c); nn_cond_mx(d_c, cs, nullptr, K, 0, 0, 0); nn_cond_mx(d_b, cs, d_cd, K, gd, gp, gp);
+    nn_d2h(a, d_c, mb); nn_d2h(b, d_b, mb); if (memcmp(a, b, mb)) bad |= 4;
+    free(a); free(b); free(xh); free(cd); nn_free(d_bas); nn_free(d_gain); nn_free(d_h4); nn_free(d_x); nn_free(d_a); nn_free(d_b); nn_free(d_c); nn_free(d_cd); nn_free(d_z);
+    return bad;
+}
+
 /* --aux-input with --gpu-input (2026-11-25, nn_input_rad_aux): the fifth channel from per-sample coarse boxes (random f 1 / 2 / 4, box
    position, bytes; sample 0 with on = 0 every other call) against the host chain: write_x's 4 channels + sample_aux_byte at each voxel's
    source-frame position (the symmetry), byte / 127.5 - 1 in fp16, through nn_h16_to_mx */
@@ -197,6 +240,10 @@ int main(void) {
                         if (xfmt == 1 && N == 1 && (sym % 7) == 0) for (int lc = 13; lc <= 29; lc += 16) {
                             const int e = latc_check(h4, d_h1, d_rec, D, P, bits, lc, lc == 13 ? 0.f : 0.25f); cases++;
                             if (e) { if (fails < 5) fprintf(stderr, "FAIL: learned cell channels (C %d MX-fp%d shape %d sym %d axis %d): %s%s\n", lc, bits, shape, sym, ax, e & 1 ? "trainer / predict kernels differ " : "", e & 2 ? "host reference differs" : ""); fails++; }
+                        }
+                        if (xfmt == 1 && N == 1 && (sym % 7) == 0) {
+                            const int e = cond_check(h4, d_h1, d_rec, D, P, bits); cases++;
+                            if (e) { if (fails < 5) fprintf(stderr, "FAIL: conditioning block (MX-fp%d shape %d sym %d axis %d):%s%s%s\n", bits, shape, sym, ax, e & 1 ? " trainer / predict chains differ" : "", e & 2 ? " host reference differs" : "", e & 4 ? " no planes != zero planes" : ""); fails++; }
                         }
                         if (lat_check(h4, d_h1, d_rec, N, D, P, xfmt, bits)) { if (fails < 5) fprintf(stderr, "FAIL: latent input (nn_input_lat) differs (xfmt %d MX-fp%d shape %d sym %d axis %d)\n", xfmt, bits, shape, sym, ax); fails++; }
                         cases++;
