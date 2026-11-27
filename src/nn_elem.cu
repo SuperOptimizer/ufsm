@@ -198,8 +198,19 @@ extern "C" void nn_input_lat(const void *ct16, shape5 xs, const void *rec, void 
     KCHECK();
 }
 extern "C" void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y) {
-    if (!ISMX(y) || xs.c != C + 3 || (xs.c != 16 && xs.c != 32) || xs.h != xs.w) { fprintf(stderr, "nn_input_latc: an MX input of C + 3 = 16 or 32 channels, square planes\n"); abort(); }
-    lp_input_latc(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(4 * xs.d), xs.n, xs.d, xs.h, bas, gain, C, step, y, ISMX4(y) ? 4 : 8);
+    if (!ISMX(y) || (xs.c != C + 3 && !(C + 3 == 32 && xs.c == 64)) || (C + 3 != 16 && C + 3 != 32) || xs.h != xs.w) {
+        fprintf(stderr, "nn_input_latc: an MX input of C + 3 = 16 or 32 channels (or 32 + a 32-channel conditioning block), square planes\n"); abort(); }
+    lp_input_latc_ct(ct16, g_h16 ? 2 : 1, rec, NN_RAD_REC(4 * xs.d), xs.n, xs.d, xs.h, bas, gain, C, step, y, ISMX4(y) ? 4 : 8, xs.c);
+    KCHECK();
+}
+extern "C" void nn_cond_mx(void *y, shape5 xs, const void *cd, int K, int gd, int gh, int gw) {
+    if (!ISMX(y) || xs.c != 64 || K < 1 || K > 32 || (cd && (gd < 1 || gh < 1 || gw < 1))) { fprintf(stderr, "nn_cond_mx: a 64-channel MX input, 1..32 conditioning planes\n"); abort(); }
+    lp_cond_mx(cd, xs.n, K, xs.d, xs.h, xs.w, gd, gh, gw, y, xs.c, ISMX4(y) ? 4 : 8);
+    KCHECK();
+}
+extern "C" void nn_cond_h16(void *y, shape5 xs, const void *cd, int K, int gd, int gh, int gw) {
+    if (!g_h16 || xs.c != 64 || K < 1 || K > 32) { fprintf(stderr, "nn_cond_h16: a 64-channel fp16 input, 1..32 conditioning planes\n"); abort(); }
+    lp_cond_h16(cd, xs.n, K, xs.d, xs.h, xs.w, gd, gh, gw, y, xs.c);
     KCHECK();
 }
 extern "C" void nn_input_latq(const void *ct16, shape5 xs, const void *rec, int n, int cz0, int ncz, const void *cells, int stride, const float *gain, int C,

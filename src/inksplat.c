@@ -1154,11 +1154,46 @@ static void ink_quality(const ssurf *S, const uint8_t *mp, int mw, int mh, doubl
                     q_pct(hf, nf, 0.95) / 255, nf ? (double)f2 / nf : 0, spf, dm, dp, rec[0], rec[1], gn ? gs / gn : 0);
     free(V); free(ok); free(bg); free(fr); free(nr); free(t);
 }
+/* --band-px K / --band-um U (inkeval 2026-11-27): band-tolerant F1, the boundary-F1 matching rule with a Chebyshev tolerance of K label px, exact at every
+   byte threshold t from two histograms. Only the scored label px (VB >= 0: in the mask, on the surface) take part, on either side.
+   - precision(t) = predicted px (byte >= t) with a label-ink px within K / all predicted px;
+   - recall(t) = label-ink px with a predicted px within K / all label-ink px (the K-box max of the map over the scored px >= t).
+   Window coverage, not one-to-one matching: offset labels (the mesh / label registration is a few px off) are not double-penalised, and a
+   thin prediction inside a blob label still covers it within K. A wide K rewards fat / speckled maps, so two tolerances are reported.
+   K 0 is the plain best F1 of the main row (test_ink_band). */
+static void box_max16(int16_t *a, int16_t *t, int64_t H, int64_t W, int K) {   /* in place, separable, K-box max */
+    for (int64_t r = 0; r < H; r++) for (int64_t c = 0; c < W; c++) { int16_t m = -1; const int64_t d0 = c - K < 0 ? 0 : c - K, d1 = c + K >= W ? W - 1 : c + K;
+        for (int64_t d = d0; d <= d1; d++) if (a[(size_t)r * W + d] > m) m = a[(size_t)r * W + d]; t[(size_t)r * W + c] = m; }
+    for (int64_t r = 0; r < H; r++) for (int64_t c = 0; c < W; c++) { int16_t m = -1; const int64_t d0 = r - K < 0 ? 0 : r - K, d1 = r + K >= H ? H - 1 : r + K;
+        for (int64_t d = d0; d <= d1; d++) if (t[(size_t)d * W + c] > m) m = t[(size_t)d * W + c]; a[(size_t)r * W + c] = m; }
+}
+static void ink_band(const int16_t *VB, const uint8_t *L, int64_t H, int64_t W, int K, int Uum, double lpx_um, const char *nm, const char *row) {
+    char sfx[32]; if (Uum >= 0) snprintf(sfx, sizeof sfx, "band%dum", Uum); else snprintf(sfx, sizeof sfx, "band%d", K);
+    const size_t np = (size_t)H * W; int16_t *near = malloc(np * sizeof *near), *mx = malloc(np * sizeof *mx), *t = malloc(np * sizeof *t);
+    if (!near || !mx || !t) { fprintf(stderr, "ink-score: %s:%s: out of memory\n", nm, sfx); free(near); free(mx); free(t); return; }
+    for (size_t i = 0; i < np; i++) { near[i] = VB[i] >= 0 && L[i] >= 128 ? 1 : -1; mx[i] = VB[i]; }
+    if (K > 0) { box_max16(near, t, H, W, K); box_max16(mx, t, H, W, K); }
+    uint64_t hp[256] = {0}, hok[256] = {0}, hr[256] = {0}, ni = 0;
+    for (size_t i = 0; i < np; i++) { if (VB[i] < 0) continue; hp[VB[i]]++; if (near[i] > 0) hok[VB[i]]++; if (L[i] >= 128) { hr[mx[i]]++; ni++; } }
+    double best = 0, bthr = 0, bp = 0, br = 0, f05 = 0; uint64_t P = 0, PO = 0, R = 0;
+    for (int b = 255; b >= 0; b--) {
+        P += hp[b]; PO += hok[b]; R += hr[b];
+        const double pr = P ? (double)PO / P : 0, re = ni ? (double)R / ni : 0, f = pr + re > 0 ? 2 * pr * re / (pr + re) : 0;
+        if (f > best) { best = f; bthr = b / 255.0; bp = pr; br = re; }
+        if (b == 128) f05 = f;
+    }
+    char um[48] = ""; if (lpx_um > 0) snprintf(um, sizeof um, " (%.1f um)", K * lpx_um);
+    fprintf(stderr, "ink-score: %s:%s: tolerance %d label px%s, %llu ink px, band F1 best %.4f (p >= %.3f, prec %.3f rec %.3f), F1@0.5 %.4f\n", nm, sfx, K, um,
+            (unsigned long long)ni, best, bthr, bp, br, f05);
+    if (row) { uint64_t n = 0; for (int b = 0; b < 256; b++) n += hp[b];
+        printf("%s\t%s:%s\t%llu\t%.4f\t%.4f\t%.3f\t%.4f\t%.4f\t%.4f\t%.4f\n", row, nm, sfx, (unsigned long long)n, n ? (double)ni / n : 0, best, bthr, f05, bp, br, best); }
+    free(near); free(mx); free(t);
+}
 int cmd_ink_score(int argc, char **argv) {
     const char *surf = sopt(argc, argv, "--surface", nullptr), *lab = sopt(argc, argv, "--labels", nullptr), *msk = sopt(argc, argv, "--mask", nullptr);
     const char *cache = sopt(argc, argv, "--cache", nullptr), *row = sopt(argc, argv, "--row", nullptr);
     if (!surf || !lab || sidx(argc, argv, "--map") < 0) {
-        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG] [--holdouts H.json --ct KEY] [--fuse mean|rank[,..] [--weights a,b,..]] [--edge K] [--quality [--quality-far PX]]\n"); return 2;
+        fprintf(stderr, "usage: ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif [--map ..] [--label-z K] [--label-scale F] [--surf-um U] [--cache DIR] [--row TAG] [--holdouts H.json --ct KEY] [--fuse mean|rank[,..] [--weights a,b,..]] [--edge K] [--quality [--quality-far PX]] [--band-px K[,K..]] [--band-um U[,U..]]\n"); return 2;
     }
     ssurf S; if (ssurf_load(&S, surf)) return 1;
     { const double su = opt_atof("--surf-um", sopt(argc, argv, "--surf-um", "0")); if (su > 0) S.vox_um = su; }   /* the mesh voxel size when its meta has none */
@@ -1191,6 +1226,19 @@ int cmd_ink_score(int argc, char **argv) {
        pixels against all negatives ("NAME:core"); the negatives are not split (atlas labels leave the pixels next to ink unsupervised) */
     const int edk = opt_atoi("--edge", sopt(argc, argv, "--edge", "0"));
     const int qfar = sidx(argc, argv, "--quality") >= 0 ? opt_atoi("--quality-far", sopt(argc, argv, "--quality-far", "32")) : 0;   /* --quality: see ink_quality */
+    /* --band-px K[,K..] (label px) / --band-um U[,U..] (um, rounded to label px: one physical tolerance over sets whose labels differ in pixel
+       size; refused when the label pixel size is unknown): see ink_band */
+    int bandk[8], bandu[8], nband = 0;
+    const double lpx_um = LL.um > 0 ? LL.um : (S.vox_um > 0 ? F * S.vox_um : 0);   /* a canvas px is one mesh voxel */
+    for (int um = 0; um < 2; um++) { const char *bs = sopt(argc, argv, um ? "--band-um" : "--band-px", nullptr);
+      for (const char *p = bs; p && *p && nband < 8; ) { char *e; const double x = strtod(p, &e);
+          if (e == p || !(x >= 0)) { fprintf(stderr, "ink-score: %s: values >= 0 (got %s)\n", um ? "--band-um" : "--band-px", bs); return 2; }
+          if (um && !(lpx_um > 0)) { fprintf(stderr, "ink-score: --band-um: the label pixel size is unknown (no label um, no mesh voxel_size_um: --surf-um U)\n"); return 2; }
+          const long k = um ? lround(x / lpx_um) : (long)x;
+          if (k > 64 || (!um && x != (double)k)) { fprintf(stderr, "ink-score: --band-px: whole label px <= 64 (got %s, %ld px)\n", bs, k); return 2; }
+          bandk[nband] = (int)k; bandu[nband++] = um ? (int)lround(x) : -1; p = *e == ',' ? e + 1 : e; } }
+    int16_t *VB = nband ? malloc(np * sizeof *VB) : nullptr;
+    if (nband && !VB) { fprintf(stderr, "ink-score: out of memory\n"); return 1; }
     uint8_t *EG = nullptr;
     if (edk > 0) {
         uint8_t *di[2]; EG = calloc(np, 1);
@@ -1211,6 +1259,7 @@ int cmd_ink_score(int argc, char **argv) {
         int mw, mh; uint8_t *mp = img_read_u8(path, &mw, &mh);
         if (!mp) { fprintf(stderr, "ink-score: cannot read %s\n", path); rc = 1; continue; }
         uint64_t hi[256] = {0}, hn[256] = {0}, ehi[2][256] = {{0}}, ehn[2][256] = {{0}};   /* (--edge: [0] core, [1] edge) */
+        if (VB) for (size_t i = 0; i < np; i++) VB[i] = -1;
         const int foot = F >= 1.5 ? (int)lround(F) : 0;
         for (int64_t r = 0; r < LL.H; r++) for (int64_t c = 0; c < LL.W; c++) {
             const size_t i = (size_t)r * LL.W + c; if (M && M[i] < 128) continue;
@@ -1229,6 +1278,7 @@ int cmd_ink_score(int argc, char **argv) {
                 v = (1 - fy) * ((1 - fx) * mp[(size_t)y0 * mw + x0] + fx * mp[(size_t)y0 * mw + x1]) + fy * ((1 - fx) * mp[(size_t)y1 * mw + x0] + fx * mp[(size_t)y1 * mw + x1]);
             }
             const int b = (int)lround(v); if (L[i] >= 128) hi[b]++; else hn[b]++;
+            if (VB) VB[i] = (int16_t)b;
             if (EG) { if (L[i] >= 128) ehi[EG[i]][b]++; else { ehn[0][b]++; ehn[1][b]++; } }   /* (every negative in both: atlas labels mask a band around the ink) */
         }
         uint64_t ti = 0, tn = 0; for (int b = 0; b < 256; b++) { ti += hi[b]; tn += hn[b]; }
@@ -1266,10 +1316,11 @@ int cmd_ink_score(int argc, char **argv) {
             if (row) printf("%s\t%s:%s\t%llu\t%.4f\t0\t0\t0\t0\t0\t%.4f\n", row, nm, e ? "edge" : "core", (unsigned long long)(ei + en), ei + en ? (double)ei / (ei + en) : 0, ea);
         }
         if (qfar > 0) ink_quality(&S, mp, mw, mh, F, L, M, LL.H, LL.W, qfar, nm, row);
+        for (int k = 0; k < nband; k++) ink_band(VB, L, LL.H, LL.W, bandk[k], bandu[k], lpx_um, nm, row);
         fflush(stdout);
         free(mp);
     }
-    free(EG);
+    free(EG); free(VB);
     const char *fu = sopt(argc, argv, "--fuse", nullptr);
     if (fu && !rc) {
         const int dm = strstr(fu, "mean") != nullptr, dr = strstr(fu, "rank") != nullptr;
