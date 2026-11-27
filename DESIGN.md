@@ -28,6 +28,91 @@ source's training windows from cells marked hard, instead of uniformly over its 
 - test_sampbias: the index of a 4.8 um map on the 9.6 um fixture (exactly the cells below z 128, 8 times each), frac 0.5 -> 0.3-0.7
   of 80 kept windows, off = identical hashes, on changes them; hard-map on a synthetic mf plane + a box (cell values exact).
 
+## Per-scroll / per-recipe ink eval: worst scroll, leak flags, band-tolerant F1; 1447 is the only scroll clean for every model (2026-11-27, branch inkeval-20261127, inkeval)
+
+Pooled dev numbers hid two things: which scroll a model fails on, and whether it trained on that scroll. `ufsm ink-strat` (src/inkstrat.c)
+reads the per-crop rows the scorers already write (devscore / picks / cleanscore tsvs, `FILE:TAG,CROP,AUC` columns, `--alias` to join a
+model's rows from several scorers). It prints:
+- one cell per scroll x model: mean crop AUC, crop count, and the model's training exposure (`--leaks`: C clean, S scroll seen, X cross-scan
+  leak = same region on another scan or through the init lineage, L leak, U unknown);
+- the mean of scroll means by scan recipe, parsed from the CT key: pixel size / propagation distance / energy. Paganin delta/beta is not in
+  our metadata; per arXiv 2606.29085 it is 1000 at 2.4 um and 500 on the 1.129 um slabs;
+- a `worst-scroll` line per model (overall and clean only; scrolls with >= `--worst-n` 5 crops) and the mean of scrolls next to the crop mean;
+- with `--ref`, deltas paired by crop per scroll (± SE, crops up), their mean, and the worst scroll.
+
+`ink-score --band-um U[,U]` / `--band-px K` adds the band-tolerant F1 that ink-compare lacked. ink-compare's "band" is a local-contrast
+statistic, not a tolerance. Band F1 uses window-coverage matching with a Chebyshev tolerance:
+- precision = predicted px within K of a label-ink px;
+- recall = label-ink px with a prediction within K;
+- both are over the scored px, exact at every byte threshold from two histograms; best F1 is reported.
+
+K 0 equals the plain best F1, and `--band-um` refuses to run when the label pixel size is unknown. Tests: test_ink_strat, test_ink_band
+(numpy references, CPU fast tier). No GPU work: every number below is from existing maps. Re-scoring all 1332 maps reproduced every
+benchmark AUC to 0.002.
+
+**Eval sets** (recipe = the scan the score reads):
+
+| set | scroll(s) | recipe | labels |
+|---|---|---|---|
+| HOLD (64 tiles each) | 1667 / P4 | 1.129um/0.2m/59keV and 78keV (R1 at level 2 = 4.5 um) | human, desk9 boxes |
+| clean 0841 (8) | 0841 | 2.403um/0.2m/77keV, coarse nets at level 2 | human |
+| clean 1447 (28) | 1447 | 8.64um/1.2m/116keV (q8 volcomp: reader3 −0.035 vs lossless) | human |
+| h116 (48) | 0009B | 8.64um/1.2m/116keV | human (its 2.4 um mesh) |
+| dev 99 | 0139 (40), 0814 (1) | 9.362um/1.2m/113keV | human / hf |
+| | 0172 (40) | 7.91um/53keV | hf |
+| | 0343 (10), 0175B (3), 0483B (2), 0125 (1), 0358 (2) | 8.64 / 9.362 um | atlas: a reader3-like ensemble |
+
+**Leaks (audit 11-27; /vesuvius/ufsm/inkeval/leaks.tsv has the evidence lines):**
+- 1447 is clean for every traced model. 0841 is clean for our nets but not for Studio: its profile and README name 0841 as training data.
+- h116 is not clean for any of our nets. S2 / R1 / R11 trained on 0009B at 2.4 um; only the first quarter of h116 lies in the desk9 box.
+  E0 / E2D2 / N9R(k) held out nothing on 0009B: holdouts-dev2.json holds the h116 boxes, but no 0009B source references it.
+- R1E and S2E (no holdouts) trained on the dev crops' own segments, so their dev rows are leaks. Their HOLD rows are cross-scan.
+- E0 / E2D2 / N9R inherit 0139 / 0814 cross-scan exposure from the S2-avg init. ink9um trained on 28 of the 40 dev 0139 crops' segments.
+- reader3's training card is not local: U everywhere except 0841 / 1447. The atlas-labelled dev crops are scored against labels a reader3-like
+  ensemble made, which is label bias, not a leak.
+
+**AUC, per scroll x model** (rows: ctx r8 median reader3, `predict --tta 8` for E0 / E2D2, as each set's benchmark ran; R1 / R1E / S2 dev
+and h116 rows are the plain devscore maps; flag after the value):
+
+| scroll (n) | reader3 | ink9um | studioRel | studioFt0846 | E0 | E2D2 | S2-avg | R1-62000 | R1E | R11P-12000 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1667 HOLD | | | | | | | | .801 S | | .896 S |
+| P4 HOLD | | | | | | | | .897 S | | .891 S |
+| 0841 (8) | .891 C | .769 C | | | .852 C | .858 C | .834 C | **.907 C** | .787 C | |
+| 1447 (28) | **.771 C** | .614 C | | | .687 C | .682 C | .686 C | .582 C | .658 C | |
+| 0009B h116 (48) | .931 U | .809 C | | | .896 X | | .904 X | .772 X | .859 X | |
+| 0139 (40) | .930 U | .897 L | .847 U | .844 U | .840 X | | .816 X | .734 X | .818 L | |
+| 0172 (40) | .897 U | .720 C | .759 U | .706 U | .827 S | | .794 C | .847 C | .886 L | |
+| 0343 (10) | .998 U | .953 C | .978 U | .971 U | .969 S | | .959 C | .735 C | .865 L | |
+| mean of scrolls (n) | .939 (11) | .805 (11) | .793 (8) | .763 (8) | .823 (11) | .770 (2) | .772 (11) | .761 (13) | .873 (11) | .894 (2) |
+| worst scroll (>= 5 crops) | 1447 .771 | 1447 .614 | 0172 .759 | 0172 .706 | 1447 .687 | 1447 .682 | 1447 .686 | 1447 .582 | 1447 .658 | — |
+
+**Paired vs reader3** (mean of scroll deltas ± SE): E0 −.116 ± .018, R1E −.066 ± .010 (inflated by its leaked dev rows), E2D2 −.061 ±
+.013 (clean only), ink9um −.134 ± .032, S2-avg −.167 ± .029, studioRel −.174 ± .042, studioFt0846 −.204 ± .035, R1-62000 −.194 ± .017.
+- No model beats reader3 on any scroll with >= 5 crops except R1-62000 on 0841 (+.017 ± .019, 4/8 up), and R1-62000 is the worst model on 1447.
+- The 0846 fine-tune loses to released Studio on the three dev scrolls with >= 5 crops (0172 −.054, 0343 −.007, 0139 −.002). It wins only on
+  the 1-3-crop scrolls 0175B / 0483B / 0814.
+
+**Band F1** (20 um / 50 um tolerance, best threshold; 20 um = 2 label px on the coarse dev crops, 8 px on 0841):
+
+| | reader3 | E0 | E2D2 | S2-avg | R1-62000 | R1E | studioRel |
+|---|---|---|---|---|---|---|---|
+| 1447 | .622 / .671 | .545 / .596 | .548 / .598 | .551 / .603 | .493 / .547 | .522 / .570 | |
+| 0841 | .723 / .767 | .657 / .704 | .660 / .708 | .670 / .728 | **.762 / .816** | .605 / .657 | |
+| 0172 | .824 / .837 | .728 / .760 | | .718 / .753 | .763 / .784 | .762 / .779 L | .665 / .680 |
+
+On both clean scrolls the band F1 has the same leader and last place as the AUC: R1 then reader3 on 0841 and R1E last; reader3 on 1447
+and R1 last. E0 / S2 / E2D2 stay within .006 of each other. The 50 um band lifts every model about equally (+.04-.06). So the 3-D nets' 1447 deficit is not a label-offset artefact that a tolerance would forgive.
+
+**What this changes:**
+- Every ink pick is reported per scroll, with its worst clean scroll. That is 1447 for every model, at 8.64um/1.2m/116keV.
+- A model counts as better only if it wins on 1447 and 0841 separately. Dev and h116 rows rank models but carry flags: h116 is X for every
+  3-D net, and dev is L for R1E / S2E.
+- HOLD rows are single per-scroll scores (the per-tile rows were not kept), so the worst-scroll rule skips them; the R line has no clean set
+  at 1.1 um.
+
+Files: /vesuvius/ufsm/inkeval/{prep.sh (rows), table.sh, band.sh, leaks.tsv, table*.out, strat*.tsv, rows/}.
+
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
 
 - Why: under -std=c23, phasecmp.c called floor / ceil / llround without <math.h> (fixed in b32c16ca). mcc took them as int f()

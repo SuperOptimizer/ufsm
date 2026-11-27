@@ -142,6 +142,7 @@ int cmd_sheet_cut(int argc, char **argv);   /* src/sheetcut.c */
 int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
+int cmd_ink_strat(int argc, char **argv);   /* src/inkstrat.c */
 int cmd_ink_runs(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach_up(int argc, char **argv);   /* src/inksplat.c */
@@ -231,6 +232,7 @@ static int usage(void) {
         "  ufsm ink-audit SEGS.json --ct ROOT KEY --ct-um U [--pred ROOT KEY] [--holdouts H]   onfly ink labels per split: positives, face offsets, band CT, AUC per band shift\n"
         "  ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx   voxelwise AUC / F1 of a 3-D ink prediction vs a 3-D reference (ink-splat)\n"
         "  ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif ..   F1 / AUC of 2D ink maps vs a segment's published labels\n"
+        "  ufsm ink-strat --rows FILE[:TAG,CROP,AUC] .. [--leaks TSV] [--ref TAG]   per-scroll / per-recipe ink scores, worst scroll, paired deltas\n"
         "  ufsm ink-runs LABELS.tif [--mask M] [--px-um U] [--row TAG]   ink stroke width quartiles (min of the row / column run per ink px)\n"
         "  ufsm ink-teach --segs SEGS --teacher NAME=MAP%%s .. --out DIR   2D teacher maps -> calibrated, gated soft ink label windows (on-the-fly ink)\n"
         "  ufsm ink-teach-up SEGS-TEACH.json OUT [--up 2]   ink-teach windows at label_scale / up (p bilinear in the mask, mask nearest)\n"
@@ -5092,6 +5094,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-ext")) return cmd_ink_ext(argc, argv);
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
+    if (!strcmp(cmd, "ink-strat")) return cmd_ink_strat(argc, argv);
     if (!strcmp(cmd, "ink-runs")) return cmd_ink_runs(argc, argv);
     if (!strcmp(cmd, "ink-teach")) return cmd_ink_teach(argc, argv);
     if (!strcmp(cmd, "ink-teach-up")) return cmd_ink_teach_up(argc, argv);
