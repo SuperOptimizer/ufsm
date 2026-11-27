@@ -6,6 +6,61 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Upstream villa spiral fit on PHerc1203 vs our -p unroll; 3 upstream speed-ups (2026-11-26, unrollperf)
+
+The upstream fitter (villa spiral-fitting @659e2fad) ran on scan 20250820131727 (9.362 µm) with upstream's own 1203 inputs: 22 auto_grown
+patches, lasagna normals + grad_mag, umbilicus 20260924035533, and surface_m7 tracks for z 8400-9400 (215,080). The fit config was the
+defaults at 30k steps, apart from the inputs 1203 lacks:
+- **switched off:** fibres, fibre directions, PCLs (absolute / relative / same-winding / drawn), winding inference (dense spacing uses
+  grad_mag instead), outer shell;
+- **active:** umbilicus, patch radius / DT, sym-Dirichlet, dense spacing / normals, min spacing, track radius / DT.
+
+Everything stays local: the clone and runs are in /vesuvius/ufsm/upspiral, nothing was uploaded (1203 is prize-eligible).
+
+**Hand.** Fitted on z 8800-9000, both senses.
+- Measured in the shared voxel frame with θ = atan2(y − cy, x − cx): their CW turns outward to +θ (98/98 seams) and their ACW to −θ
+  (76/77). Our -p (+1) turns to −θ (89/97 wraps at the θ cut), so **our +1 = their ACW**.
+- This contradicts reading count-field's U = W + dir θ/2π in tifxyz x / y, which suggests its native y / x is transposed.
+- Their loss weakly prefers CW: mean total over steps ≥ 26000 is 201.3 ± 7.6 vs 215.9 ± 7.5 (1.4σ, driven by patch_dt and the track
+  terms). This was computed before looking at our verdict; it disagrees with our hand but is not decisive.
+
+**Geometry vs ours, z 8800-9000** (cmp/ in the upspiral dir):
+
+| | upstream CW | upstream ACW | ours -p |
+|---|---|---|---|
+| sheets / wraps in the slab | 120 | 120 | 140 (111 rendered) |
+| sheets in air outside the scroll | 23 | 24 | 0 |
+| in-scroll sheets, mean distance to our nearest wrap | 10.1 vox | 9.9 vox | |
+| wrap-align share (CT level 1), in-scroll | 0.707 | 0.707 | 0.713 |
+| HercUeNet grown sheet: plane distance p50 / mean / p95 (surf-near) | 4.76 / 6.45 / 17.2 | 5.56 / 7.02 / 18.7 | 1.87 / 4.13 / 15.7 |
+| HercUeNet: vertices ≤ 2 vox / id change between neighbours | 0.24 / 0.32 | 0.22 / 0.35 | 0.52 / 0.14 |
+
+- **Air sheets:** num_windings defaults to 130 and 1203 has no outer shell, so ~23 windings sit up to 250 vox outside the papyrus.
+- **Phase:** their in-scroll sheets run at chance phase relative to ours. Our wraps are ~14 vox apart; random points fall ≤ 2 vox from
+  one of them 16 % of the time, their sheets 19 %.
+- **HercUeNet sheet** (our only independent single-sheet reference): ours follows it (p50 1.9 vox, chance ≈ 3.5); theirs does not.
+  Along it our winding id drifts over w164-167 (0.82 of its vertices). Their top-sheet share (0.56) comes from smoothness, not from
+  following the sheet.
+- **Sheet count:** per 250-vox radius band and 5° ray, below r 1500 both have 16-18. At r 1500-2250 theirs have 15-18, ours 7-12,
+  partly their air sheets.
+- **reader3** on 2 of their sheets (w051, w063) vs our matching wraps (w185, w201) cropped to the same band: no readable text in either.
+  Their CT texture is a mosaic of cross-sheet patches; ours is continuous fibre texture. Ink frac > 0.5: theirs 0.0004 / 0.0028, ours
+  0.0093 / 0.0091.
+
+**Speed** (local branch fast-20261126 in the villa clone, README-fast-20261126.md, not pushed). Three changes:
+- **Batched track ingest:** 256 tracks per sqlite transaction instead of one. 2238 s → 294 s, RSS 1.7 → 0.23 GB, identical track
+  content hashes. Batches of 4096 were slower as the transaction grew.
+- **Input cache:** FIT_SPIRAL_INPUT_CACHE pickles the materialized object-store inputs. Key: store identity + the values of the config
+  keys actually read. Input load ~80 s → 3.8 s; identical digest and meshes.
+- **Compiled transforms:** FIT_SPIRAL_COMPILE_TRANSFORMS compiles the VaryingLinear and gap-expander regions.
+  - z 8800-9000, 3000 steps: eager 16.7-18.3 ms/step; upstream COMPILE 17.6; + ours 13.7; + PREFETCH 12.2.
+  - Same-seed eager runs differ by 3.4 % in loss and 5.8 / 15.2 vox (mean / p95) in mesh. The compiled arms stay inside that noise;
+    prefetch uses a different RNG stream and falls outside it.
+- **800-slice band** (z 8500-9300, ACW, 30k steps, c2 + cache miss + first compile): 1488 s wall, ~44.6 ms/step, peak GPU memory 2.5 GB.
+  - A new band end to end: track extraction 131 s + ingest 294 s + fit 1488 s ≈ 32 min (ingest alone was 37 min before).
+- **Not done:** the whole-step CUDA graph is held for the user. It needs the native CPU track-crossing sampler (.item / nonzero /
+  repeat_interleave per step) drawn off-graph into padded static buffers.
+
 ## predict --seamless 2: the offset-256 "seams" were pass b alone beyond the box / tile list; the blend now keeps the region (2026-11-26, perf)
 
 PHerc1203 r24 reads (R11P-12000, window 576 halo 32, tile list of 512): ink-seam off0 0.25 but off256 9.32 (plain read 17.7). The
