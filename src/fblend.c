@@ -187,7 +187,7 @@ int fb_plane_group(const char *s) {
          : is_w4(s) ? FB_G_W4 : !strcmp(s, "r") ? FB_G_R : -1;
 }
 int fb_group_id(const char *s) {
-    static const char *g[FB_NGRP] = {"phase", "normal", "sp", "w", "w4", "r"};
+    static const char *const g[FB_NGRP] = {"phase", "normal", "sp", "w", "w4", "r"};
     for (int k = 0; k < FB_NGRP; k++) if (!strcmp(s, g[k])) return k;
     return -1;
 }
@@ -460,7 +460,7 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
         for (int i = 0; i < n; i++) fprintf(f, "%s%.6g", i ? ", " : "", w[i]);
         fprintf(f, "]");
         for (int g = 0; g < FB_NGRP; g++) if (opt && opt->pw_on[g]) {
-            static const char *gn[FB_NGRP] = {"phase", "normal", "sp", "w", "w4", "r"};
+            static const char *const gn[FB_NGRP] = {"phase", "normal", "sp", "w", "w4", "r"};
             fprintf(f, ", \"plane_w_%s\": [", gn[g]); for (int i = 0; i < n; i++) fprintf(f, "%s%.6g", i ? ", " : "", opt->pw[g][i]); fprintf(f, "]");
         }
         if (opt && opt->tile) {

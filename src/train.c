@@ -378,7 +378,7 @@ static int g_tm_unused;    /* unwrap2 head slabs: the packed recto target / mask
 static int g_hs_z;         /* its planes per slab */
 static int g_ds; static float g_ds_w = 0.5f, g_ds_frac = 1.f; static int g_ds_anneal = 1;   /* --deep-sup K: decoder levels 1..K, weight w^j x frac */
 static const int8_t *emb_host(batch *b);
-static int g_cnd, g_cnd_g[3]; static float g_cnd_drop = 0.3f; static size_t g_cnd_n;   /* --cond-fields 1 [--cond-drop 0.3]: unet_cfg.cond_ch = COND_K planes (sample_cond.h) of g_cnd_n bytes a batch */   /* (below: an echo's / replay's distill targets cleared) */
+static int g_cnd, g_cnd_g[3]; static float g_cnd_drop = 0.3f; static size_t g_cnd_n;   /* mgpu: config.  --cond-fields 1 [--cond-drop 0.3]: unet_cfg.cond_ch = COND_K planes (sample_cond.h) of g_cnd_n bytes a batch */   /* (below: an echo's / replay's distill targets cleared) */
 static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w = 1.f; static float g_distill_pap;   /* --distill-papyrus F: targets only on head cells >= F papyrus */ static size_t g_distill_n;   /* --distill C: a C-channel 1^3 head on decoder level --distill-level
                                                                                                     (cells of g_distill_div^3 window voxels; g_distill_n int8 targets per batch), cosine loss x --distill-weight */
 static ssl_heads g_sslh; static float g_sslh_w[SSLH_MAX]; static const char *g_sslh_name[SSLH_MAX];   /* --ssl-heads LIST (--ssl-ink W: "ink:W"): gated mean-teacher

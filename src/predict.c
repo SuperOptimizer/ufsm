@@ -2345,7 +2345,7 @@ static int predict_one(int argc, char **argv) {
     shape5 xs = {1, !half && (cfg.cin == 5 || cfg.cin == 7) ? cfg.cin : 4, Dl, W, W};   /* (7: a train --cond net, its condition inputs zero here) */
     const shape5 xn = half ? (shape5){1, cfg.cin, W / hdiv, W / hdiv, W / hdiv} : xs;   /* the network's input */
     int latin = 0; void *x2 = nullptr, *lrt = nullptr; float *lgf = nullptr;   /* half: the network's input, the intermediate grid (div 4), the full-resolution logits */
-    static source cnd_src; int8_t *cnd_h = nullptr; void *cnd_d = nullptr; size_t cnd_n = 0;   /* cfg.cond_ch: the conditioning sets, host / device planes of a window */
+    source cnd_src = {0}; int8_t *cnd_h = nullptr; void *cnd_d = nullptr; size_t cnd_n = 0;   /* cfg.cond_ch: the conditioning sets, host / device planes of a window */
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
     /* --fit-zarr in z-chunk slabs (fzs below, the plane path): the 1^3 head per chunk over the cell planes the chunk reads (unet_head_fwd_z32,
        each plane once: two plane buffers, the overlap with the previous chunk copied) instead of the whole window's fp32 cell logits

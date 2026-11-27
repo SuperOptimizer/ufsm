@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *cond_planes[8] = {"pc", "ps", "w", "sp", "dq", "dz", "dy", "dx"};
+static const char *const cond_planes[8] = {"pc", "ps", "w", "sp", "dq", "dz", "dy", "dx"};
 
 void sample_cond_decode(const uint8_t v[8], int has_w4, const int perm[3], const int flip[3], float out[COND_K]) {
     out[0] = (v[0] - 128) / 127.f; out[1] = (v[1] - 128) / 127.f; out[2] = v[2] / 255.f; out[3] = v[3] / 255.f;
@@ -25,7 +25,8 @@ void sample_cond_decode(const uint8_t v[8], int has_w4, const int perm[3], const
 }
 
 /* per-thread open sets */
-typedef struct { const source *s; int k, ok, has_w4, h; double um; int64_t origin[3], off[3], shape[3]; z3 *z[8]; } ch_t;
+typedef struct { const source *s; int k, ok, has_w4, h; double um; int64_t origin[3], off[3], shape[3]; z3 *z[8]; char dir[1024]; } ch_t;   /* (keyed by the directory too: predict's
+   per-call source may reuse an address with other sets) */
 static _Thread_local ch_t *g_ch; static _Thread_local int g_nch;
 static json *read_json(const char *path) {
     FILE *f = fopen(path, "rb"); if (!f) return nullptr;
@@ -34,9 +35,9 @@ static json *read_json(const char *path) {
     fclose(f); t[n] = 0; json *j = json_parse(t, (size_t)n); free(t); return j;
 }
 static ch_t *ch_get(const source *s, int k) {
-    for (int i = 0; i < g_nch; i++) if (g_ch[i].s == s && g_ch[i].k == k) return &g_ch[i];
+    for (int i = 0; i < g_nch; i++) if (g_ch[i].s == s && g_ch[i].k == k && !strcmp(g_ch[i].dir, s->cond_dir[k])) return &g_ch[i];
     ch_t *t = realloc(g_ch, (size_t)(g_nch + 1) * sizeof *t); if (!t) return nullptr;
-    g_ch = t; ch_t *h = &g_ch[g_nch++]; memset(h, 0, sizeof *h); h->s = s; h->k = k;
+    g_ch = t; ch_t *h = &g_ch[g_nch++]; memset(h, 0, sizeof *h); h->s = s; h->k = k; snprintf(h->dir, sizeof h->dir, "%s", s->cond_dir[k]);
     const char *dir = s->cond_dir[k]; char p[1400]; snprintf(p, sizeof p, "%s/fields.json", dir);
     json *j = read_json(p);
     if (!j || strcmp(json_str(json_get(j, "format"), "raw"), "zarr")) { fprintf(stderr, "cond: %s: %s is not a zarr fit-field set (predict --fit-zarr)\n", s->name, dir); json_free(j); return h; }
