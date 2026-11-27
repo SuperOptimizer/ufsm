@@ -59,6 +59,118 @@ The paper's gain comes from an independent representation (DINO trained on 10 sc
 **Decision.** No student A/B. Repeat only with a feature extractor of our own that is independent of the teacher (a successful SSL
 or J1 trunk). The commands stay opt-in for that.
 
+## try9 + w24 at fit time: a phase mean helps the packed boxes; train --cond-fields for a try9-conditioned 2.4 um net (2026-11-27, branch condnet-20261127, condnet)
+
+w24 (native 2.4 um, P 640 = 1.5 mm field of view) loses wbench to try9 (9.6 um, 6.1 mm) at step 2000 (packed ids -0.122, controls -0.168).
+The idea under test: try9 counts the sheets and w24 places them.
+
+**Fit-time fusion** (`field-blend --plane-w GROUP=w1,w2:..`). The two kept field sets (bl-t9 at 9.6 um, w24-2000 at 2.4 um) lie on the same
+19.2 um cells, so fusing them needs no resampling. Per plane group (phase, normal, sp, w, w4, r) each input gets its own weight. An input of
+weight 0 is left out of the plane, also under `--weights` (before, a weight-0 input still counted in the material max). Winding mod 4 planes
+of another w4_d x um are left out with a DEFAULTED line. The output's w4_d is in the first input's voxels: 64 x 2.4 um becomes 16 x 9.6 um
+(test_fblend test_fuse). Scored with the pinned fitter on the same 20 clean boxes, paired against bl-t9. A - B [95 % CI]:
+
+| variant | packed ids (4) | packed p05x | control ids (16) | control p05x |
+|---|---|---|---|---|
+| fz-ph: w24 phase, the rest try9 | -0.003 [-0.048, +0.039] | -0.002 [-0.039, +0.028] | -0.054 [-0.125, +0.025] (15) | -0.017 [-0.031, +0.001] |
+| fz-phn: w24 phase + normals | -0.015 [-0.072, +0.030] | -0.015 [-0.056, +0.014] | -0.056 [-0.122, +0.019] | -0.028 [-0.044, -0.009] |
+| **fz-phb: phase = complex mean of both (resultant), the rest try9** | **+0.025 [+0.001, +0.065]** | **+0.015 [+0.003, +0.038]** | +0.007 [-0.042, +0.068] | -0.003 [-0.015, +0.012] |
+| fz-w24c: w24, winding mod 4 + spacing from try9 | -0.015 [-0.071, +0.030] | -0.015 [-0.056, +0.014] | -0.055 [-0.122, +0.020] | -0.027 [-0.044, -0.009] |
+| **fz-phbm: phase mean with --conf mean (the mean input confidence as the length), the rest try9: the recipe** | **+0.032 [+0.003, +0.078]** | **+0.023 [+0.005, +0.050]** | +0.020 [-0.006, +0.069] | -0.001 [-0.010, +0.013] |
+| fz-phbw: phase mean, weights try9 1 : w24 2 | +0.035 [+0.009, +0.064] | | -0.009 [-0.071, +0.064] (14 of 16) | |
+
+- fz-phb box by box:
+  - C14 0.543 -> 0.924 and C22 0.781 -> 0.866;
+  - C4 0.912 -> 0.695;
+  - the other boxes within +-0.02.
+  The resultant mean lowers the confidence where the two nets disagree. On C4 w24's phase is wrong (w24-phase-only 0.727), the confidence
+  cancels and the fitter loses the phase term there.
+- **Recipe (fz-phbm):** `ufsm field-blend OUT T9 W24 --weights 1,0 --plane-w phase=1,1 --conf mean`. --conf mean keeps try9's
+  confidence: C4 holds (0.905), C14 0.543 -> 0.916, C22 0.781 -> 0.882, C24 0.924 -> 0.944; no box loses more than 0.015 (C3).
+- **Snap** (`field-blend --snap R`, fb_phase_snap, test_fblend test_snap; lead: "try9 counts the sheets, w24 places them"): in[0]'s phase
+  turned to in[1]'s where the two sheets lie within R um (|dphi| / 2 pi x in[0]'s spacing), else in[0]'s; in[0]'s confidence kept. It
+  cannot add a wrap. phase-near (unrollperf, pn1 / pn2) showed why that matters: w24 places GT sheets slightly closer (GT -> pred p50
+  13.1 vs 16.8 um on C10) but adds 3-4x the phase wraps, confidently (conf > 0.6 on C10: pred -> GT p50 19.8 um vs try9's 4.8).
+  The R sweep (4.8 / 9.6 / 14.4 um) on wbench and phase-near: below when scored.
+- w24's phase alone is broken on the Paris 4 PH1-3 boxes (ids 0.10-0.13, try9 0.12-0.21). It also fails C10 and C12 (0.29 / 0.53). Swapping
+  the phase therefore loses the controls.
+- Rows: /vesuvius/ufsm/wbench/res/fz-*.tsv. Kit: /vesuvius/ufsm/condnet/fuse.sh and wbfuse.sh.
+
+**try9-conditioned net** (`train --cond-fields 1 [--cond-drop 0.3]`, `predict --cond-fields DIR[,DIR..] | none`).
+- Input: another model's fit-field sets on the scan, a source's `"cond": {"fields": [DIR, ..]}`. They enter as a second 32-channel MX input
+  block of a latent net (unet_cfg.cond_ch = 12, cin 32 -> 64, header key "cond_ch").
+- The 12 channels (sample_cond.h):
+  - pc, ps;
+  - w, sp, dq;
+  - the three winding mod 4 differences as dq-weighted (cos, sin) per output axis, permuted and sine-negated under the window's cube symmetry.
+- Sampling: the sampler pulls them onto 8^3-voxel cells through the window's symmetry and warp, with the --distill cell coordinates.
+  `nn_cond_mx` upsamples them x2 trilinearly onto the latent cells and writes MX block 1. `nn_input_latc` writes block 0 into the 64-channel
+  tensor.
+- Missing data: a dropped window (probability --cond-drop), an echo / replay and cells outside the sets all read 0.
+- Warm start: init-from a net without the block zero-initialises the stem's new columns (copy_conv_in), so the donor's function is kept.
+- Presence (channel 11, lead: absence marked, not read as zero fields): the trilinear weight of the field cells that exist. A set's
+  cond_tiles.txt (the predict's tile list) limits it to its tiles, so unpredicted cells read presence 0, while a set's air is present
+  with zero planes. Dropped windows (--cond-drop, default 0.5: try9's fields are in-sample on part of 1667) are absent everywhere.
+- Predict: fills channels 32-63 of its 16-bit input (nn_cond_h16); there is no --tta.
+- Tests:
+  - test_gpu_input cond_check: the trainer chain equals predict's byte for byte, plus a host reference;
+  - test_cond_net: the warm-started net equals the donor bit for bit for random planes (MX-fp8 rn and the fp4 lean-2 preset), the new columns
+    get a gradient, and the header round-trips;
+  - test_sample_cond (CPU): positions, trilinear, the symmetry channel map, a second set.
+- Coverage: `ufsm occ-tiles` writes per-source predict tile lists near the sampler's labelled cells.
+
+| source | 512^3 tiles at 9.6 um (margin 64) | Gvox |
+|---|---|---|
+| Paris4 june / july (same CT) | 2334 / 3444 | 313 / 462 |
+| 1667 | 585 | 78 |
+| 0139 twin | 736 | 99 |
+| 0814 twin | 341 | 46 |
+
+- Cost: at ~19 Mvox/s for try9 fit fields (the wbench --boxes rate, 5060 Ti) that is 6-10 h of card time.
+- Disk: ~18 GB at 19.2 um cells with q8 phase.
+- Scope (lead / user 11-27, validation only): try9 fields for PHerc1667 only (67.5 Gvox, ~1 h of card 1, cpred1.sh), then a
+  1667-only fine-tune from w24 snap/4000, cond vs base, ~1 h (800 steps) per arm (ft.sh), scored on the 1667 wbench boxes and
+  phase-near. 0814 / 0139 / Paris4 only if that is positive.
+
+## Hard-spot sampling: a share of the draws from merge-flagged / id-change cells (2026-11-27, branch hardspot-20261127, hardspot)
+
+Port of upstream villa's hard-spot training (`tracers/sheets/evaluation/hard_spots.py`, `data.hard_windows` / `hard_fraction`: a fixed
+share of training episodes starts at a recorded failure spot of a model; research/villa.md idea 4). Ours draws a fixed share of a
+source's training windows from cells marked hard, instead of uniformly over its draw cells.
+
+- **Map** (`ufsm hard-map`, src/hardmap.c): uint8 per cell of 2^lev level-0 voxels of a scan (RAW + RAW.json: grid, lev, um, ct),
+  0 easy, 1..255 hard weight. Inputs: `--mf ZARR` (merge-flag plane in a field frame from `--fields`; weight = 255 x share of the
+  cell's material field cells at mf >= `--mf-thr` 179, kept when >= `--mf-min` 0.1 and >= 64 material cells) and / or `--boxes TSV`
+  (`z0 y0 x0 z1 y1 x1 w`: wbench per-box errors, the unroll's id-change places, disagreement boxes; max with 255 w).
+- **Source key** `"hard": {"map": RAW, "frac": F}`. The sampler maps each draw cell's centre into the map's frame (the same scan: the
+  map's `ct` basename must match, its um a power of two of the source's), keeps the cells with weight > 0 that are not in a held-out
+  box, and repeats each (w + 31) / 32 = 1..8 times. With probability F the position draw takes a cell from this list, else from the
+  usual index (edge-boost / zboost / focus apply to the usual index only). `--hard-frac F` > 0 overrides every source's frac, < 0 is off.
+  Validation samplers ignore the map. A map that marks none of the draw cells prints DEFAULTED.
+- **Off = byte-identical**: a source without a map draws no extra random number (test_sampbias: 8 deterministic batches of the
+  fixture source with and without a map at `--hard-frac -1`, every plane's hash equal).
+- **Logged**: at start the hard cells per source; sampler-only and the end of training print, per hard source, the kept windows
+  from hard draws, the share of all its kept windows on hard cells, and that share among the other draws alone (the unboosted rate).
+- test_sampbias: the index of a 4.8 um map on the 9.6 um fixture (exactly the cells below z 128, 8 times each), frac 0.5 -> 0.3-0.7
+  of 80 kept windows, off = identical hashes, on changes them; hard-map on a synthetic mf plane + a box (cell values exact).
+  bench_sampler hashes (deterministic fixture runs: plain, a holdout box, the trainer recipe) are the same for origin/master and the branch.
+- **1667 map** (`maps/PHerc1667-mf179.raw` in /vesuvius/ufsm/hardspot): the q2 mf plane (wgraph c7cf, 4635 x 1568 x 1616 field cells,
+  h 2 at 9.596 um), level-7 cells of the 2.399 um scan (290 x 119 x 119, 307 um). 42 s on 6 threads, 0.2 GB RSS. 237738 of 983777
+  material cells are hard (0.24 at share >= 0.1); weights: 36 % of the hard cells >= 224, 17 % at 32-63.
+- **Sampler-only** (CPU, PHerc1667-A48: the stored codesA at 4.8 um, P 256, w24's holdouts, edge-boost / snap-jitter / stick-src on;
+  frac 0.3, 600 kept windows): 18001 of 130018 draw cells hard (0.138; 5150 dropped in held-out boxes)
+
+  | | share |
+  |---|---|
+  | kept windows from hard draws | 0.352 (requested 0.3: hard draws are rejected less; 314 rejections in all) |
+  | kept windows on a hard cell | 0.448 |
+  | the same among the other draws (unboosted rate) | 0.149 |
+
+  So frac 0.3 triples the windows centred on merge-flagged cells. On w24's own source (2.4 um, onfly mesh labels on the CPU) the
+  same map marks 157091 of 1147175 draw cells (0.137); its windows cost ~70 s each on the CPU, too slow for a share count.
+- Only 1667 has a whole-scroll mf plane. Paris 4 / 0139 / 0814 need predicted fields + `ufsm merge-flag`, or per-box error rows
+  (wbench) as `--boxes`.
+
 ## Per-scroll / per-recipe ink eval: worst scroll, leak flags, band-tolerant F1; 1447 is the only scroll clean for every model (2026-11-27, branch inkeval-20261127, inkeval)
 
 Pooled dev numbers hid two things: which scroll a model fails on, and whether it trained on that scroll. `ufsm ink-strat` (src/inkstrat.c)
@@ -487,7 +599,8 @@ at w320).
   HOLD at rung 1.1, w832 h160 − w768 h32, paired: 1667 .903 vs .896 = +0.006 ± 0.010, P4 .895 vs .891 = +0.003 ± 0.006
   (predict 136 vs 105 s). The CT for this HOLD check is a local copy re-staged for it (r11/ctl/stage3.sh, 39 GB).
 - **Verdict:** a larger halo is AUC-neutral and cuts the seam ~4x, but `--seamless 2` is ~10x lower again at 1.3x the time.
-  Seamless 2 stays the seam fix; no predict default changed.
+  Seamless 2 stays the seam fix. Decision (lead): `--seamless 2` is the default of the production ink renders (scripts/unroll/unroll.sh's predict
+  ink pass, INKSEAM=2; INKSEAM=0 = the old --feather pass); window / halo unchanged. Unroll's R11P section reads (sect24*) already ran it.
 - A first run of this A/B on an old branch build (before perf's blend-region fix f7478578) showed seamless 2 at off256 7.64, i.e.
   pass b's own seams. That was the stale binary, not a current bug.
 

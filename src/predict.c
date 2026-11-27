@@ -1,5 +1,6 @@
 /* ufsm predict: sliding-window inference of a checkpoint over a CT box, written as a volcomp zarr v3
    probability pyramid (uint8 p*255, q=8) in the published layout. */
+#include "sample_cond.h"
 #include "imgops.h"
 #include "scannorm.h"
 #include "optcheck.h"
@@ -2360,6 +2361,7 @@ static int predict_one(int argc, char **argv) {
     shape5 xs = {1, !half && (cfg.cin == 5 || cfg.cin == 7) ? cfg.cin : 4, Dl, W, W};   /* (7: a train --cond net, its condition inputs zero here) */
     const shape5 xn = half ? (shape5){1, cfg.cin, W / hdiv, W / hdiv, W / hdiv} : xs;   /* the network's input */
     int latin = 0; void *x2 = nullptr, *lrt = nullptr; float *lgf = nullptr;   /* half: the network's input, the intermediate grid (div 4), the full-resolution logits */
+    source cnd_src = {0}; int8_t *cnd_h = nullptr; void *cnd_d = nullptr; size_t cnd_n = 0;   /* cfg.cond_ch: the conditioning sets, host / device planes of a window */
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
     /* --fit-zarr in z-chunk slabs (fzs below, the plane path): the 1^3 head per chunk over the cell planes the chunk reads (unet_head_fwd_z32,
        each plane once: two plane buffers, the overlap with the previous chunk copied) instead of the whole window's fp32 cell logits
@@ -2428,6 +2430,16 @@ static int predict_one(int argc, char **argv) {
                   && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")); }
         if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz || aux_zero) { auxd = nn_malloc(w3); auxh = malloc(w3); }
+        if (half && cfg.cond_ch) {   /* train --cond-fields checkpoints: the conditioning planes of every window (sample_cond.h, no symmetry) from --cond-fields DIR[,DIR..] */
+            const char *cf = opt(argc, argv, "--cond-fields", nullptr);
+            if (!cf) { fprintf(stderr, "predict: the checkpoint reads %d conditioning planes (train --cond-fields): --cond-fields DIR[,DIR..] (fit-field sets on this scan) or none\n", cfg.cond_ch); return 2; }
+            if (cfg.cond_ch != COND_K || !h16 || tta > 1 || W % 8 || Wz != W || hdiv != 4) { fprintf(stderr, "predict: --cond-fields: %d planes, fp16 activations, no --tta, cube windows of a multiple of 8\n", COND_K); return 2; }
+            memset(&cnd_src, 0, sizeof cnd_src); cnd_src.name = (char *)"predict"; cnd_src.um = um;
+            if (strcmp(cf, "none")) { char *t = strdup(cf), *sv = nullptr; for (char *q = strtok_r(t, ",", &sv); q && cnd_src.ncond < 16; q = strtok_r(nullptr, ",", &sv)) cnd_src.cond_dir[cnd_src.ncond++] = strdup(q); free(t); }
+            else UFSM_DEFAULTED("predict: --cond-fields none: the checkpoint's conditioning block is 0 (a dropped window's input)");
+            cnd_n = (size_t)COND_K * (W / 8) * (W / 8) * (W / 8); cnd_h = malloc(cnd_n); cnd_d = nn_malloc(cnd_n);
+            fprintf(stderr, "predict: %d conditioning planes from %d fit-field sets (%s)\n", COND_K, cnd_src.ncond, cf);
+        }
         if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4));   /* (lgf, and lrt with the direct latent input: at their first use; the direct latent rv path has none) */
             if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
         if (lat_store && gpath) lz_d = nn_malloc(w3 / 64 * (lz_c + 1));   /* (a voxel checkpoint too: its CT window rebuilt from the cells) */
@@ -3290,6 +3302,11 @@ static int predict_one(int argc, char **argv) {
                 if (skw && !nn_skip_build(ctd, Wz, W, W, 4, skip_nl, skip_thr, skip_margin)) { skip_wins++; if (ufsm_env_on("UFSM_SKIP_REPORT")) { const double sh0 = nn_skip_share(0); skip_share0 += sh0; skip_zero += sh0 <= 0; } }
                 if (skw && ufsm_env_on("UFSM_SKIP_AB")) skip_ab(u, x2, xn, h16, ctd, Wz, W, cfg.cout);   /* the dense / masked A/B of this window */
                 if (cfg.lat_dec) { if (!xd || !h16) { fprintf(stderr, "predict: the sub-cell decoder (lat_dec) reads the fp16 CT window (xd)\n"); return 1; } unet_set_latdec_ct(u, xd, Wz, W, W); }
+                if (cnd_h) {   /* cfg.cond_ch: channels 32 .. 63 of the 16-bit input from the window's conditioning planes */
+                    static const int id3[3] = {0, 1, 2}, nf3[3] = {0, 0, 0};
+                    if (sample_cond_window(&cnd_src, 8, level, o, W, W, id3, nf3, nullptr, cnd_h)) { fprintf(stderr, "predict: --cond-fields: read failed\n"); return 1; }
+                    nn_h2d(cnd_d, cnd_h, cnd_n); nn_cond_h16(x2, xn, cnd_d, COND_K, W / 8, W / 8, W / 8);
+                }
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
                 if (skw) { long m_, c_; nn_skip_counts(&m_, &c_); skip_masked += m_; skip_calls += c_; nn_skip_off(); }
                 /* train --fstem: the fine voxel stem on the CT channel (xd channel 0) into the planes the path holds: output o of the stem's list
