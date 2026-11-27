@@ -340,7 +340,7 @@ z3 *phase_onfly_fuse_open(z3 **sets, int n, float tol) {
     fuse_ctx *F = calloc(1, sizeof *F); F->n = n; F->tol = tol; for (int k = 0; k < n; k++) F->set[k] = sets[k];
     z3 *z = z3_open_derived(sets[0], PHASE_UNKNOWN, fuse_read, F, free);
     if (!z) { free(F); for (int k = 0; k < n; k++) z3_close(sets[k]); return nullptr; }
-    for (int k = 1; k < n; k++) if (z3_derived_cover(z, sets[k])) { fprintf(stderr, "phase fuse: set %d has another shape\n", k); for (int e = k; e < n; e++) z3_close(sets[e]); F->n = k; z3_close(z); return nullptr; }
+    for (int k = 1; k < n; k++) if (z3_derived_cover(z, sets[k])) { fprintf(stderr, "phase fuse: set %d has another shape (or more than %d sets)\n", k, Z3_MAX_COVER + 1); for (int e = k; e < n; e++) z3_close(sets[e]); F->n = k; z3_close(z); return nullptr; }
     return z;
 }
 

@@ -410,6 +410,7 @@ ufsm_exe(test_skip_empty SUITE tests/test_skip_empty.c OBJS unet NN LP LIBS m CU
 ufsm_exe(test_grad_ar SUITE tests/test_grad_ar.c OBJS CORE NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_sumsq SUITE tests/test_sumsq.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_dcache_batch SUITE tests/test_dcache_batch.c OBJS dcache zarr3 store z3w json LIBS LDLIBS)
+ufsm_exe(test_derived_cover SUITE tests/test_derived_cover.c OBJS zarr3 store z3w json LIBS LDLIBS)
 ufsm_exe(test_dcache_cap SUITE tests/test_dcache_cap.c OBJS dcache zarr3 store z3w json LIBS LDLIBS)
 ufsm_exe(test_dcache_phase SUITE tests/test_dcache_phase.c OBJS dcache zarr3 store z3w json LIBS LDLIBS)
 ufsm_exe(test_label_versions SUITE tests/test_label_versions.c OBJS band_onfly fuse band zarr3 store z3w json LIBS LDLIBS m)
