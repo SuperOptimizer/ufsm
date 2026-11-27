@@ -56,6 +56,38 @@ void phase_near_sample(const fit_fields_buf *F, const int64_t o[3], const int64_
     }
 }
 
+/* --min-comp N (topoloss 2026-11-27, the survey's "persistence filter" without retraining): predicted sheet components (26-connected
+   sheet voxels) of fewer than N voxels are dropped before the distances: tests whether w24's extra wraps are small fragments a
+   post-filter removes, or whole spurious sheets. 0: off (the measurement unchanged). */
+static long g_min_comp;
+void phase_near_set_min_comp(long n) { g_min_comp = n > 0 ? n : 0; }
+static void drop_small(uint8_t *mp, const int64_t n[3], long minc) {
+    const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];
+    size_t cap = 1 << 20, *st = malloc(cap * sizeof *st), *cv = malloc(cap * sizeof *cv), ccap = cap; size_t nc = 0, nd = 0, vd = 0, vt = 0;
+    for (size_t s0 = 0; s0 < N; s0++) {
+        if (mp[s0] != 1) continue;
+        size_t ns = 0, nv = 0; st[ns++] = s0; mp[s0] = 2;
+        while (ns) {
+            const size_t i = st[--ns];
+            if (nv == ccap) { ccap *= 2; cv = realloc(cv, ccap * sizeof *cv); }
+            cv[nv++] = i;
+            const int64_t z = (int64_t)(i / sz), y = (int64_t)(i / sy % (size_t)n[1]), x = (int64_t)(i % sy);
+            for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                const int64_t a = z + dz, b = y + dy, c = x + dx;
+                if (a < 0 || a >= n[0] || b < 0 || b >= n[1] || c < 0 || c >= n[2]) continue;
+                const size_t j = (size_t)a * sz + (size_t)b * sy + (size_t)c;
+                if (mp[j] != 1) continue;
+                mp[j] = 2; if (ns == cap) { cap *= 2; st = realloc(st, cap * sizeof *st); } st[ns++] = j;
+            }
+        }
+        nc++; vt += nv;
+        if ((long)nv < minc) { nd++; vd += nv; for (size_t k = 0; k < nv; k++) mp[cv[k]] = 0; }
+    }
+    for (size_t i = 0; i < N; i++) mp[i] = mp[i] != 0;
+    fprintf(stderr, "phase-near: --min-comp %ld: dropped %zu of %zu predicted sheet components, %zu of %zu voxels (%.1f %%)\n", minc, nd, nc, vd, vt, vt ? 100.0 * vd / vt : 0.0);
+    free(st); free(cv);
+}
+
 /* the measurement on one box (phasenear.h): g the GT phase, ph / cf the predicted phase (turns) and confidence on the same grid */
 int phase_near_measure(const uint8_t *g, const float *ph, const float *cf, const int64_t n[3], int mg, float cmin, int nth, phase_near_res *R) {
     const size_t N = (size_t)n[0] * n[1] * n[2];
@@ -75,6 +107,7 @@ int phase_near_measure(const uint8_t *g, const float *ph, const float *cf, const
             mp[ri <= rj ? i : j] = 1;
         }
     }
+    if (g_min_comp > 0) drop_small(mp, n, g_min_comp);
     if (edt_sq(mg_, n, dg, nth) || edt_sq(mp, n, dp, nth)) { free(mg_); free(mp); free(dg); free(dp); return -1; }
     float *a = malloc(N * 4), *b = malloc(N * 4); size_t na = 0, nb = 0; size_t w[2][3] = {{0}};
     for (int64_t z = mg; z < n[0] - mg; z++) for (int64_t y = mg; y < n[1] - mg; y++) for (int64_t x = mg; x < n[2] - mg; x++) {
@@ -92,11 +125,11 @@ int phase_near_measure(const uint8_t *g, const float *ph, const float *cf, const
 }
 
 int cmd_phase_near(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-near GT.json SOURCE FIELDS-DIR --box z,y,x,nz,ny,nx [--conf 0] [--margin 8] [--gpu 0] [--threads 6] [--header 0] [--tag T]\n"
+    if (argc < 5) { fprintf(stderr, "usage: ufsm phase-near GT.json SOURCE FIELDS-DIR --box z,y,x,nz,ny,nx [--conf 0] [--margin 8] [--gpu 0] [--threads 6] [--header 0] [--tag T] [--min-comp N]\n"
                                     "  predicted phase-0 sheets (predict --fit-zarr fields, any level: upsampled) vs SOURCE's GT phase sheets on its level-0 grid: distances in um\n"); return 2; }
     long long bx[6]; const char *bs = pn_opt(argc, argv, "--box", nullptr);
     if (!bs || sscanf(bs, "%lld,%lld,%lld,%lld,%lld,%lld", &bx[0], &bx[1], &bx[2], &bx[3], &bx[4], &bx[5]) != 6 || bx[3] < 16 || bx[4] < 16 || bx[5] < 16) { fprintf(stderr, "phase-near: --box z,y,x,nz,ny,nx (level-0 voxels, >= 16 each)\n"); return 2; }
-    const float cmin = (float)opt_atof("--conf", pn_opt(argc, argv, "--conf", "0")); const int mg = opt_atoi("--margin", pn_opt(argc, argv, "--margin", "8"));
+    const char *cl = pn_opt(argc, argv, "--conf", "0"), *ml = pn_opt(argc, argv, "--min-comp", "0"); const int mg = opt_atoi("--margin", pn_opt(argc, argv, "--margin", "8"));
     const int gpu = opt_atoi("--gpu", pn_opt(argc, argv, "--gpu", "0")), nth = opt_atoi("--threads", pn_opt(argc, argv, "--threads", "6"));
     const char *tag = pn_opt(argc, argv, "--tag", argv[4]);
     store_global_init();
@@ -111,13 +144,20 @@ int cmd_phase_near(int argc, char **argv) {
     if (!g || !ph || !cf) { fprintf(stderr, "phase-near: out of memory (%zu voxels)\n", N); return 1; }
     if (z3_read(s->phase, o, n, g, nth)) { fprintf(stderr, "phase-near: %s: GT phase read failed\n", s->name); return 1; }
     phase_near_sample(&F, o, n, s->um, ph, cf);
-    phase_near_res R;
-    if (phase_near_measure(g, ph, cf, n, mg, cmin, nth, &R)) { fprintf(stderr, "phase-near: out of memory\n"); return 1; }
-    const double um = s->um;
+    const double um = s->um; const int many = strchr(cl, ',') || strchr(ml, ',');
     if (opt_atoi("--header", pn_opt(argc, argv, "--header", "0")))
         printf("tag\tsource\tbox\tknown\tgt_sheet\tpred_sheet\tpg_p50_um\tpg_p90_um\tpg_1\tpg_2\tpg_4\tgp_p50_um\tgp_p90_um\tgp_1\tgp_2\tgp_4\n");
-    printf("%s\t%s\t%s\t%.4f\t%zu\t%zu\t%.2f\t%.2f\t%.4f\t%.4f\t%.4f\t%.2f\t%.2f\t%.4f\t%.4f\t%.4f\n", tag, s->name, bs, R.known, R.gt_sheet, R.pred_sheet,
-           R.pg50 * um, R.pg90 * um, R.pg_within[0], R.pg_within[1], R.pg_within[2], R.gp50 * um, R.gp90 * um, R.gp_within[0], R.gp_within[1], R.gp_within[2]);
+    /* --conf C[,C..] x --min-comp N[,N..]: one row each on the one GT read (the tag gets -cC-mN when either is a list) */
+    for (const char *cp = cl; *cp; ) { char *ce; const float cmin = strtof(cp, &ce); if (ce == cp) { fprintf(stderr, "phase-near: --conf C[,C...]\n"); return 2; }
+      for (const char *mp = ml; *mp; ) { char *me; const long mc = strtol(mp, &me, 10); if (me == mp) { fprintf(stderr, "phase-near: --min-comp N[,N...]\n"); return 2; }
+        phase_near_set_min_comp(mc);
+        phase_near_res R;
+        if (phase_near_measure(g, ph, cf, n, mg, cmin, nth, &R)) { fprintf(stderr, "phase-near: out of memory\n"); return 1; }
+        char tg[512]; if (many) snprintf(tg, sizeof tg, "%s-c%g-m%ld", tag, cmin, mc); else snprintf(tg, sizeof tg, "%s", tag);
+        printf("%s\t%s\t%s\t%.4f\t%zu\t%zu\t%.2f\t%.2f\t%.4f\t%.4f\t%.4f\t%.2f\t%.2f\t%.4f\t%.4f\t%.4f\n", tg, s->name, bs, R.known, R.gt_sheet, R.pred_sheet,
+               R.pg50 * um, R.pg90 * um, R.pg_within[0], R.pg_within[1], R.pg_within[2], R.gp50 * um, R.gp90 * um, R.gp_within[0], R.gp_within[1], R.gp_within[2]);
+        fflush(stdout); mp = *me == ',' ? me + 1 : me; if (*me && *me != ',') { fprintf(stderr, "phase-near: --min-comp N[,N...]\n"); return 2; } }
+      cp = *ce == ',' ? ce + 1 : ce; if (*ce && *ce != ',') { fprintf(stderr, "phase-near: --conf C[,C...]\n"); return 2; } }
     free(g); free(ph); free(cf); fit_fields_free(&F); sources_free(S);
     return 0;
 }

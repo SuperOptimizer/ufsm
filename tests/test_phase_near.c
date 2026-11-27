@@ -69,6 +69,20 @@ int main(void) {
         printf("%s missed sheets: pred -> GT p50 %.2f, GT -> pred p90 %.2f (>= %.1f), GT within 4 voxels %.3f (< 0.6)\n", ok ? "ok  " : "FAIL", R.pg50, R.gp90, 0.8 * S * c, R.gp_within[2]);
         fails += !ok; free(g); free(ph); free(cf); free(F.a[0]); free(F.a[1]);
     }
+    /* --min-comp (phase_near_set_min_comp): a small spurious wrap (a 5^3 blob of phase 0.98 | 0.02 between two sheets) adds predicted sheet voxels
+       far from any GT sheet (the share within 1 voxel drops); dropping components < 200 voxels removes exactly it (pred count back to the clean run's), the planes stay */
+    {
+        const int64_t n[3] = {NZ, NY, NX}, o[3] = {0, 0, 0}; const size_t N = (size_t)NZ * NY * NX;
+        uint8_t *g = malloc(N); float *ph = malloc(N * 4), *cf = malloc(N * 4); fit_fields_buf F; phase_near_res R0, R1, R2;
+        gt_phase(g); mk_fields(&F, 1, 0.0, 0); phase_near_sample(&F, o, n, 2.4, ph, cf);
+        phase_near_measure(g, ph, cf, n, 8, 0.f, 2, &R0);
+        for (int z = 46; z < 51; z++) for (int y = 30; y < 35; y++) for (int x = 30; x < 35; x++) ph[((size_t)z * NY + y) * NX + x] = x < 32 ? 0.98f : 0.02f;   /* (mid-gap, ~4 voxels from either plane: a wrap inside the blob) */
+        phase_near_measure(g, ph, cf, n, 8, 0.f, 2, &R1);
+        phase_near_set_min_comp(200); phase_near_measure(g, ph, cf, n, 8, 0.f, 2, &R2); phase_near_set_min_comp(0);
+        const int ok = R1.pred_sheet > R0.pred_sheet && R2.pred_sheet == R0.pred_sheet && R1.pg_within[0] < R0.pg_within[0] && R2.pg_within[0] == R0.pg_within[0];
+        printf("%s --min-comp: pred sheets clean %zu, + blob %zu, filtered %zu; pred -> GT within 1 voxel %.4f / %.4f / %.4f\n", ok ? "ok  " : "FAIL", R0.pred_sheet, R1.pred_sheet, R2.pred_sheet, R0.pg_within[0], R1.pg_within[0], R2.pg_within[0]);
+        fails += !ok; free(g); free(ph); free(cf); free(F.a[0]); free(F.a[1]);
+    }
     printf("%s\n", fails ? "FAIL" : "PASS");
     return fails != 0;
 }
