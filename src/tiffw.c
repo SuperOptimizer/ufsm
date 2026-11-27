@@ -113,7 +113,9 @@ int tiffw_write(const char *path, int w, int h, int fmt, const void *data, int d
 }
 
 int tifxyz_write(const char *dir, int w, int h, const float *x, const float *y, const float *z, double step, double voxel_um, int winding,
-                 const char *source) {
+                 const char *source) { return tifxyz_write_ex(dir, w, h, x, y, z, step, voxel_um, winding, source, nullptr); }
+int tifxyz_write_ex(const char *dir, int w, int h, const float *x, const float *y, const float *z, double step, double voxel_um, int winding,
+                    const char *source, const char *extra) {
     char p[1400]; const float *ax[3] = {x, y, z}; static const char *nm[3] = {"x.tif", "y.tif", "z.tif"};
     const int sfc = g_sfc_err > 0 && tfx_write_hook;   /* tifxyz_set_sfc: <dir>.sfc instead of the directory */
     if (!sfc) {
@@ -130,10 +132,11 @@ int tifxyz_write(const char *dir, int w, int h, const float *x, const float *y, 
     if (!isfinite(lo[0])) for (int k = 0; k < 3; k++) lo[k] = hi[k] = -1;
     const char *uuid = strrchr(dir, '/'); uuid = uuid ? uuid + 1 : dir;
     const double area = (double)quads * step * step, cm2 = area * voxel_um * voxel_um * 1e-8;
-    char meta[2048];
+    char meta[4096];
     snprintf(meta, sizeof meta, "{\"format\": \"tifxyz\", \"type\": \"seg\", \"uuid\": \"%s\", \"scale\": [%.9g, %.9g], \"bbox\": [[%.3f, %.3f, %.3f], [%.3f, %.3f, %.3f]], "
-             "\"area_vx2\": %.1f, \"area_cm2\": %.6f, \"voxel_size_um\": %.6g, \"winding\": %d, \"source\": \"%s\"}\n",
-             uuid, 1 / step, 1 / step, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], area, cm2, voxel_um, winding, source ? source : "ufsm");
+             "\"area_vx2\": %.1f, \"area_cm2\": %.6f, \"voxel_size_um\": %.6g, \"winding\": %d, \"source\": \"%s\"%s%s}\n",
+             uuid, 1 / step, 1 / step, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], area, cm2, voxel_um, winding, source ? source : "ufsm",
+             extra && *extra ? ", " : "", extra ? extra : "");
     if (sfc) { const size_t n = strlen(dir); snprintf(p, sizeof p, "%s%s", dir, n > 4 && !strcmp(dir + n - 4, ".sfc") ? "" : ".sfc");
                return tfx_write_hook(p, w, h, x, y, z, meta, g_sfc_err); }
     snprintf(p, sizeof p, "%s/meta.json", dir);
