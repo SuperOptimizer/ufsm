@@ -109,7 +109,9 @@ drain)
     sum=$(awk -F'\t' 'NR > 1 {c[$2]++} END {for (s in c) printf "%s %d ", s, c[s]}' "$O/results.tsv" 2> /dev/null)
     [ -z "$sum" ] && sum="no results: $(grep -m1 -E 'run_suite:|invalid|error' "$O.log" | cut -c1-100)"
     printf '%s %s %-28s rc %s  %s %s\n' "$(date '+%m-%d %H:%M')" "$T" "$REF" "$rc" "$sum" "$O/summary.txt" | tee -a "$RES"
-    case $rc in 0|1|2) ;; *) qline >> "$Q.left";; esac   # (BUSY / slot timeout: stays queued; a pass, a failure or a bad selection leave)
+    # (BUSY / NOGPU / slot timeout: stays queued; a pass, a failure or a bad selection leave. rc 3 with nothing BUSY / NOGPU / TIMEOUT is
+    #  only NEED2 (2-GPU tests a one-card slot cannot run): done too, else it reran every round, laminae / 5f2371c8 x3 on 11-26)
+    case $rc in 0|1|2) ;; 3) [[ "$sum" =~ BUSY|NOGPU|TIMEOUT|no\ results ]] && qline >> "$Q.left";; *) qline >> "$Q.left";; esac
   done < "$Q"
   mv -f "$Q.left" "$Q"
   ;;
