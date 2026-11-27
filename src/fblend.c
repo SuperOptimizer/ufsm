@@ -45,6 +45,17 @@ void fb_phase_cw(int n, const uint8_t *const *pc, const uint8_t *const *ps, cons
         opc[j] = clamp8(128 + 127 * x, 1); ops[j] = clamp8(128 + 127 * y, 1);
     }
 }
+void fb_phase_snap(const uint8_t *pca, const uint8_t *psa, const uint8_t *pcb, const uint8_t *psb, const uint8_t *sp, int h, double r_vox, size_t ncell,
+                   uint8_t *opc, uint8_t *ops) {
+    for (size_t j = 0; j < ncell; j++) {
+        opc[j] = pca[j]; ops[j] = psa[j];
+        const double ax = pca[j] - 128.0, ay = psa[j] - 128.0, bx = pcb[j] - 128.0, by = psb[j] - 128.0, ra = hypot(ax, ay), rb = hypot(bx, by);
+        if (!(ra > 0) || !(rb > 0) || !sp[j]) continue;
+        const double dphi = atan2(ax * by - ay * bx, ax * bx + ay * by);   /* b's phase - a's, (-pi, pi] */
+        if (fabs(dphi) / (2 * M_PI) * sp[j] * h / 8.0 > r_vox) continue;
+        opc[j] = clamp8(128 + ra * bx / rb, 1); ops[j] = clamp8(128 + ra * by / rb, 1);
+    }
+}
 void fb_phase(int n, const uint8_t *const *pc, const uint8_t *const *ps, const float *w, size_t ncell, uint8_t *opc, uint8_t *ops) {
     fb_phase_cw(n, pc, ps, w, nullptr, FB_CONF_RESULTANT, ncell, opc, ops);
 }
@@ -182,13 +193,23 @@ static float fb_plane_q(const fb_in *I, const char *name) {
 
 static int is_t(const char *s) { return s[0] == 't' && s[1] >= '0' && s[1] <= '5' && !s[2]; }
 static int is_w4(const char *s) { return !strcmp(s, "dz") || !strcmp(s, "dy") || !strcmp(s, "dx") || !strcmp(s, "dq"); }
+int fb_plane_group(const char *s) {
+    return !strcmp(s, "pc") || !strcmp(s, "ps") ? FB_G_PHASE : is_t(s) ? FB_G_NORMAL : !strcmp(s, "sp") ? FB_G_SP : !strcmp(s, "w") ? FB_G_W
+         : is_w4(s) ? FB_G_W4 : !strcmp(s, "r") ? FB_G_R : -1;
+}
+int fb_group_id(const char *s) {
+    static const char *const g[FB_NGRP] = {"phase", "normal", "sp", "w", "w4", "r"};
+    for (int k = 0; k < FB_NGRP; k++) if (!strcmp(s, g[k])) return k;
+    return -1;
+}
 
 /* the work of one slab of FB_ROWS field rows, on threads: reads (plane, input), combines (plane, cell chunk), shard writes (plane, shard) */
 #define FB_CHUNK ((size_t)1 << 20)
 typedef struct {
     int n, np, H, W, z0, nz, y0, nchunk, nx, kps, kw4[4];   /* H: the band's rows (of 128 at y0) */ const char **pl; const float *w;
+    float (*wk)[FB_MAXIN];   /* per plane its input weights (w, or the plane group's --plane-w) */
     fb_rd (*R)[FB_MAXIN]; int (*use)[FB_MAXIN]; uint8_t *(*buf)[FB_MAXIN]; uint8_t **obuf; z3w **ZW; atomic_int next, fail;
-    const float *aw[3][FB_MAXIN]; int conf;   /* tile weights per input along z, y, x (aw[0][0] nullptr: none); the phase confidence rule */
+    const float *aw[3][FB_MAXIN]; int conf, ksp, snap_h; double snap_r;   /* (snap_r > 0: --snap R in in[0]'s native voxels, its cell h snap_h) tile weights per input along z, y, x (aw[0][0] nullptr: none); the phase confidence rule */
     int paste, sub[FB_MAXIN][3], subsh[FB_MAXIN][3];   /* --paste: input i's box in in[0]'s cells (offset, shape) */
 } fb_slab;
 typedef void (*fb_fn)(fb_slab *, int);
@@ -245,18 +266,23 @@ static void fb_job_combine(fb_slab *S, int j) {
             cwb[t] = r > 1e-6f ? r : 1e-6f;
         }
     }
-    const float *const *cwp = cwb ? cw : nullptr;
+    const float *const *cwp = cwb ? cw : nullptr; const float *wk = S->wk[k];
     if (!strcmp(nm, "pc")) {   /* with its ps partner */
         const int kp = S->kps; const uint8_t *s2[FB_MAXIN]; for (int i = 0; i < n; i++) s2[i] = S->use[kp][i] ? S->buf[kp][i] + c0 : nullptr;
-        fb_phase_cw(n, src, s2, S->w, cwp, S->conf, m, o, S->obuf[kp] + c0);
+        if (S->snap_r > 0) {
+            const uint8_t *sp0 = S->ksp >= 0 && S->use[S->ksp][0] ? S->buf[S->ksp][0] + c0 : nullptr;
+            if (!src[0] || !s2[0] || !src[1] || !s2[1] || !sp0) { atomic_store(&S->fail, 1); free(cwb); return; }
+            fb_phase_snap(src[0], s2[0], src[1], s2[1], sp0, S->snap_h, S->snap_r, m, o, S->obuf[kp] + c0);
+        } else
+        fb_phase_cw(n, src, s2, wk, cwp, S->conf, m, o, S->obuf[kp] + c0);
     } else if (!strcmp(nm, "dz")) {
         const uint8_t *d4[FB_MAXIN][4]; for (int i = 0; i < n; i++) for (int a = 0; a < 4; a++) d4[i][a] = S->use[S->kw4[a]][i] ? S->buf[S->kw4[a]][i] + c0 : nullptr;
         uint8_t *const o4[4] = {S->obuf[S->kw4[0]] + c0, S->obuf[S->kw4[1]] + c0, S->obuf[S->kw4[2]] + c0, S->obuf[S->kw4[3]] + c0};
-        fb_wind4_cw(n, (const uint8_t *const (*)[4])d4, S->w, cwp, m, o4);
+        fb_wind4_cw(n, (const uint8_t *const (*)[4])d4, wk, cwp, m, o4);
     }
-    else if (is_t(nm) || !strcmp(nm, "r")) fb_mean_cw(n, src, S->w, cwp, m, o);
-    else if (!strcmp(nm, "sp")) fb_median_known_cw(n, src, S->w, cwp, m, o);
-    else if (!strcmp(nm, "w")) { if (S->paste) fb_mean_cw(n, src, S->w, cwp, m, o); else fb_max(n, src, m, o); }
+    else if (is_t(nm) || !strcmp(nm, "r")) fb_mean_cw(n, src, wk, cwp, m, o);
+    else if (!strcmp(nm, "sp")) fb_median_known_cw(n, src, wk, cwp, m, o);
+    else if (!strcmp(nm, "w")) { if (S->paste) fb_mean_cw(n, src, wk, cwp, m, o); else fb_max(n, src, m, o); }
     else { for (int i = 0; i < n; i++) if (src[i]) { memcpy(o, src[i], m); break; } }   /* passed through */
     free(cwb);
 }
@@ -319,8 +345,13 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
     /* the output planes: the known ones any input has (the phase pair and the winding mod 4 quad only whole), then in[0]'s others */
     static const char *known[] = {"pc", "ps", "t0", "t1", "t2", "t3", "t4", "t5", "sp", "w", "dz", "dy", "dx", "dq", "r"};
     const char *pl[FB_MAXP]; int np = 0, w4src = -1;
+    /* the weight of input i in plane nm: its group's --plane-w when given, else the global weight (0: the input does not take part) */
+    #define PW(nm, i) (opt && fb_plane_group(nm) >= 0 && opt->pw_on[fb_plane_group(nm)] ? opt->pw[fb_plane_group(nm)][i] : w[i])
+    for (int g = 0; g < FB_NGRP; g++) if (opt && opt->pw_on[g]) for (int i = 0; i < n; i++)
+        if (!(opt->pw[g][i] >= 0)) { fprintf(stderr, "field-blend: --plane-w weights must be >= 0\n"); rc = 2; goto done; }
     for (int k = 0; k < 15; k++) for (int i = 0; i < n; i++) {
         const char *nm = known[k];
+        if (!(PW(nm, i) > 0)) continue;   /* (weight 0: not part of the plane) */
         const int ok = !strcmp(nm, "pc") || !strcmp(nm, "ps") ? fb_has(&I[i], "pc") && fb_has(&I[i], "ps")
                      : is_w4(nm) ? fb_has(&I[i], "dz") && fb_has(&I[i], "dy") && fb_has(&I[i], "dx") && fb_has(&I[i], "dq") : fb_has(&I[i], nm);
         if (ok) { pl[np++] = nm; if (is_w4(nm) && w4src < 0) w4src = i; break; }
@@ -334,7 +365,13 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
     z3w *ZW[FB_MAXP] = {0}; FILE *FW[FB_MAXP] = {0};
     const size_t rowc = (size_t)FB_ROWS * W;   /* a band: 128 rows of y (memory: 128 x 128 x W per plane and input) */
     uint8_t *(*buf)[FB_MAXIN] = calloc((size_t)np, sizeof *buf), *obuf[FB_MAXP] = {0};
-    if (!R || !use || !buf) goto done2;
+    float (*wk)[FB_MAXIN] = calloc((size_t)np, sizeof *wk);
+    if (!R || !use || !buf || !wk) goto done2;
+    int w4d_out = 0;   /* the output's w4_d (in[0]'s native voxels) */
+    if (w4src >= 0) {
+        const double d = I[w4src].w4_d * I[w4src].um / I[0].um; w4d_out = (int)lround(d);
+        if (fabs(d - w4d_out) > 1e-3 * (1 + d)) { fprintf(stderr, "field-blend: the winding mod 4 offset of %s (%d x %.3f um) is not whole in %s's voxels\n", in[w4src], I[w4src].w4_d, I[w4src].um, in[0]); goto done2; }
+    }
     for (int k = 0; k < np; k++) {
         int known_ = 0; for (int q = 0; q < 15; q++) if (!strcmp(pl[k], known[q])) known_ = 1;
         int pass = -1; if (!known_) for (int i = 0; i < n && pass < 0; i++) if (fb_has(&I[i], pl[k])) pass = i;   /* (in[0] has it) */
@@ -343,6 +380,12 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
                                                   : !strcmp(pl[k], "pc") || !strcmp(pl[k], "ps") ? fb_has(&I[i], "pc") && fb_has(&I[i], "ps") : fb_has(&I[i], pl[k]))
                                   : i == pass;
             if (on && paste && i > 0 && is_w4(pl[k]) && fabs(I[i].w4_d * I[i].um - I[0].w4_d * I[0].um) > 1e-3) on = 0;   /* another offset */
+            if (on && known_ && !(PW(pl[k], i) > 0)) on = 0;   /* weight 0 (--weights / --plane-w): not read */
+            if (on && !paste && is_w4(pl[k]) && i != w4src && fabs(I[i].w4_d * I[i].um - I[w4src].w4_d * I[w4src].um) > 1e-3) {   /* another offset */
+                if (!strcmp(pl[k], "dz")) printf("DEFAULTED: field-blend: %s left out of the winding mod 4 planes (w4_d %d x %.3f um, %s's %d x %.3f um)\n", in[i], I[i].w4_d, I[i].um, in[w4src], I[w4src].w4_d, I[w4src].um);
+                on = 0;
+            }
+            if (on) wk[k][i] = known_ ? PW(pl[k], i) : w[i];
             if (!on) continue;
             use[k][i] = 1;
             if (rd_open(&R[k][i], &I[i], pl[k])) goto done2;
@@ -361,8 +404,12 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
             if (!(FW[k] = fopen(p, "wb"))) { fprintf(stderr, "field-blend: cannot write %s\n", p); goto done2; }
         }
     }
-    fb_slab S = {.n = n, .np = np, .W = W, .pl = pl, .w = w, .R = R, .use = use, .buf = buf, .obuf = obuf, .ZW = ZW};
-    S.conf = opt ? opt->conf : FB_CONF_RESULTANT;
+    fb_slab S = {.n = n, .np = np, .W = W, .pl = pl, .w = w, .wk = wk, .R = R, .use = use, .buf = buf, .obuf = obuf, .ZW = ZW};
+    S.conf = opt ? opt->conf : FB_CONF_RESULTANT; S.ksp = -1;
+    if (opt && opt->snap_um > 0) {
+        if (n != 2 || paste || opt->tile) { fprintf(stderr, "field-blend --snap: exactly two inputs (the sheets, the placer), no --paste / --tile\n"); rc = 2; goto done2; }
+        S.snap_r = opt->snap_um / I[0].um; S.snap_h = I[0].h;
+    }
     if (paste) {   /* per-axis feathered box weights (in[0]: 1; its share is set per cell in the combine) */
         S.paste = 1; const int sh[3] = {D, H, W}; const double F = opt->feather > 0 ? opt->feather : 1;
         if (!(awb = malloc((size_t)n * (D + H + W) * sizeof *awb))) goto done2;
@@ -387,6 +434,7 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
     }
     for (int k = 0; k < np; k++) {   /* the partner planes of the groups */
         if (!strcmp(pl[k], "ps")) S.kps = k;
+        if (!strcmp(pl[k], "sp")) S.ksp = k;
         static const char *wn[4] = {"dz", "dy", "dx", "dq"}; for (int a = 0; a < 4; a++) if (!strcmp(pl[k], wn[a])) S.kw4[a] = k;
     }
     for (int z0 = 0; z0 < D; z0 += FB_ROWS) for (int y0 = 0; y0 < H; y0 += FB_ROWS) {   /* bands of 128 x 128 x W cells */
@@ -426,12 +474,16 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
             fprintf(f, ", \"%s\": ", key); jw(f, j->items[i]);
         }
         fprintf(f, ", \"recto\": %s", has_r ? "true" : "false");
-        if (w4src >= 0) fprintf(f, ", \"w4_d\": %d", (int)json_num(json_get(I[w4src].j, "w4_d"), 32));
+        if (w4src >= 0) fprintf(f, ", \"w4_d\": %d", w4d_out);
         fprintf(f, ", \"blend\": {\"inputs\": [");
         for (int i = 0; i < n; i++) { fprintf(f, "%s\"", i ? ", " : ""); for (const char *c = in[i]; *c; c++) { if (*c == '"' || *c == '\\') fputc('\\', f); fputc(*c, f); } fputc('"', f); }
         fprintf(f, "], \"weights\": [");
         for (int i = 0; i < n; i++) fprintf(f, "%s%.6g", i ? ", " : "", w[i]);
         fprintf(f, "]");
+        for (int g = 0; g < FB_NGRP; g++) if (opt && opt->pw_on[g]) {
+            static const char *const gn[FB_NGRP] = {"phase", "normal", "sp", "w", "w4", "r"};
+            fprintf(f, ", \"plane_w_%s\": [", gn[g]); for (int i = 0; i < n; i++) fprintf(f, "%s%.6g", i ? ", " : "", opt->pw[g][i]); fprintf(f, "]");
+        }
         if (opt && opt->tile) {
             fprintf(f, ", \"tile_stride\": [%g, %g, %g], \"tile_grids\": [", opt->stride[0], opt->stride[1], opt->stride[2]);
             for (int i = 0; i < n; i++) fprintf(f, "%s[%g, %g, %g]", i ? ", " : "", opt->grid[i][0], opt->grid[i][1], opt->grid[i][2]);
@@ -439,6 +491,7 @@ int fblend_run2(const char *out, int n, const char *const *in, const float *wt, 
         }
         if (opt && opt->conf == FB_CONF_MEAN) fprintf(f, ", \"conf\": \"mean\"");
         if (opt && opt->conf == FB_CONF_MEDOID) fprintf(f, ", \"conf\": \"medoid\"");
+        if (opt && opt->snap_um > 0) fprintf(f, ", \"snap_um\": %g", opt->snap_um);
         if (paste) fprintf(f, ", \"paste_feather\": %g", opt->feather);
         if (opt && opt->box) fprintf(f, ", \"box\": [%lld, %lld, %lld, %lld, %lld, %lld]", opt->b0[0], opt->b0[1], opt->b0[2], opt->bn[0], opt->bn[1], opt->bn[2]);
         fprintf(f, "}}\n");
@@ -452,7 +505,7 @@ done2:
         for (int i = 0; i < n; i++) { if (use && use[k][i]) rd_close(&R[k][i]); if (buf) free(buf[k][i]); }
         free(obuf[k]); if (ZW[k] && z3w_close(ZW[k])) rc = 1; if (FW[k] && fclose(FW[k])) rc = 1;
     }
-    free(R); free(use); free(buf); free(awb);
+    free(R); free(use); free(buf); free(awb); free(wk);
 done:
     for (int i = 0; i < nin; i++) fb_close(&I[i]);
     return rc;

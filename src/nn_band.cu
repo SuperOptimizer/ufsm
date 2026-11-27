@@ -137,7 +137,7 @@ __global__ void k_bg_pair(const uint8_t *codes, const int32_t *ie, const int32_t
    parity is the level-0 one, or the level-1 one (at its cell's centre, 2 g + 0.5 in level-0 voxels) when that cell is not wholly inside
    the level-0 tile (a sheet the level-0 tile cannot see) and nearer. The level-1 feature is its parent cell's: at rmax 160 (the 2.4 um
    rung) the halo of 162 level-0 voxels became one of 82 level-1 voxels, 8x fewer voxels stamped and transformed. ---- */
-__device__ __forceinline__ int bg_near2(const uint8_t *c0, int32_t f0, const uint8_t *c1, int32_t f1, long z, long y, long x, int3 n0, int3 n1, int3 off,
+__device__ __forceinline__ int bg_near2(const uint8_t *c0, int32_t f0, const uint8_t *c1, int32_t f1, long z, long y, long x, int3 n0, int3 n1, int3 off, int ls,
                                         float &d, float &vz, float &vy, float &vx, int &code) {
     d = BINF;
     if (f0 >= 0) {
@@ -146,25 +146,25 @@ __device__ __forceinline__ int bg_near2(const uint8_t *c0, int32_t f0, const uin
     }
     if (f1 >= 0) {
         const long s1 = (long)n1.y * n1.z, gz = f1 / s1, gy = (f1 / n1.z) % n1.y, gx = f1 % n1.z;
-        const long lz = 2 * gz - off.x, ly = 2 * gy - off.y, lx = 2 * gx - off.z;   /* the cell's first level-0 voxel in the level-0 tile */
-        if (lz < 0 || ly < 0 || lx < 0 || lz + 1 >= n0.x || ly + 1 >= n0.y || lx + 1 >= n0.z) {
-            const float wz = (float)(lz - z) + 0.5f, wy = (float)(ly - y) + 0.5f, wx = (float)(lx - x) + 0.5f, e = wz * wz + wy * wy + wx * wx;
+        const long k = 1L << ls, lz = k * gz - off.x, ly = k * gy - off.y, lx = k * gx - off.z; const float hc = 0.5f * (float)(k - 1);   /* the cell's first level-0 voxel in the level-0 tile; its centre */
+        if (lz < 0 || ly < 0 || lx < 0 || lz + k - 1 >= n0.x || ly + k - 1 >= n0.y || lx + k - 1 >= n0.z) {
+            const float wz = (float)(lz - z) + hc, wy = (float)(ly - y) + hc, wx = (float)(lx - x) + hc, e = wz * wz + wy * wy + wx * wx;
             if (e < d) { d = e; vz = wz; vy = wy; vx = wx; code = c1[f1]; }
         }
     }
     return d < BINF;
 }
 __global__ void k_bg_pair2(const uint8_t *c0, const int32_t *ie0, const int32_t *io0, int3 n0, const uint8_t *c1, const int32_t *ie1, const int32_t *io1,
-                           int3 n1, int3 off, float r2, uint8_t *phase) {
+                           int3 n1, int3 off, int ls, float r2, uint8_t *phase) {
     const long N = (long)n0.x * n0.y * n0.z, i = (long)blockIdx.x * blockDim.x + threadIdx.x; if (i >= N) return;
     phase[i] = PHASE_UNKNOWN;
     const int c = c0[i];
     if (c > 0 && c < 255) { phase[i] = 0; return; }
     const long z = i / ((long)n0.y * n0.z), y = (i / n0.z) % n0.y, x = i % n0.z;
-    const long p = (((z + off.x) >> 1) * n1.y + ((y + off.y) >> 1)) * n1.z + ((x + off.z) >> 1);
+    const long p = (((z + off.x) >> ls) * n1.y + ((y + off.y) >> ls)) * n1.z + ((x + off.z) >> ls);
     float de, dd, az, ay, ax, bz, by, bx; int ca, cb;
-    if (!bg_near2(c0, ie0[i], c1, ie1[p], z, y, x, n0, n1, off, de, az, ay, ax, ca)) return;
-    if (!bg_near2(c0, io0[i], c1, io1[p], z, y, x, n0, n1, off, dd, bz, by, bx, cb)) return;
+    if (!bg_near2(c0, ie0[i], c1, ie1[p], z, y, x, n0, n1, off, ls, de, az, ay, ax, ca)) return;
+    if (!bg_near2(c0, io0[i], c1, io1[p], z, y, x, n0, n1, off, ls, dd, bz, by, bx, cb)) return;
     if (de > r2 || dd > r2) return;
     const int ka = (ca - 1) / BAND_STEPS, kb = (cb - 1) / BAND_STEPS;
     int dk = ((kb - ka) % 14 + 14) % 14; if (dk > 7) dk -= 14;
@@ -562,9 +562,9 @@ extern "C" int band_pair_gpu_fill(int (*fill)(void *ctx, uint8_t *dcodes, int de
    level-0 tile's voxel z lies in the level-1 cell (z + off) / 2, off >= 0). 2: no labelled voxel in the level-1 tile; -2: a fill
    could not (the caller's CPU path). Only the crop of the level-0 tile comes down */
 extern "C" int band_pair_gpu_fill2(int (*fill0)(void *ctx, uint8_t *dcodes, int dev, const int n[3]), void *ctx0, const int n0[3],
-                                   int (*fill1)(void *ctx, uint8_t *dcodes, int dev, const int n[3]), void *ctx1, const int n1[3], const int off[3],
+                                   int (*fill1)(void *ctx, uint8_t *dcodes, int dev, const int n[3]), void *ctx1, const int n1[3], const int off[3], int ls,
                                    float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out) {
-    if (rmax <= 0) return -1;
+    if (rmax <= 0 || ls < 1 || ls > 3) return -1;
     int k = -1;
     pthread_mutex_lock(&g_mu);
     for (;;) { for (int i = 0; i < g_slots; i++) { const int q = (g_rr + i) % g_slots; if (!g_ctx[q].busy) { k = q; break; } } if (k >= 0) break; pthread_cond_wait(&g_cv, &g_mu); }
@@ -593,7 +593,7 @@ extern "C" int band_pair_gpu_fill2(int (*fill0)(void *ctx, uint8_t *dcodes, int 
         for (int par = 0; par < 2; par++) bg_parity(G, G.codes, n0, lc0, par, par ? G.io : G.ie);
         if (tim) cudaEventRecord(ev[2], G.st);
         k_bg_pair2<<<(unsigned)((N0 + 255) / 256), 256, 0, G.st>>>(G.codes, G.ie, G.io, make_int3(n0[0], n0[1], n0[2]), G.c1, G.ie1, G.io1,
-                                                                 make_int3(n1[0], n1[1], n1[2]), make_int3(off[0], off[1], off[2]), rmax * rmax, G.phase);
+                                                                 make_int3(n1[0], n1[1], n1[2]), make_int3(off[0], off[1], off[2]), ls, rmax * rmax, G.phase);
         if (cudaGetLastError() != cudaSuccess) { rc = -1; break; }
         cudaMemcpy3DParms P = {};
         P.srcPtr = make_cudaPitchedPtr(G.phase, (size_t)n0[2], (size_t)n0[2], (size_t)n0[1]); P.srcPos = make_cudaPos((size_t)crop_o[2], (size_t)crop_o[1], (size_t)crop_o[0]);

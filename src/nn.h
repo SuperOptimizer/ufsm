@@ -252,6 +252,11 @@ void nn_skip_bwd_check(void);
 void nn_skip_wg_begin(void);
 void nn_skip_wg_end(void);
 void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y);
+/* train / predict --cond-fields (unet_cfg.cond_ch): channels 32 .. 63 of a 64-channel latent input (xs: the cell grid) from K int8 conditioning planes
+   cd [n][K][gd][gh][gw] (v / 127; coarse cells of 2^3 latent cells, trilinear x2, fp16-rounded; cd nullptr: zeros). nn_cond_mx into the MX
+   input (after nn_input_latc wrote block 0), nn_cond_h16 into a 16-bit [n][64][d][h][w] window (predict: then nn_h16_to_mx gives the same bits) */
+void nn_cond_mx(void *y, shape5 xs, const void *cd, int K, int gd, int gh, int gw);
+void nn_cond_h16(void *y, shape5 xs, const void *cd, int K, int gd, int gh, int gw);
 /* train --lat-direct-p: rows of window n's cells [cz0, cz0 + ncz) of nn_input_latc's input with the C coefficient channels from stored latvol
    cells (int8 [ncz][h][w][stride], nn_latvol_decode's layout, raw-domain step step_raw) z-scored with the window's mean / isd (predict's
    nn_lat_input_qs), the radial channels as nn_input_latc's */
@@ -614,6 +619,14 @@ void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, cons
 /* Offset-tolerant positives on channel 0 (radius r <= 2 voxels, 0 = off; see nn.cu): code is a uint8 [n][S] work buffer. */
 void nn_set_loss_tol(int r);
 void nn_set_loss_unit_ch7(int c);   /* 7-channel losses (task unwrap normal n n^T + density): channel c's mask weight counts as 0 / 1 (the packed weight off); -1 off */
+void nn_set_loss_dgap(int c, int thr);   /* train --density-min-gap-um (thread-local): the next nn_loss_stats_acc_e / nn_loss_grad_only_s drop channel c's voxels with target code >= thr; thr 0 off */
+/* train --density-nll (src/nn_dvar.cu): the density head's learned log-variance zs (fp16 logit = s) against the residual sigmoid(zd) - t / 255,
+   mask m > 0 less target codes >= thr (thr 0: none). stats: acc[4] += supervised, sum NLL, sum e^(-(1 - beta) s), sum s. grad: the s
+   gradient in place over zs (16-bit, the loss producers' scale), af (fp16 per voxel, nullptr: none) the mean's factor a / mean(a);
+   scale: the density plane's 16-bit gradient times af */
+void nn_dvar_stats(const void *zd, const void *zs, const uint8_t *t, const uint8_t *m, size_t n, int thr, float beta, double *acc);
+void nn_dvar_grad(const void *zd, void *zs, const uint8_t *t, const uint8_t *m, size_t n, int thr, float beta, float lam, const double *acc, void *af);
+void nn_dvar_scale(void *g, const void *af, size_t n);
 void nn_set_recall(float w);
 int nn_get_loss_grad_h16(void);   /* the loss kernels' gradient format (nn_set_loss_grad_h16) */
 void nn_pool_targets(const uint8_t *t, const uint8_t *m, int B, int C, int D, int H, int W, int f, uint8_t *to, uint8_t *mo);   /* deep supervision: max-pool masked targets, any-pool the mask (C <= 16) */   /* recto channel: + w (1 - (sum s p + 1) / (sum p + 1)), gradient only (the logged dice excludes it) */
@@ -805,6 +818,8 @@ void nn_rv_fuse(void *lg, size_t n, int h16);   /* predict --channel rv: [recto 
 void nn_ink_targets(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m);   /* train --ink-head: ink prob254 (255 unknown) -> target t (x255) and mask m (known) */
 void nn_ink_targets_smooth(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m, float eps);   /* the same, label-smoothed: t (1 - eps) + eps / 2 (train --ink-smooth) */
 void nn_ink_air(const uint8_t *pap, size_t n, int z0, int H, int W, int S, float eps, uint8_t *t, uint8_t *m);   /* train --ink-air S: unlabelled air voxels on the S-lattice -> ink 0 (the smoothed 0), mask 1 */
+void nn_ink_neg(const uint8_t *ink, size_t vb, size_t n, int D, int H, int W, int R, const void *lg, float thr, uint8_t *m, int count);   /* train --ink-neg-guard R / --ink-neg-gate T: label negatives within R voxels of a positive, or (lg: fp16 logits) with p > T, leave the slab mask m (ink: the window plane, slab = [vb, vb + n)); count: + nn_ink_neg_counts */
+void nn_ink_neg_counts(unsigned long long out[3]);   /* known negatives, guard drops, gate drops since the last call (all devices) */
 void nn_phase_trunc(const void *lc, const void *ls, const uint8_t *t, uint8_t *m, size_t n, float tau, float kappa);   /* robust phase loss: confident (>= kappa) predictions off their label by > tau turns leave the mask (fp16 logits) */
 void nn_phase_trunc_counts(unsigned long long out[2]);   /* labelled voxels / dropped since the last call */
 void nn_sheet_mask_z(const uint8_t *phase, int d, int h, int w, int s, float lo, float hi, uint8_t *m, int z0, int z1);   /* train --sheet-mask: the phase mask of phase-0 (labelled sheet) voxels x ramp(local spacing LO..HI voxels), planes [z0, z1) of the window into m (planes of z1 - z0) */
@@ -842,6 +857,12 @@ void nn_count_loss(const void *dens_logits, const uint8_t *phase, int d, int h, 
 void nn_pgrad_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, const float *dist,
                    int nd, int angle, int mask, double *sums, float *acc);   /* dist: nd (1..4) partner distances, each its own pairs; angle: angular gradient only; mask: reliable label pairs only */
 void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const double *sums, float lambda);
+/* train --topo-lambda: the wrap-count (topology) loss over a head slab [z0, z1) (src/nn_loss.cu topo_k): rays along the label's phase normal from
+   every k-th voxel per axis (the lattice shifted by off), up to len steps each way, huber(predicted - label total phase turns) per ray. lc / ls,
+   phase, wm as nn_pgrad_slab; sums (4 device doubles, accumulated): sum w loss, sum w, sum w of count errors (> 0.5 turn), sum w (Tp - Tg);
+   lc = ls = nullptr: sums[1] only; acc (2 x slab floats, zero; nullptr: none): the gradient of sum w loss, added by nn_pgrad_apply(..., sums, lambda) */
+void nn_topo_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, int len, int k,
+                  unsigned off, double *sums, float *acc);
 void nn_cond_targets(const uint8_t *wind, size_t n, uint8_t *t, uint8_t *m);   /* --cond: winding mod 14 (band.h band_winding) -> 4 targets: cos / sin of 2 pi q / 14 and 2 pi q / 2 (x255, 4 planes), mask (known) */
 void nn_cond_acc(const void *lg, int lg_h16, const uint8_t *wind, size_t n, unsigned long long *cnt);   /* --cond: known / right-turn counts of the 14-turn head (cnt: 2 device u64, accumulated) */
 void nn_pap_targets(const uint8_t *pl, const uint8_t *pm, size_t n, uint8_t *t, uint8_t *m);   /* --pap-head: gap labels (0 / 1 / 255 ignored) -> target, mask (not ignored, inside the scroll) */

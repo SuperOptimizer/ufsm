@@ -12,6 +12,10 @@
 #   JOIN="--fibers /vesuvius/ufsm/fibers/wbsites/{box}.fib --join-fib 1"; changes the fitter config tag), FIELDS (TAG0: reuse fields),
 #   KEEP (1: keep this TAG's fields for later fixed-fields runs; default 1), U (binary; default $WB/bin/ufsm = the pinned build), UP (predict binary, default U: a newer build for checkpoints the fitter pin cannot load),
 #   NOLOCK=1 (the caller holds the GPU lock).
+#   REFSNAP=1 (globwind 11-27): score boxes the way the unroll fits them: count-field (L2, CPU) on the box's fields -> fit --ref-model
+#   --ref-snap 1 (every voxel's integer from the count ref); CFX = extra count-field flags (e.g. "--cf-robust 8"). Changes the fitter
+#   config tag; boxes only (the slab sites keep the plain fit). Needs U = a build with count-field (not the pinned b29b1bda): compare
+#   against a plain run with the same U. try9 20 boxes: +0.040 ids vs the plain fit (DESIGN "Global winding").
 #   WZARGS= (empty): cube windows, no --window-z (latent-grid checkpoints: train --lat 4), with WIN / HALO.
 #   LATENTS="SCROLL=STORE ..." (e.g. "1667=/home/forrest/scratch-mig/lat/p1667-l2b.lc"): those scrolls' fields predicted from
 #   the ufsm lc-encode store of their CT level (predict --latents: --lat-basis checkpoints; paris4j falls back to paris4's store).
@@ -28,7 +32,7 @@ BOXES=${BOXES:-clean}; SLABORC=${SLABORC:-}; REP=${REP:-2}; SLABS=${SLABS:-$([ "
 [ "$SITE" = laptop ] && [ "$SLABS" = 1 ] && { echo "wbench: no slab fits on the laptop (OOM in ufsm.slice): run the sites on forlindesk (wgate-slabs.sh) or SLABS=0"; exit 2; }
 BT=${BT:-$H/boxes.tsv}; BIN=$(sha1sum $U | cut -c1-8)
 GF="--gpu $GPU"; [ "${CPU:-0}" = 1 ] && GF="--cpu --threads $THREADS"   # CPU=1: fits on the CPU backend (no GPU; a separate fitter config)
-FCFG=$(echo "$BIN --dir 1 --uw-repair 8 $FIT${CPU:+ cpu$CPU}${JOIN:+ join $JOIN}" | sha1sum | cut -c1-8)   # the fitter config: binary + flags
+FCFG=$(echo "$BIN --dir 1 --uw-repair 8 $FIT${CPU:+ cpu$CPU}${JOIN:+ join $JOIN}$([ "${REFSNAP:-0}" = 1 ] && echo " refsnap ${CFX:-}")" | sha1sum | cut -c1-8)   # the fitter config: binary + flags
 FT=${FIELDS:-$TAG}; FD=$WB/fields/$FT; O=$WB/runs/$TAG; mkdir -p $O $WB/res $WB/ceil $FD $CACHE
 RES=$WB/res/$TAG.tsv; RS=$WB/res/$TAG-slabs.tsv; RR=$WB/res/$TAG-radius.tsv; CEIL=$WB/ceil/$FCFG.tsv
 HDR="tag	box	scroll	ids	ids0	ids_a	ids_b	ids_sd	e08	p05	p1	p2	p4	p05x	p1x	p2x	p4x	pmed	gross	gross100	conf	ceil	ceil_p1x	frac	pred_s	fit_s	bin	fcfg	cnt_bias	cnt_off	cnt_offp	dcnt_bias	dcnt_off	dcnt_offp"
@@ -159,6 +163,12 @@ pbatch() {   # PBATCH=1 (default): the fields of every box still to run, one pre
 }
 fitsc() {   # fitsc FIELDS OUT LOG [extra]: production fit + codes score + pair accuracy
   local f=$1 o=$2 lg=$3; shift 3
+  if [ "${REFSNAP:-0}" = 1 ]; then   # the unroll's integers: the box's own L2 count-field ref (CPU solve, deterministic), every voxel snapped to it
+    RUN $U count-field 2>&1 | grep -q 'count-field' || { echo "wbench: REFSNAP=1: $U has no count-field (the pinned wbench build predates it): set U to a current master build, and score the plain arm with the same U" > $lg; return 1; }
+    RUN $U count-field $f $o.cf --model $o.cfm --model-only 1 --dir 1 --threads $THREADS --cf-gpu 0 ${CFX:-} > $lg.cf 2>&1 || { echo "wbench: REFSNAP count-field failed on $f ($lg.cf)" > $lg; return 1; }
+    UFSM_FIT_THREADS=$THREADS RUN $U fit $f $GF --out $o --codes $QR $QK --dir 1 --uw-repair 8 --score-pairs 1 --ref-model $o.cfm --ref-snap 1 ${FIT//\{box\}/$B} "$@" > $lg 2>&1
+    local rc=$?; rm -rf $o.cf $o.cfm; return $rc
+  fi
   UFSM_FIT_THREADS=$THREADS RUN $U fit $f $GF --out $o --codes $QR $QK --dir 1 --uw-repair 8 --score-pairs 1 ${FIT//\{box\}/$B} "$@" > $lg 2>&1
 }
 g_ids() { grep -oE 'winding ids right [0-9.]+' $1 | tail -1 | awk '{print $4}'; }

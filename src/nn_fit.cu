@@ -407,6 +407,44 @@ extern "C" void nn_fit_finalize_ct(const float *acc, size_t nf, int h, uint8_t *
     fit_finalize_ct_k<<<nblk(nf, 256), 256>>>(acc, acc + 12 * nf, acc + 13 * nf, nf, h, oct, ocs); KCHECK();
 }
 
+/* predict --fit-dv 1 (train --density-nll checkpoints, 2026-11-27 densvar): the density's learned log-variance s (channel ch, the logit,
+   clamped to [-12, 6]) summed over each cell's material voxels in the window interior (the voxels of nn_fit_accum's material plane 1)
+   into acc_dv; nn_fit_finalize_dv: dv = round((mean s + 12) x 255 / 18) where the cell has material, else 0 */
+template <typename LT>
+__global__ void fit_accum_dv_k(const LT *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
+                               int fz0, int fy0, int fx0, int nfz, int nfy, int nfx, int F1, int F2, int ch, float *acc) {
+    const size_t ci = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (ci >= (size_t)nfz * nfy * nfx) return;
+    const int fz = fz0 + (int)(ci / ((size_t)nfy * nfx)), fy = fy0 + (int)(ci / nfx % nfy), fx = fx0 + (int)(ci % nfx);
+    const size_t w3 = (size_t)D * W * W; float v = 0.f; int any = 0;
+    for (int t = 0; t < h * h * h; t++) {
+        const int lz = t / (h * h), ly = (t / h) % h, lx = t % h;
+        const int gz = fz * h + lz, gy = fy * h + ly, gx = fx * h + lx, wz = gz - tz, wy = gy - ty, wx = gx - tx;
+        if (gz >= bz || gy >= by || gx >= bx || wz < hz || wz >= D - hz || wy < halo || wy >= W - halo || wx < halo || wx >= W - halo) continue;
+        const size_t i = ((size_t)wz * W + wy) * W + wx;
+        if (!(bits ? (bits[i >> 5] >> (i & 31)) & 1u : ct[i])) continue;
+        v += fminf(6.f, fmaxf(-12.f, lgv(lg, (size_t)ch * w3 + i))); any = 1;
+    }
+    if (any) atomicAdd(&acc[((size_t)fz * F1 + fy) * F2 + fx], v);
+}
+extern "C" void nn_fit_accum_dv(const float *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3], int ch, float *acc_dv) {
+    int f0[3], f1[3];
+    const int t[3] = {tz, ty, tx}, wn[3] = {D, W, W}, hn[3] = {hz, halo, halo};
+    for (int d = 0; d < 3; d++) {
+        int lo = t[d] + hn[d], hi = t[d] + wn[d] - hn[d]; if (lo < 0) lo = 0; if (hi > box[d]) hi = box[d];
+        f0[d] = lo / h; f1[d] = (hi + h - 1) / h; if (f1[d] > F[d]) f1[d] = F[d];
+        if (f1[d] <= f0[d]) return;
+    }
+    const int nfz = f1[0] - f0[0], nfy = f1[1] - f0[1], nfx = f1[2] - f0[2];
+    if (g_logits_h16) fit_accum_dv_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>((const f16 *)lg, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfz, nfy, nfx, F[1], F[2], ch, acc_dv);
+    else fit_accum_dv_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(lg, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfz, nfy, nfx, F[1], F[2], ch, acc_dv);
+    KCHECK();
+}
+__global__ void fit_finalize_dv_k(const float *mat, const float *sum, size_t nf, uint8_t *o) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= nf) return;
+    o[i] = mat[i] > 0.f ? (uint8_t)fminf(255.f, fmaxf(0.f, lroundf((__fdiv_rn(sum[i], mat[i]) + 12.f) * (255.f / 18.f)))) : 0;
+}
+extern "C" void nn_fit_finalize_dv(const float *acc, size_t nf, int kdv, uint8_t *odv) { fit_finalize_dv_k<<<nblk(nf, 256), 256>>>(acc + nf, acc + (size_t)kdv * nf, nf, odv); KCHECK(); }
+
 /* predict --fit-fields of a task unwrap2 checkpoint: the winding mod 4 head as gauge-free relative planes. Per field cell and axis a
    (z, y, x) the material-voxel sums of p(v + d e_a) conj p(v), p = (2 sigma - 1) of the cos / sin channels (ch_w4, ch_w4 + 1): the
    predicted W difference mod 4 over d voxels, inside one window (one gauge). acc: 9 planes of nf cells (re, im, count per axis);
