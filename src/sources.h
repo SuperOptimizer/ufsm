@@ -153,6 +153,9 @@ typedef struct {
                                                   the same group (ufsm downsample --mode phase, key = that level's um) instead of pooling per read */
     uint8_t *focus; int64_t focus_grid[3]; float focus_w;   /* optional "focus": {"map": RAW, "w": K} (ufsm phase-packing --map: per coarse occupancy cell 0 none, else
                                                               1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */
+    uint8_t *hard; int64_t hard_grid[3]; int hard_lev; double hard_um; float hard_frac;   /* optional "hard": {"map": RAW, "frac": F} (ufsm hard-map: per cell of
+                                                              2^lev level-0 voxels of a scan of "um" (RAW.json) 0 easy, 1..255 hard weight): that share of the source's position
+                                                              draws takes a cell from the hard cells (villa's hard_fraction; hardspot 2026-11-27) */
     int64_t zb_below; float zb_k;   /* optional "zboost": {"below": N, "k": K}: occupancy cells with z index < N (cells of the occupancy grid, see the log line) are drawn K times as often */
     z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h
                     band_winding), {"band": {..., "phase": {...}, "winding": {"root": ..., "key": ...}}}: the --cond targets / condition */
