@@ -11,6 +11,7 @@
 #include "store.h"
 #include "optcheck.h"
 #include "zarr3.h"
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,7 +62,8 @@ int cmd_phase_cmp(int argc, char **argv) {
             else {   /* the coarse box: the mapped corners' bounds (x y z points), + 2 */
                 double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
                 for (int k = 0; k < 8; k++) { const double f[3] = {(double)(o[2] + ((k & 1) ? P : 0)), (double)(o[1] + ((k & 2) ? P : 0)), (double)(o[0] + ((k & 4) ? P : 0))}; double c[3];
-                    rmap_f2c(M, f, c); for (int d = 0; d < 3; d++) { if (c[d] < lo[d]) lo[d] = c[d]; if (c[d] > hi[d]) hi[d] = c[d]; } }
+                    rmap_f2c(M, f, c); if (!k && getenv("UFSM_PCMP_DEBUG")) fprintf(stderr, "f2c(%g %g %g) = %g %g %g\n", f[0], f[1], f[2], c[0], c[1], c[2]);
+                    for (int d = 0; d < 3; d++) { if (c[d] < lo[d]) lo[d] = c[d]; if (c[d] > hi[d]) hi[d] = c[d]; } }
                 const z3_meta *mb = z3_meta_of(sb->phase); int64_t co[3], cn[3];
                 for (int d = 0; d < 3; d++) { const int e = 2 - d; co[d] = (int64_t)floor(lo[e]) - 2; cn[d] = (int64_t)ceil(hi[e]) + 3 - co[d];
                     if (co[d] < 0) { cn[d] += co[d]; co[d] = 0; } if (co[d] + cn[d] > mb->shape[d]) cn[d] = mb->shape[d] - co[d]; }
@@ -70,6 +72,7 @@ int cmd_phase_cmp(int argc, char **argv) {
                     const size_t cnn = (size_t)cn[0] * cn[1] * cn[2];
                     if (cnn > bcap) { free(bc); bcap = 0; if (!(bc = malloc(cnn))) { rc = 1; break; } bcap = cnn; }
                     if (z3_read(sb->phase, co, cn, bc, 8)) { fprintf(stderr, "phase-cmp: %s: read failed\n", sb->name); rc = 1; break; }
+                    if (getenv("UFSM_PCMP_DEBUG")) { size_t kk = 0; for (size_t q = 0; q < cnn; q++) kk += bc[q] != PHASE_UNKNOWN; fprintf(stderr, "phase-cmp --map: A box %lld,%lld,%lld -> B box %lld,%lld,%lld + %lld,%lld,%lld: %zu known\n", (long long)o[0], (long long)o[1], (long long)o[2], (long long)co[0], (long long)co[1], (long long)co[2], (long long)cn[0], (long long)cn[1], (long long)cn[2], kk); }
                     for (int64_t z = 0; z < P; z++) for (int64_t y = 0; y < P; y++) for (int64_t x = 0; x < P; x++) {
                         const double f[3] = {(double)(o[2] + x), (double)(o[1] + y), (double)(o[0] + z)}; double c[3]; rmap_f2c(M, f, c);
                         const int64_t q[3] = {(int64_t)llround(c[2]) - co[0], (int64_t)llround(c[1]) - co[1], (int64_t)llround(c[0]) - co[2]};
