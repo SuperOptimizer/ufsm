@@ -252,6 +252,11 @@ void nn_skip_bwd_check(void);
 void nn_skip_wg_begin(void);
 void nn_skip_wg_end(void);
 void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y);
+/* train / predict --cond-fields (unet_cfg.cond_ch): channels 32 .. 63 of a 64-channel latent input (xs: the cell grid) from K int8 conditioning planes
+   cd [n][K][gd][gh][gw] (v / 127; coarse cells of 2^3 latent cells, trilinear x2, fp16-rounded; cd nullptr: zeros). nn_cond_mx into the MX
+   input (after nn_input_latc wrote block 0), nn_cond_h16 into a 16-bit [n][64][d][h][w] window (predict: then nn_h16_to_mx gives the same bits) */
+void nn_cond_mx(void *y, shape5 xs, const void *cd, int K, int gd, int gh, int gw);
+void nn_cond_h16(void *y, shape5 xs, const void *cd, int K, int gd, int gh, int gw);
 /* train --lat-direct-p: rows of window n's cells [cz0, cz0 + ncz) of nn_input_latc's input with the C coefficient channels from stored latvol
    cells (int8 [ncz][h][w][stride], nn_latvol_decode's layout, raw-domain step step_raw) z-scored with the window's mean / isd (predict's
    nn_lat_input_qs), the radial channels as nn_input_latc's */
@@ -795,6 +800,8 @@ void nn_rv_fuse(void *lg, size_t n, int h16);   /* predict --channel rv: [recto 
 void nn_ink_targets(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m);   /* train --ink-head: ink prob254 (255 unknown) -> target t (x255) and mask m (known) */
 void nn_ink_targets_smooth(const uint8_t *ink, size_t n, uint8_t *t, uint8_t *m, float eps);   /* the same, label-smoothed: t (1 - eps) + eps / 2 (train --ink-smooth) */
 void nn_ink_air(const uint8_t *pap, size_t n, int z0, int H, int W, int S, float eps, uint8_t *t, uint8_t *m);   /* train --ink-air S: unlabelled air voxels on the S-lattice -> ink 0 (the smoothed 0), mask 1 */
+void nn_ink_neg(const uint8_t *ink, size_t vb, size_t n, int D, int H, int W, int R, const void *lg, float thr, uint8_t *m, int count);   /* train --ink-neg-guard R / --ink-neg-gate T: label negatives within R voxels of a positive, or (lg: fp16 logits) with p > T, leave the slab mask m (ink: the window plane, slab = [vb, vb + n)); count: + nn_ink_neg_counts */
+void nn_ink_neg_counts(unsigned long long out[3]);   /* known negatives, guard drops, gate drops since the last call (all devices) */
 void nn_phase_trunc(const void *lc, const void *ls, const uint8_t *t, uint8_t *m, size_t n, float tau, float kappa);   /* robust phase loss: confident (>= kappa) predictions off their label by > tau turns leave the mask (fp16 logits) */
 void nn_phase_trunc_counts(unsigned long long out[2]);   /* labelled voxels / dropped since the last call */
 void nn_sheet_mask_z(const uint8_t *phase, int d, int h, int w, int s, float lo, float hi, uint8_t *m, int z0, int z1);   /* train --sheet-mask: the phase mask of phase-0 (labelled sheet) voxels x ramp(local spacing LO..HI voxels), planes [z0, z1) of the window into m (planes of z1 - z0) */
