@@ -81,6 +81,7 @@ int main(void) {
         { const size_t nw = (size_t)cb.widths[0] * cb.cin * 27; float *w = malloc(nw * 4); nn_d2h(w, unet_param_ptr(b), nw * 4);
           for (int co = 0; co < cb.widths[0]; co++) for (int t = 0; t < 27; t++) w[((size_t)co * cb.cin + LC + 3 + co % K) * 27 + t] = 0.05f * (float)(2 * ru() - 1);
           nn_h2d(unet_param_ptr(b), w, nw * 4); nn_h2d(unet_ema_ptr(b), w, nw * 4); free(w);
+          nn_wmemo_clear();   /* (the fp4 kernels memoise prepared weights per conv and step: a weight written outside a step needs this) */
           logits(b, ct, cb.cout, lw); unet_set_cond_input(b, nullptr, 0, 0, 0); logits(b, ct, cb.cout, lz);
           const double dw = rel(lw, la, nl); const int okw = dw > 1e-3 && !memcmp(lz, la, nl * 4);
           printf("    a nonzero new column: logits rel %.2e with planes, no planes %s  %s\n", dw, !memcmp(lz, la, nl * 4) ? "bit-identical" : "DIFFER", okw ? "ok" : "FAIL"); fails += !okw; }
