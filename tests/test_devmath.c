@@ -1,8 +1,7 @@
-/* the device library's trigonometry by pi (src/nn_devmath.cu) against a long double host reference: sincospi / sinpi / cospi / sincos
+/* the device library's trigonometry by pi (src/nn_devmath.cu) against glibc on the host: sincospi / sinpi / cospi / sincos
    in double, sincospif in float, on special values, random arguments and the FFT twiddles 2 m / P of nn_aug.cu's four_tab_k (P = 64,
-   640, 768, 1024). Double: at most 2 ulp (CUDA's documented bound for sincospi / sincos; mcc's are within 1), exact on multiples of
-   1/4 (sign of zero included); sincospi equal to sinpi / cospi bit for bit; float: at most 2 ulp. Until mcc e0e23d0 the launch itself
-   failed (no double sinpi / cospi in the device library), and the error was only latched, so the caller went on with garbage: first, in a
+   640, 768, 1024), against glibc (ref_scpi). Double: at most 2 ulp from it; exact on integers and halves (sign of zero included);
+   sincospi equal to sinpi / cospi bit for bit; float: at most 2 ulp. Until mcc e0e23d0 the launch itself failed (no double sinpi / cospi in the device library), and the error was only latched, so the caller went on with garbage: first, in a
    child (before this process touches CUDA), a kernel calling a device function nothing defines must stop the program at its launch. */
 #include "nn.h"
 #include <math.h>
@@ -14,21 +13,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static const long double PI_L = 3.14159265358979323846264338327950288L;
-
-/* sin(pi x), cos(pi x) in long double: the exact reduction to f in [-1/4, 1/4] (a - 2 floor(a / 2), then the nearest half), sinl / cosl */
-static void ref_scpi(long double x, long double *sp, long double *cp) {
-    long double a = fabsl(x), r = a - 2.0L * floorl(a * 0.5L), f, s, c, t;
-    const int n = (int)floorl(2.0L * r + 0.5L);
-    f = r - 0.5L * n;
-    s = f == 0 ? 0 : sinl(PI_L * f); c = cosl(PI_L * f);
-    switch (n & 3) {
-    case 1: t = s; s = c; c = f == 0 ? 0 : -t; break;
-    case 2: s = f == 0 ? 0 : -s; c = -c; break;
-    case 3: t = s; s = -c; c = f == 0 ? 0 : t; break;
-    }
-    *sp = signbit(x) ? -s : s; *cp = c;
-}
+/* the reference: glibc's sinpi / cospi (2.41 on) and sin / cos, in double. Not long double: mcc's long double is double (sinl gave
+   sin(pi / 4) = 0x1.6a09e667f3bccp-1, 1 ulp low, the 11-27 slot run's false failures), and glibc's sinpi is not correctly rounded either
+   (sinpi(0.25) is the same 1 ulp low), so the general bound is 2 ulp from it; integers and halves must be exact (signed zeros
+   included), odd quarters within 1 ulp of sqrt(1/2) */
+static void ref_scpi(double x, double *sp, double *cp) { *sp = sinpi(x); *cp = cospi(x); }
 
 static int64_t key64(double d) { int64_t i; memcpy(&i, &d, 8); return i < 0 ? INT64_MIN - i : i; }
 static int32_t key32(float f) { int32_t i; memcpy(&i, &f, 4); return i < 0 ? INT32_MIN - i : i; }
@@ -62,25 +51,24 @@ int main(void) {
     int64_t w_pi = 0, w_sc = 0, w_f = 0; int bad = 0, incons = 0, nsc = 0;
     for (int i = 0; i < n; i++) {
         const double *r = o + (size_t)i * 8;
-        long double rs, rc2; ref_scpi(x[i], &rs, &rc2);
-        const double es = (double)rs, ec = (double)rc2;
+        double es, ec; ref_scpi(x[i], &es, &ec);
         const int64_t ds = ulp64(r[0], es), dc = ulp64(r[1], ec);
         if (ds > w_pi) w_pi = ds;
         if (dc > w_pi) w_pi = dc;
-        const int quarter = x[i] * 4.0 == floor(x[i] * 4.0) && fabs(x[i]) < 0x1p50;
-        const int eq_special = !quarter || (memcmp(&r[0], &es, 8) == 0 && memcmp(&r[1], &ec, 8) == 0)
-                               || (fabs(es) == M_SQRT1_2 && ds <= 1 && dc <= 1);   /* (odd quarters: +-sqrt(1/2), not exact) */
+        const int half = x[i] * 2.0 == floor(x[i] * 2.0), quarter = !half && x[i] * 4.0 == floor(x[i] * 4.0);
+        const int eq_special = half ? memcmp(&r[0], &es, 8) == 0 && memcmp(&r[1], &ec, 8) == 0
+                             : quarter ? ulp64(fabs(r[0]), M_SQRT1_2) <= 1 && ulp64(fabs(r[1]), M_SQRT1_2) <= 1 : 1;
         if (memcmp(&r[0], &r[2], 8) || memcmp(&r[1], &r[3], 8)) incons++;
         if (ds > 2 || dc > 2 || !eq_special) { if (bad++ < 8) printf("  x %a: sincospi %a %a, want %a %a (%lld / %lld ulp)\n", x[i], r[0], r[1], es, ec, (long long)ds, (long long)dc); }
         if (fabs(x[i]) < 1e5) {   /* sincos(x) */
             nsc++;
-            const int64_t a = ulp64(r[4], (double)sinl((long double)x[i])), b = ulp64(r[5], (double)cosl((long double)x[i]));
+            const int64_t a = ulp64(r[4], sin(x[i])), b = ulp64(r[5], cos(x[i]));
             if (a > w_sc) w_sc = a;
             if (b > w_sc) w_sc = b;
             if (a > 2 || b > 2) { if (bad++ < 8) printf("  x %a: sincos %a %a (%lld / %lld ulp)\n", x[i], r[4], r[5], (long long)a, (long long)b); }
         }
         if (fabs(x[i]) < 0x1p20) {   /* sincospif((float)x) */
-            long double fs, fc; ref_scpi((long double)(float)x[i], &fs, &fc);
+            double fs, fc; ref_scpi((double)(float)x[i], &fs, &fc);
             const int64_t a = ulp32((float)r[6], (float)fs), b = ulp32((float)r[7], (float)fc);
             if (a > w_f) w_f = a;
             if (b > w_f) w_f = b;
