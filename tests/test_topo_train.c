@@ -1,8 +1,8 @@
 /* train --topo-lambda (the wrap-count loss, src/nn_loss.cu nn_topo_slab) in the trainer, on the synthetic spiral fixture
    (tests/make_wind_fixture.c), --det 1, 4 steps, the latent w24 layout (--lat 4 --lat-guide 3 --rv 2: streamed head slabs, fused
    gradient pass) and the plain whole-cell unwrap2 head:
-   (1) --topo-lambda 0 logs the losses of a run without the flag (the off path runs no topo code; the plain head's --det runs may differ
-       in a last digit run to run, so numbers within 1e-3);
+   (1) --topo-lambda 0 logs the losses of a run without the flag (the off path runs no topo code): byte-exact for the latent w24 layout
+       under --det; the plain head's --det runs differ in a last digit run to run (gpuslot 7695db25), so there numbers within 1e-3;
    (2) --topo-lambda 1 trains: the topo term is logged, finite, on every window, with rays, and it moves the logged loss;
    (3) layouts without the phase pair are refused (--rv 1: the side slot holds recto / verso).
    Usage: test_topo_train <ufsm binary> <make_wind_fixture binary> */
@@ -92,7 +92,8 @@ int main(int argc, char **argv) {
         char *ta = loss_terms(la), *tb = loss_terms(lb), *tc = loss_terms(lc);
         printf("%s off   : %s\n%s lambda0: %s\n%s topo 1 : %s\n", nm, ta, nm, tb, nm, tc);
         CHECK(strlen(ta) > 20 && strchr(ta, '4'), "%s: no step lines", nm);
-        CHECK(terms_close(tb, ta), "%s: --topo-lambda 0 logs other losses than no flag", nm);
+        if (k == 0) CHECK(!strcmp(ta, tb), "%s: --topo-lambda 0 logs other losses than no flag (byte-exact under --det: the w24 latent layout)", nm);
+        else CHECK(terms_close(tb, ta), "%s: --topo-lambda 0 logs other losses than no flag (within 1e-3)", nm);
         if (strcmp(ta, tb)) printf("%s: lambda 0 vs no flag: equal within the last logged digit, not byte-equal (plain --det wobble)\n", nm);
         CHECK(!strstr(la, " topo ") && !strstr(lb, " topo "), "%s: the off runs log a topo term", nm);
         double tl, te, tp; const int nt = topo_terms(lc, &tl, &te, &tp);
