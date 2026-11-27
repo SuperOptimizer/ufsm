@@ -6,6 +6,72 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Ink augmentation audit; SA_FOURIER, a low-band Fourier amplitude op (`--aug-fourier-p`) (2026-11-27, branch inkaug-20261127, inkaug)
+
+**Question.** Do the ink recipes' scanner ops erase the ink signal, which is a thin, high-frequency surface cue (Bukreeva 2016, Angelotti
+2026)? Every current ink recipe (R11d / R11P, E0 / E2D2, R1E, lad base.argv) carries the winding runs' block unchanged: `--aug none`,
+strength 1, blur p .7 s 1.6 (sigma .3-1.42 voxels per axis), lowres .1 / .6 (cells 1-1.9 voxels), paganin .2 / 1 (lambda .4-1.6),
+tone .3, gin .15, noise .15, cnoise .1, sharpen .03, ring .1, slice .1, quant .1, bias .15, cupping .1. That is, 82 % of windows get at
+least one low-pass op.
+
+**Tool.** `ufsm ink-augaudit` (src/inkaugaudit.c; CPU, 6 threads) runs the training's own CPU executor (scan_aug_plan / scan_aug_exec)
+on 256^3 CT tiles around ink-devcrops crops. Each condition is one op at p 1 with the recipe's strength, or a whole recipe, 3 seeds.
+Per 4 x 4 label-px cell (ink share >= .75 = ink, 0 = no ink) it reads the window's z-scored CT along the surface normal, t = -8..8, raw
+and high-passed (f - G_2 f). Three statistics per scan:
+- dHP: the standardised ink − no-ink difference of the HP energy over |t| <= 3 (the lead's statistic).
+- aHP: the AUC of that energy.
+- aLDA: the out-of-fold AUC of a ridge LDA on the 34 profile features.
+Runs: A, the coarse dev crops (inksdk/dev/crops, 7.9-9.4 um, 7 scans, 91 tiles); B, the 2.4 um evcrops of 0139 / 1667 at level 0
+(48 tiles); C, the same at level 1 (4.8 um). TSVs are in /vesuvius/ufsm/inkaug/audit/.
+
+| condition | A dHP | A aHP | A aLDA | B dHP | B aLDA |
+|---|---|---|---|---|---|
+| none | .451 | .633 | .581 | .061 | .541 |
+| blur (s 1.6) | .415 (−8 %) | .625 | .588 | .053 | .542 |
+| blur s .8 | .442 (−2 %) | .630 | .586 | .067 | .541 |
+| paganin (s 1) | .397 (−12 %) | .621 | .592 | .059 | .541 |
+| gin | .353 (−22 %) | .624 | .553 | .090 | .533 |
+| lowres | .441 | .628 | .584 | .062 | .541 |
+| noise / cnoise / quant / sharpen / ring / slice / cupping | .440-.452 | .630-.633 | .578-.582 | ~.06 | ~.540 |
+| recipe (the mixture) | .376 (−17 %) | .615 | .593 | .070 | .547 |
+| recipeB (blur p .3 s .8, paganin s .5) | .419 | .633 | .584 | .035 | .542 |
+| fourier (cut .03) | .436 (−3 %) | .631 | .586 | .081 | .541 |
+| fourier cut .06 / .12 | .419 / .436 | .626 / .630 | .567 / .583 | .058 / .030 | .546 / .543 |
+
+- **Coarse scans:** blur, paganin, gin and the recipe lower the high-pass contrast by 8-22 %, but the linearly readable signal (aLDA)
+  does not fall. Only gin drops it, by .028. Blur s .8 keeps dHP within 2 % of clean.
+- **2.4 / 4.8 um:** the per-cell profile statistic hardly separates ink at all (B aLDA .54, C .50; 1667's dHP is ~0 or negative). The
+  proxy cannot resolve these ops at the fine scans: no evidence for or against.
+- **Recommendation (small, for an A/B, not a default change yet):** blur s 1.6 -> 0.8 (sigma .3-.86). It keeps the blur augmentation
+  but halves the high-pass loss. gin: p .15 stays; it is the only op that costs linear separability (−.028) on coarse scans. Leave the
+  rest. The proxy is weak (a 34-feature linear read on a few-voxel profile), so only a fine-tune A/B decides.
+
+**SA_FOURIER** (scan_augment.h, opt-in `--aug-fourier-p P --aug-fourier-cut C`, cycles per voxel, default .03; needs `--gpu-aug`).
+- **What it does:** it computes the window's DFT coefficients for 0 < |k| < C P (integer cycles per window, box |k_d| <= K = floor(C P),
+  at most 48) and multiplies them by a real, even, positive gain m(k) = exp(g(|k| / C P) + b (3 k_z^2 / |k|^2 − 1)). g is piecewise
+  linear through 3 knots ~U(±.7 s) and is 0 at the edge; b ~U(±.35 s) is a scan-axis anisotropy. Phase, DC and every coefficient above
+  the cut are kept. Air reads as the material mean during the transform. This is random amplitude scaling; FDA mixing with another
+  scroll's window is not implemented (it needs a device bank of other windows' spectra).
+- **Draws:** its own seed-derived stream, so with it on every other op's plan is unchanged (paired arms). p 0 draws nothing, so the
+  off path is byte-identical. The plan / record grows by 24 bytes (zero when off): a raw hash over the whole record changes size, not
+  content.
+- **Device:** a partial DFT by plane chunks. x is a GEMM of the window rows against a [P x 2 (K+1)] twiddle matrix, then y, then z
+  accumulated in double. Then the gain, the inverse z and y, and x as a GEMM added into F. Split windows sum the band across ranks
+  (zc_sum). Extra device memory is reserved only when the op is on (nn_aug_fourier_reserve, ≤ ~20 MB at K 48).
+- **Host reference:** scan_augment.c fourier_ref, in double.
+- **Tests:** test_scan_augment: DC and the coefficients above the cut are unchanged within byte rounding; strong band coefficients are
+  scaled by exactly the plan's real gain (phase kept); the other ops' plans are unchanged. test_gpu_aug (P 96, K 2): the device matches
+  the host, 92 cases, worst mean |d| .073 bytes, max 2.
+- **Bug on the way:** the first device version built its twiddle table with double sincospi. mcc's device library has no double
+  sinpi, so the kernel failed to launch ("device code calls sinpi, which nothing defines") without an error through KCHECK, and the
+  table stayed uninitialised (fourier cases mean |d| 0.9-54 bytes). The tables are now built on the host in double. Reported to
+  mccdecl, who is adding the double functions to microc.
+- **Audit:** cut .03 costs the coarse HP contrast 3 % and nothing in aLDA; cuts .06 / .12 cost more (aLDA −.014 at .06). The A/B uses .03.
+
+**A/B (queued, card-0 slot n3):** /vesuvius/ufsm/inkaug/ab.sh. E2D2-avg is fine-tuned 2000 steps on inklabelfix's recipe; arm A is
+the control, arm F adds `--aug-fourier-p .3 --aug-fourier-cut .03`. inkeval's ab.sh scores 1447 / 0841 per scroll, F − A paired by crop
+(LEVEL_0841 2, PWIN 288). Results will be added here.
+
 ## Hard-spot sampling: a share of the draws from merge-flagged / id-change cells (2026-11-27, branch hardspot-20261127, hardspot)
 
 Port of upstream villa's hard-spot training (`tracers/sheets/evaluation/hard_spots.py`, `data.hard_windows` / `hard_fraction`: a fixed
