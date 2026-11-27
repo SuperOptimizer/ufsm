@@ -1,7 +1,8 @@
 /* train --topo-lambda (the wrap-count loss, src/nn_loss.cu nn_topo_slab) in the trainer, on the synthetic spiral fixture
    (tests/make_wind_fixture.c), --det 1, 4 steps, the latent w24 layout (--lat 4 --lat-guide 3 --rv 2: streamed head slabs, fused
    gradient pass) and the plain whole-cell unwrap2 head:
-   (1) --topo-lambda 0 logs exactly the losses of a run without the flag (the off path runs no topo code);
+   (1) --topo-lambda 0 logs the losses of a run without the flag (the off path runs no topo code; the plain head's --det runs may differ
+       in a last digit run to run, so numbers within 1e-3);
    (2) --topo-lambda 1 trains: the topo term is logged, finite, on every window, with rays, and it moves the logged loss;
    (3) layouts without the phase pair are refused (--rv 1: the side slot holds recto / verso).
    Usage: test_topo_train <ufsm binary> <make_wind_fixture binary> */
@@ -43,6 +44,18 @@ static char *loss_terms(const char *log) {
     }
     return o;
 }
+/* a and b: the same words, every number within 2e-4 + 1e-3 relative (the plain head's --det runs differ in a last logged digit run to run,
+   desk 11-27: loss 2.8740 vs 2.8739 at step 3; test_heads tolerates the same); the topo run moves the loss by ~0.1 */
+static int terms_close(const char *a, const char *b) {
+    while (*a && *b) {
+        if ((*a >= '0' && *a <= '9') || *a == '-' || *a == '+') {
+            char *ea, *eb; const double x = strtod(a, &ea), y = strtod(b, &eb);
+            if (ea != a && eb != b) { if (!(fabs(x - y) <= 2e-4 + 1e-3 * fabs(y))) return 0; a = ea; b = eb; continue; }
+        }
+        if (*a++ != *b++) return 0;
+    }
+    return !*a && !*b;
+}
 /* the step lines' " topo X (count errors E, dT T turn, P% of windows)" groups: count, all finite, every window, the means */
 static int topo_terms(const char *log, double *loss, double *err, double *pct) {
     int n = 0; *loss = *err = 0; *pct = 100;
@@ -79,16 +92,17 @@ int main(int argc, char **argv) {
         char *ta = loss_terms(la), *tb = loss_terms(lb), *tc = loss_terms(lc);
         printf("%s off   : %s\n%s lambda0: %s\n%s topo 1 : %s\n", nm, ta, nm, tb, nm, tc);
         CHECK(strlen(ta) > 20 && strchr(ta, '4'), "%s: no step lines", nm);
-        CHECK(!strcmp(ta, tb), "%s: --topo-lambda 0 logs other losses than no flag", nm);
+        CHECK(terms_close(tb, ta), "%s: --topo-lambda 0 logs other losses than no flag", nm);
+        if (strcmp(ta, tb)) printf("%s: lambda 0 vs no flag: equal within the last logged digit, not byte-equal (plain --det wobble)\n", nm);
         CHECK(!strstr(la, " topo ") && !strstr(lb, " topo "), "%s: the off runs log a topo term", nm);
         double tl, te, tp; const int nt = topo_terms(lc, &tl, &te, &tp);
         printf("%s topo terms: %d steps, mean loss %.4f, count errors %.4f, min %.0f%% of windows\n", nm, nt, nt > 0 ? tl / nt : 0, nt > 0 ? te / nt : 0, tp);
         CHECK(nt == 4 && tp == 100 && tl > 0, "%s: topo terms %d (want 4), loss sum %.4f, windows %.0f%%", nm, nt, tl, tp);
         CHECK(strstr(lc, "--topo-lambda 1: wrap-count rays") != nullptr, "%s: no topo banner", nm);
-        CHECK(strcmp(ta, tc) != 0, "%s: the topo run logs the off run's losses", nm);
+        CHECK(!terms_close(tc, ta), "%s: the topo run logs the off run's losses", nm);
         free(la); free(lb); free(lc); free(ta); free(tb); free(tc);
     }
-    /* (3) refused: --rv 1 */
+    /* (3) refused: --rv 1 (its "command failed (512)" line is the expected refusal) */
     const int rc = sh("UFSM_GRAD_MX8=1 %s train %s/fx/sources.json --out %s/rv1 %s --rv 1 --rv-iso 100 --topo-lambda 1 > %s/rv1.log 2>&1", U, d, d, common, d);
     CHECK(rc != 0, "--rv 1 --topo-lambda 1 was accepted");
     if (fails) { fprintf(stderr, "test_topo_train: %d FAILED (logs in %s)\n", fails, d); return 1; }
