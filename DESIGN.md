@@ -103,6 +103,56 @@ at w320).
 - For R11P: post-hoc pooled statistics (`predict --gn-save` at w768, then `--gn-frozen`), A/B on HOLD against window mode, and the seam
   jump on PHerc1203 (gn/gnab.sh, gn1203.sh). Results follow when they land.
 
+## PHerc1203 status: every read so far shows no text; card 0 stops reading this band (2026-11-26, unroll)
+
+PHerc1203 is prize-eligible: every run, mesh and image stayed on our machines (/vesuvius/ufsm/unrollrun, inksdk/r24).
+
+**Surfaces.** All come from our `scripts/unroll/unroll.sh` fits on the 9.362 um scan, apart from one upstream mesh:
+- **-p (dir +1, MFREF):** the main arm. Its band (orig, then up to 2.4 um as r24) sits on the 2.403 um scan through fit2's c2f
+  registration (reg.json).
+- **-m (dir -1):** the control arm.
+- **Full -p unroll at 9.362:** 140 wraps, wrap-align 0.646 (PHerc1203-p/ink, qa/wrapalign.tsv).
+- **Hand +1 is weak.** The -p wraps are exact W level sets of their ref-cf (`ufsm wrap-w`: W = k +- 0.16, so they wind +1 by
+  construction), and upstream's CW is +1 by unrollperf's seam test. The radius / theta statistics are shape-dominated on this scroll and
+  prove nothing. The -m arm reads no better.
+- **HercUeNet's VC3D auto-grown 1203 sheet** (7.9 cm2, z 8580-11554): `ufsm surf-near` against our wraps puts it in the same band and
+  following our wraps. It came out of the 0846A prize repo, so it is a surface that someone else's pipeline accepted.
+
+**Reads.** None shows a letter, stroke or line structure:
+
+| surface | resolution | models | windows / offsets |
+|---|---|---|---|
+| -p full unroll, 140 wraps | 9.362 (reader3 reads 9.6) | reader3 | whole wraps; inkiest 10 by FOV-masked rank (align/all/rankfov.tsv) |
+| -p r24 sections | 2.403 | R11P-12000 (seamless 2, w576 h32), reader3 | w176 w187 w219 w224 w227 w228 w229 w232 w233 w245 w248 (top-ranked) |
+| -p r24 windows w202 / w206 / w209, w225 / w237; -m w226 / w238 | 2.403 | inksdk atlas3's 6 maps (canon2, hecate24, reader3, R11P ...), Studio, Studio-0846 (HercUeNet fine-tune) | 4096-wide windows, share >= 0.74 |
+| -p w228 / w237 normal-offset stack | 2.403 | canon2, hecate24, reader3 | -64 .. +64 um in 16 um steps |
+| HercUeNet sheet | 2.403 (via fit2 c2f) | canon2, hecate24, reader3 | whole sheet |
+| HercUeNet sheet | 9.362 | reader3 | whole sheet |
+
+What the maps contain: isolated round blobs (~50-150 um) at the same places in every model and offset, which mark CT density features.
+They are not strokes, since they show no line spacing, letter height or row structure. The models agree only weakly. On the HercUeNet
+sheet at 2.4 the correlations are reader3 / canon2 0.44, reader3 / hecate24 0.31 and canon2 / hecate24 0.41. reader3 at 9.362 on that sheet gives mean 0.29, p99 0.52 and frac50 0.013, with blobs only
+(hercue/ink2/h9_side.jpg). The first r3_9 was empty (ink-ext reads tifxyz without voxel_size_um as 2.399 um, so it got 0 tiles). The
+rerun with `--surf-um 9.362` is the valid one.
+
+**Ruled out:**
+- **Sheet undercount:** ~2.3 bands / turn as on 1667; air-separated bands follow the gap. See the next section.
+- **Seam / window artefacts:** fixed in 41f1176c and read with seamless 2.
+- **Surface offset:** +-64 um.
+- **Model choice:** six of ours plus both Studios.
+- **Our surface vs an independently grown one:** HercUeNet's sheet reads the same.
+
+**What would change it:**
+1. An ink model that sees 1203's ink. Its contrast may differ from the training scrolls (1203 is not in any ink label set). A few
+   hand-found letters on 1203 would let us fine-tune or check a model; with none known, there is no signal to aim at.
+2. Another region. These reads cover the band around wraps 176-248 (z 8.6-11.6k at 9.362) and the whole-wrap 9.362 pass. The 9.362 pass
+   cannot resolve 1203's ~170 um turns' letters if they are small, and the 2.4 um scan covers only part of the scroll.
+3. A better 2.4 um surface in the crushed zones. ws009 shows oblique passes, which smear letters across sheets. That calls for a 2.4 um
+   winding net or local re-growth, which the sheet count alone does not call for.
+
+Decision: card 0 does no more 1203 reading of this band. Outputs live in PHerc1203-p/r24/sect/, inksdk/r24/ (-p_*, -m_*, off/,
+studio/) and hercue/ink2/.
+
 ## PHerc1203 sheet count: CT bands vs fitted wraps vs count-field, calibrated on 1667 (2026-11-26, unroll)
 
 Question (lead): wrap-xsec on the 1203 band (ws009, wraps 224-229) showed 2-3 CT laminae between consecutive fitted wraps. Does the fit
