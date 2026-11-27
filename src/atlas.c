@@ -298,7 +298,7 @@ static int au_occ_at(const au_ref *r, const float p[3]) {
     const size_t i = ((size_t)c[2] * r->oc[1] + c[1]) * r->oc[0] + c[0]; return r->occ[i >> 3] >> (i & 7) & 1;
 }
 
-static int au_label_index = 0;   /* --label-index 1: every reference mesh is its own sheet (label = its index; a patch set as its own reference) */
+static int au_label_index = 0;   /* mgpu: config (set from the command line before the audit threads start). --label-index 1: every reference mesh is its own sheet (label = its index; a patch set as its own reference) */
 static int au_add_mesh(au_ref *r, const char *P, const char *value, int set, const double lo[3], const double hi[3], size_t *nmesh) {
     char p[2400]; int w = 0, h = 0, w2, h2; float *X[3] = {nullptr, nullptr, nullptr}, *Q = nullptr;
     static const char *const nm[3] = {"x.tif", "y.tif", "z.tif"};
