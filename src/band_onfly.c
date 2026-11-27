@@ -99,11 +99,47 @@ static size_t pk_put(onfly_pack *K, const void *src, size_t n, size_t align) {
     K->n = o + n; return o;
 }
 static int g_pool2_tag;   /* (the pooled codes views' ctx, codes_pool2_open: tile_gpu pools them on the device) */
+/* the GPU path for derived codes (the meshes' codes rasterised on read, meshcodes.c; no stored chunks to hand the device decoder): the
+   clipped box read on the host (z3_read: the meshes stamped on the GPU, mc_read_gpu), cut into its 128^3 chunks of the box grid as raw
+   chunks (all-zero ones dropped, as the stored path drops const-0 chunks), then the same band_pair_gpu_codes. Before (w24 2026-11-26) such
+   tiles fell to the CPU pair rule: at the 2.4 um rung (rmax 160) no P 896 window in 12 minutes on the desk. Same returns as tile_gpu. */
+static thread_local struct { uint8_t *b; size_t cap; } t_drb;
+static int tile_gpu_derived(z3 *codes, const int64_t co[3], const int64_t cn[3], const int64_t ro[3], const int64_t rn[3], int h, const int64_t tn[3], float rmax, uint8_t *out) {
+    const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
+    if (rnn > t_drb.cap) { free(t_drb.b); t_drb.cap = 0; if (!(t_drb.b = malloc(rnn))) return -1; t_drb.cap = rnn; }
+    uint8_t *rb = t_drb.b;
+    if (z3_read(codes, ro, rn, rb, 1)) return -1;
+    size_t lab = 0; for (size_t q = 0; q < rnn && !lab; q++) lab = rb[q] > 0 && rb[q] < 255;
+    if (!lab) return 2;
+    onfly_pack *K = &t_pk; K->n = 0; K->nch = 0;
+    for (int64_t z0 = 0; z0 < rn[0]; z0 += 128) for (int64_t y0 = 0; y0 < rn[1]; y0 += 128) for (int64_t x0 = 0; x0 < rn[2]; x0 += 128) {
+        const int64_t nz = rn[0] - z0 < 128 ? rn[0] - z0 : 128, ny = rn[1] - y0 < 128 ? rn[1] - y0 : 128, nx = rn[2] - x0 < 128 ? rn[2] - x0 : 128;
+        int any = 0;
+        for (int64_t z = 0; z < nz && !any; z++) for (int64_t y = 0; y < ny && !any; y++) { const uint8_t *r = rb + ((size_t)(z0 + z) * rn[1] + (y0 + y)) * rn[2] + x0;
+            for (int64_t x = 0; x < nx; x++) if (r[x]) { any = 1; break; } }
+        if (!any) continue;
+        const size_t off = pk_put(K, nullptr, VOLCOMP_CHUNK_VOXELS, 16); if (off == SIZE_MAX) return -1;
+        uint8_t *c = K->b + off; memset(c, 0, VOLCOMP_CHUNK_VOXELS);   /* (past the box edge: 0, no codes, as the CPU path's zero fill) */
+        for (int64_t z = 0; z < nz; z++) for (int64_t y = 0; y < ny; y++)
+            memcpy(c + ((size_t)z * 128 + y) * 128, rb + ((size_t)(z0 + z) * rn[1] + (y0 + y)) * rn[2] + x0, (size_t)nx);
+        bg_lchunk C; memset(&C, 0, sizeof C);
+        C.o[0] = (int32_t)(ro[0] + z0 - co[0]); C.o[1] = (int32_t)(ro[1] + y0 - co[1]); C.o[2] = (int32_t)(ro[2] + x0 - co[2]);
+        C.mode = VLL_MODE_RAW; C.raw_off = (uint32_t)off;
+        if (K->nch == K->ccap) { const int cc = K->ccap ? 2 * K->ccap : 256; bg_lchunk *nc = realloc(K->ch, (size_t)cc * sizeof *nc); if (!nc) return -1; K->ch = nc; K->ccap = cc; }
+        K->ch[K->nch++] = C;
+    }
+    if (K->n > UINT32_MAX - 64) return -2;
+    if (!K->nch) return 2;
+    const int n[3] = {(int)cn[0], (int)cn[1], (int)cn[2]}, lo[3] = {(int)(ro[0] - co[0]), (int)(ro[1] - co[1]), (int)(ro[2] - co[2])};
+    const int hi[3] = {lo[0] + (int)rn[0], lo[1] + (int)rn[1], lo[2] + (int)rn[2]}, cro[3] = {h, h, h}, crn[3] = {(int)tn[0], (int)tn[1], (int)tn[2]};
+    return band_pair_gpu_codes(K->ch, K->nch, K->b, K->n, n, lo, hi, rmax, cro, crn, out);
+}
 static int tile_gpu(z3 *codes, const int64_t co_[3], const int64_t cn_[3], const int64_t ro_[3], const int64_t rn_[3], int h, const int64_t tn[3], float rmax, uint8_t *out) {
     /* pooled views (up to 3 deep) of stored codes: the base chunks of the 2^k box, decoded and pooled k times on the device (before:
        decoded and pooled on the CPU, only the pair rule on the GPU; the pod's 9.6 / 19.2 um rungs, 2026-11-12) */
     int k = 0; z3 *base = codes;
     while (k < 3 && z3_derived_ctx(base) == &g_pool2_tag) { base = z3_base_of(base); k++; }
+    if (!k && z3_derived_ctx(base)) return tile_gpu_derived(codes, co_, cn_, ro_, rn_, h, tn, rmax, out);
     if (z3_derived_ctx(base) || (k && !band_pair_gpu_codes_pool)) return -2;
     const z3_meta *m = z3_meta_of(base);
     if (m->chunk[0] != 128 || m->chunk[1] != 128 || m->chunk[2] != 128 || m->esize != 1 || (m->q != 0 && !m->lbc)) return -2;
