@@ -43,19 +43,24 @@ int cmd_phase_cmp(int argc, char **argv) {
         if (nc <= 0 || !bits) { printf("phase-cmp: %s: no labelled chunk\n", sb->name); free(bits); continue; }
         int64_t *idx = malloc((size_t)nc * sizeof *idx), k = 0;
         for (int64_t q = 0; q < g[0] * g[1] * g[2]; q++) if (bits[q]) idx[k++] = q;
-        uint64_t kb = 0, ka = 0, lost = 0, vox = 0; int boxes = 0;
+        uint64_t kb = 0, ka = 0, lost = 0, vox = 0, both = 0, eq[4] = {0}; int boxes = 0;   /* eq: |A - B| (circular, codes of 252) 0, <= 2, <= 6, <= 13 */
         for (int t = 0; t < nb && k; t++) {
             const int64_t q = idx[rng_next(&seed) % (uint64_t)k], c[3] = {q / (g[1] * g[2]), (q / g[2]) % g[1], q % g[2]};
             int64_t o[3]; const int64_t n[3] = {P, P, P};
             for (int d = 0; d < 3; d++) { o[d] = c[d] * m->chunk[d] + m->chunk[d] / 2 - P / 2; if (o[d] < 0) o[d] = 0; if (o[d] + P > m->shape[d]) o[d] = m->shape[d] - P > 0 ? m->shape[d] - P : 0; }
             if (z3_read(sa->phase, o, n, a, 8) || z3_read(sb->phase, o, n, b, 8)) { fprintf(stderr, "phase-cmp: %s: read failed\n", sb->name); rc = 1; break; }
-            for (size_t v = 0; v < N; v++) { const int kna = a[v] != PHASE_UNKNOWN, knb = b[v] != PHASE_UNKNOWN; kb += knb; ka += kna; lost += knb && !kna; }
+            for (size_t v = 0; v < N; v++) {
+                const int kna = a[v] != PHASE_UNKNOWN, knb = b[v] != PHASE_UNKNOWN; kb += knb; ka += kna; lost += knb && !kna;
+                if (kna && knb) { int d = abs((int)a[v] - (int)b[v]); if (d > PHASE_PERIOD / 2) d = PHASE_PERIOD - d; both++; eq[0] += d == 0; eq[1] += d <= 2; eq[2] += d <= 6; eq[3] += d <= 13; }
+            }
             vox += N; boxes++;
         }
         free(idx); free(bits);
         const double sh = kb ? (double)lost / kb : 0;
         printf("phase-cmp: %s: %d boxes of %d^3: known B %.4f, A %.4f of the voxels; A leaves %.4f of B's known voxels unknown\n", sb->name, boxes, P,
                vox ? (double)kb / vox : 0, vox ? (double)ka / vox : 0, sh);
+        if (both) printf("phase-cmp: %s: agreement on the %llu voxels known in both: exact %.4f, within 2 codes %.4f, 6 %.4f, 13 (5 %% of a turn) %.4f\n", sb->name,
+                         (unsigned long long)both, (double)eq[0] / both, (double)eq[1] / both, (double)eq[2] / both, (double)eq[3] / both);
         if (lost) printf("DEFAULTED: phase-cmp: %s: %.2f %% of the phase voxels known in B (%s) stay unknown in A (%s): sheet gaps wider than A's rmax\n",
                          sb->name, 100 * sh, argv[3], argv[2]);
     }

@@ -132,6 +132,50 @@ __global__ void k_bg_pair(const uint8_t *codes, const int32_t *ie, const int32_t
     phase[i] = (uint8_t)q;
 }
 
+/* ---- the two-level pair rule (option 3, w24 2026-11-27; band.h band_field_phase_pair2, byte-identical): the parity feature transforms
+   of the level-0 tile (a small halo h0) and of a level-1 tile over the same region (halo rmax / 2 + 2); a voxel's nearest sheet of each
+   parity is the level-0 one, or the level-1 one (at its cell's centre, 2 g + 0.5 in level-0 voxels) when that cell is not wholly inside
+   the level-0 tile (a sheet the level-0 tile cannot see) and nearer. The level-1 feature is its parent cell's: at rmax 160 (the 2.4 um
+   rung) the halo of 162 level-0 voxels became one of 82 level-1 voxels, 8x fewer voxels stamped and transformed. ---- */
+__device__ __forceinline__ int bg_near2(const uint8_t *c0, int32_t f0, const uint8_t *c1, int32_t f1, long z, long y, long x, int3 n0, int3 n1, int3 off,
+                                        float &d, float &vz, float &vy, float &vx, int &code) {
+    d = BINF;
+    if (f0 >= 0) {
+        const long s0 = (long)n0.y * n0.z, fz = f0 / s0, fy = (f0 / n0.z) % n0.y, fx = f0 % n0.z;
+        vz = (float)(fz - z); vy = (float)(fy - y); vx = (float)(fx - x); d = vz * vz + vy * vy + vx * vx; code = c0[f0];
+    }
+    if (f1 >= 0) {
+        const long s1 = (long)n1.y * n1.z, gz = f1 / s1, gy = (f1 / n1.z) % n1.y, gx = f1 % n1.z;
+        const long lz = 2 * gz - off.x, ly = 2 * gy - off.y, lx = 2 * gx - off.z;   /* the cell's first level-0 voxel in the level-0 tile */
+        if (lz < 0 || ly < 0 || lx < 0 || lz + 1 >= n0.x || ly + 1 >= n0.y || lx + 1 >= n0.z) {
+            const float wz = (float)(lz - z) + 0.5f, wy = (float)(ly - y) + 0.5f, wx = (float)(lx - x) + 0.5f, e = wz * wz + wy * wy + wx * wx;
+            if (e < d) { d = e; vz = wz; vy = wy; vx = wx; code = c1[f1]; }
+        }
+    }
+    return d < BINF;
+}
+__global__ void k_bg_pair2(const uint8_t *c0, const int32_t *ie0, const int32_t *io0, int3 n0, const uint8_t *c1, const int32_t *ie1, const int32_t *io1,
+                           int3 n1, int3 off, float r2, uint8_t *phase) {
+    const long N = (long)n0.x * n0.y * n0.z, i = (long)blockIdx.x * blockDim.x + threadIdx.x; if (i >= N) return;
+    phase[i] = PHASE_UNKNOWN;
+    const int c = c0[i];
+    if (c > 0 && c < 255) { phase[i] = 0; return; }
+    const long z = i / ((long)n0.y * n0.z), y = (i / n0.z) % n0.y, x = i % n0.z;
+    const long p = (((z + off.x) >> 1) * n1.y + ((y + off.y) >> 1)) * n1.z + ((x + off.z) >> 1);
+    float de, dd, az, ay, ax, bz, by, bx; int ca, cb;
+    if (!bg_near2(c0, ie0[i], c1, ie1[p], z, y, x, n0, n1, off, de, az, ay, ax, ca)) return;
+    if (!bg_near2(c0, io0[i], c1, io1[p], z, y, x, n0, n1, off, dd, bz, by, bx, cb)) return;
+    if (de > r2 || dd > r2) return;
+    const int ka = (ca - 1) / BAND_STEPS, kb = (cb - 1) / BAND_STEPS;
+    int dk = ((kb - ka) % 14 + 14) % 14; if (dk > 7) dk -= 14;
+    if (dk != 1 && dk != -1) return;
+    const float da = sqrtf(de), db = sqrtf(dd);
+    if (az * bz + ay * by + ax * bx > -0.5f * da * db) return;
+    const float f = dk == 1 ? da / (da + db) : db / (da + db);
+    int q = (int)lrintf(f * PHASE_PERIOD); if (q >= PHASE_PERIOD) q -= PHASE_PERIOD;
+    phase[i] = (uint8_t)q;
+}
+
 /* ---- volcomp lossless (mode 1) codes chunks decoded on the device (2026-11-11), byte-identical to vll_decode_sub: one CUDA block of 32
    threads per chunk (its 8 tANS tables in shared memory), one thread per substream decoding its 16 blocks' residuals (or values) into
    a per-block scratch; then one 256-thread block per 16^3 block: unzigzag, the x / y / z prefix rebuild in shared memory, the scatter
@@ -236,7 +280,8 @@ __global__ void __launch_bounds__(256) k_ll_build(const bg_lchunk *__restrict__ 
 /* a pool of slot contexts (device buffers grown on demand, a stream each): a caller takes a free one and gives it back, so the
    block threads (new pthreads every shard) reuse the same few buffer sets */
 typedef struct { int init, busy; size_t cap, lcap, fcap; uint8_t *fine, *mid; uint8_t *codes, *phase; int32_t *ie, *io; float *F, *Z; int32_t *S; int *V; cudaStream_t st;
-                 size_t bcap, ccap, scap; uint8_t *blob, *scr, *tag; bg_lchunk *ch; uint32_t *status, *hstatus; int fixed, dev; } bg_ctx;   /* (the codes decode: blob, chunk records, scratch) */
+                 size_t bcap, ccap, scap; uint8_t *blob, *scr, *tag; bg_lchunk *ch; uint32_t *status, *hstatus; int fixed, dev;
+                 size_t cap1; uint8_t *c1; int32_t *ie1, *io1; } bg_ctx;   /* (c1 / ie1 / io1: band_pair_gpu_fill2's coarse level-1 tile) */   /* (the codes decode: blob, chunk records, scratch) */
 enum { BG_MAXS = 16 };
 static bg_ctx g_ctx[BG_MAXS];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
@@ -261,6 +306,7 @@ extern "C" void band_pair_gpu_free(void) {   /* every idle context's buffers (ca
     for (int k = 0; k < BG_MAXS; k++) { bg_ctx &G = g_ctx[k]; if (!G.init || G.busy) continue;
         cudaFree(G.codes); cudaFree(G.phase); cudaFree(G.ie); cudaFree(G.io); cudaFree(G.F); cudaFree(G.Z); cudaFree(G.S); cudaFree(G.V);
         cudaFree(G.blob); cudaFree(G.scr); cudaFree(G.tag); cudaFree(G.ch); cudaFree(G.status); cudaFreeHost(G.hstatus); cudaFree(G.fine); cudaFree(G.mid);
+        cudaFree(G.c1); cudaFree(G.ie1); cudaFree(G.io1);
         cudaStreamDestroy(G.st); memset(&G, 0, sizeof G); }
     cudaGetLastError(); pthread_mutex_unlock(&g_mu);
 }
@@ -300,22 +346,26 @@ static int bg_run(bg_ctx &G, const uint8_t *codes, const int n[3], float rmax, u
 }
 /* the two parity feature transforms and the pair kernel on G.codes (n voxels) into G.phase; ev (optional): records 2 (parity 1
    starts), 3 (the pair kernel starts), 4 (done) */
+/* the exact feature transform of codes' parity-par labelled voxels into id (lc: the envelope chunk's lines, G's scratch sized for it) */
+static void bg_parity(bg_ctx &G, const uint8_t *codes, const int n[3], long lc, int par, int32_t *id) {
+    const long nz = n[0], ny = n[1], nx = n[2], sy = nx, sz = ny * nx;
+    if (g_xw) k_bg_xw<<<(unsigned)((nz * ny + 7) / 8), 256, 0, G.st>>>(codes, nz * ny, (int)nx, par, id);
+    else k_bg_x<<<(unsigned)((nz * ny + BT - 1) / BT), BT, 0, G.st>>>(codes, (int)(nz * ny), (int)nx, par, id);
+    for (int ax = 1; ax < 3; ax++) {
+        const long L = ax == 1 ? ny : nz, st = ax == 1 ? sy : sz, nl = (ax == 1 ? nz : ny) * nx;
+        for (long l0 = 0; l0 < nl; l0 += lc) {
+            const int m = (int)(nl - l0 < lc ? nl - l0 : lc);
+            k_bg_env<<<(unsigned)((m + BT - 1) / BT), BT, 0, G.st>>>(id, ax, (int)ny, (int)nx, (int)L, st, sz, sy, l0, m, G.F, G.S, G.V, G.Z);
+        }
+    }
+}
 static int bg_fields(bg_ctx &G, const int n[3], float rmax, cudaEvent_t *ev) {
     const long nz = n[0], ny = n[1], nx = n[2], N = nz * ny * nx, sy = nx, sz = ny * nx;
     const long Lmax = nz > ny ? nz : ny, nlines = (nz * nx > ny * nx ? nz * nx : ny * nx), lc = bg_lines(N, Lmax, nlines);
     const int tim = ev != nullptr;
     for (int par = 0; par < 2; par++) {
-        int32_t *id = par ? G.io : G.ie;
         if (tim && par) cudaEventRecord(ev[2], G.st);
-        if (g_xw) k_bg_xw<<<(unsigned)((nz * ny + 7) / 8), 256, 0, G.st>>>(G.codes, nz * ny, (int)nx, par, id);
-        else k_bg_x<<<(unsigned)((nz * ny + BT - 1) / BT), BT, 0, G.st>>>(G.codes, (int)(nz * ny), (int)nx, par, id);
-        for (int ax = 1; ax < 3; ax++) {
-            const long L = ax == 1 ? ny : nz, st = ax == 1 ? sy : sz, nl = (ax == 1 ? nz : ny) * nx;
-            for (long l0 = 0; l0 < nl; l0 += lc) {
-                const int m = (int)(nl - l0 < lc ? nl - l0 : lc);
-                k_bg_env<<<(unsigned)((m + BT - 1) / BT), BT, 0, G.st>>>(id, ax, (int)ny, (int)nx, (int)L, st, sz, sy, l0, m, G.F, G.S, G.V, G.Z);
-            }
-        }
+        bg_parity(G, G.codes, n, lc, par, par ? G.io : G.ie);
     }
     if (tim) cudaEventRecord(ev[3], G.st);
     k_bg_pair<<<(unsigned)((N + 255) / 256), 256, 0, G.st>>>(G.codes, G.ie, G.io, N, (int)ny, sz, sy, rmax * rmax, G.phase);
@@ -503,6 +553,58 @@ extern "C" int band_pair_gpu_fill(int (*fill)(void *ctx, uint8_t *dcodes, int de
         if (tim) { float tt[5]; for (int q = 0; q < 5; q++) cudaEventElapsedTime(&tt[q], ev[q], ev[q + 1]);
             fprintf(stderr, "band gpu fill: %ldx%ldx%ld: parity 0 %.1f ms, parity 1 %.1f, pair %.1f, crop D2H %.1f\n", nz, ny, nx, tt[1], tt[2], tt[3], tt[4]);
             for (int q = 0; q < 6; q++) cudaEventDestroy(ev[q]); }
+    } while (0);
+    if (rc < 0) cudaGetLastError();
+    pthread_mutex_lock(&g_mu); G.busy = 0; pthread_cond_signal(&g_cv); pthread_mutex_unlock(&g_mu);
+    return rc;
+}
+/* the two-level pair rule (k_bg_pair2) on a context: fill0 stamps the level-0 tile (n0, small halo), fill1 the level-1 tile (n1; the
+   level-0 tile's voxel z lies in the level-1 cell (z + off) / 2, off >= 0). 2: no labelled voxel in the level-1 tile; -2: a fill
+   could not (the caller's CPU path). Only the crop of the level-0 tile comes down */
+extern "C" int band_pair_gpu_fill2(int (*fill0)(void *ctx, uint8_t *dcodes, int dev, const int n[3]), void *ctx0, const int n0[3],
+                                   int (*fill1)(void *ctx, uint8_t *dcodes, int dev, const int n[3]), void *ctx1, const int n1[3], const int off[3],
+                                   float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out) {
+    if (rmax <= 0) return -1;
+    int k = -1;
+    pthread_mutex_lock(&g_mu);
+    for (;;) { for (int i = 0; i < g_slots; i++) { const int q = (g_rr + i) % g_slots; if (!g_ctx[q].busy) { k = q; break; } } if (k >= 0) break; pthread_cond_wait(&g_cv, &g_mu); }
+    g_ctx[k].busy = 1; g_rr = (k + 1) % g_slots; pthread_mutex_unlock(&g_mu);
+    bg_ctx &G = g_ctx[k]; int rc = 0;
+    do {
+        if (cudaSetDevice(G.dev) != cudaSuccess) { rc = -1; break; }
+        const long N0 = (long)n0[0] * n0[1] * n0[2], N1 = (long)n1[0] * n1[1] * n1[2];
+        const long L0 = n0[0] > n0[1] ? n0[0] : n0[1], L1 = n1[0] > n1[1] ? n1[0] : n1[1];
+        const long nl0 = (long)(n0[0] > n0[1] ? n0[0] : n0[1]) * n0[2], nl1 = (long)(n1[0] > n1[1] ? n1[0] : n1[1]) * n1[2];
+        const long lc0 = bg_lines(N0, L0, nl0), lc1 = bg_lines(N1, L1, nl1);
+        if (N0 >= (1L << 31) || N1 >= (1L << 31) || off[0] < 0 || off[1] < 0 || off[2] < 0) { rc = -1; break; }
+        if (bg_alloc(G, N0, L0, lc0) || bg_alloc(G, N0, L1, lc1)) { rc = -1; break; }   /* (the second only grows the scratch) */
+        if ((size_t)N1 > G.cap1) {
+            cudaFree(G.c1); cudaFree(G.ie1); cudaFree(G.io1); G.c1 = nullptr; G.ie1 = G.io1 = nullptr; G.cap1 = 0;
+            if (cudaMalloc(&G.c1, N1) != cudaSuccess || cudaMalloc(&G.ie1, N1 * 4) != cudaSuccess || cudaMalloc(&G.io1, N1 * 4) != cudaSuccess) { rc = -1; break; }
+            G.cap1 = N1;
+        }
+        if (cudaMemsetAsync(G.codes, 0, (size_t)N0, G.st) != cudaSuccess || cudaMemsetAsync(G.c1, 0, (size_t)N1, G.st) != cudaSuccess ||
+            cudaStreamSynchronize(G.st) != cudaSuccess) { rc = -1; break; }
+        if ((rc = fill1(ctx1, G.c1, G.dev, n1))) break;   /* (2: nothing labelled within reach: no phase) */
+        const int r0 = fill0(ctx0, G.codes, G.dev, n0); if (r0 != 0 && r0 != 2) { rc = r0; break; }   /* (2: no sheet inside the level-0 tile) */
+        cudaEvent_t ev[4]; const int tim = g_timing; if (tim) { for (int q = 0; q < 4; q++) cudaEventCreate(&ev[q]); cudaEventRecord(ev[0], G.st); }
+        for (int par = 0; par < 2; par++) bg_parity(G, G.c1, n1, lc1, par, par ? G.io1 : G.ie1);
+        if (tim) cudaEventRecord(ev[1], G.st);
+        for (int par = 0; par < 2; par++) bg_parity(G, G.codes, n0, lc0, par, par ? G.io : G.ie);
+        if (tim) cudaEventRecord(ev[2], G.st);
+        k_bg_pair2<<<(unsigned)((N0 + 255) / 256), 256, 0, G.st>>>(G.codes, G.ie, G.io, make_int3(n0[0], n0[1], n0[2]), G.c1, G.ie1, G.io1,
+                                                                 make_int3(n1[0], n1[1], n1[2]), make_int3(off[0], off[1], off[2]), rmax * rmax, G.phase);
+        if (cudaGetLastError() != cudaSuccess) { rc = -1; break; }
+        cudaMemcpy3DParms P = {};
+        P.srcPtr = make_cudaPitchedPtr(G.phase, (size_t)n0[2], (size_t)n0[2], (size_t)n0[1]); P.srcPos = make_cudaPos((size_t)crop_o[2], (size_t)crop_o[1], (size_t)crop_o[0]);
+        P.dstPtr = make_cudaPitchedPtr(out, (size_t)crop_n[2], (size_t)crop_n[2], (size_t)crop_n[1]); P.extent = make_cudaExtent((size_t)crop_n[2], (size_t)crop_n[1], (size_t)crop_n[0]); P.kind = cudaMemcpyDeviceToHost;
+        if (cudaMemcpy3DAsync(&P, G.st) != cudaSuccess) { rc = -1; break; }
+        if (tim) cudaEventRecord(ev[3], G.st);
+        if (cudaStreamSynchronize(G.st) != cudaSuccess) { rc = -1; break; }
+        if (tim) { float tt[3]; for (int q = 0; q < 3; q++) cudaEventElapsedTime(&tt[q], ev[q], ev[q + 1]);
+            fprintf(stderr, "band gpu fill2: %dx%dx%d + level 1 %dx%dx%d: level-1 parities %.1f ms, level-0 parities %.1f, pair + crop D2H %.1f\n",
+                    n0[0], n0[1], n0[2], n1[0], n1[1], n1[2], tt[0], tt[1], tt[2]);
+            for (int q = 0; q < 4; q++) cudaEventDestroy(ev[q]); }
     } while (0);
     if (rc < 0) cudaGetLastError();
     pthread_mutex_lock(&g_mu); G.busy = 0; pthread_cond_signal(&g_cv); pthread_mutex_unlock(&g_mu);

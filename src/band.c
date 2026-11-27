@@ -281,6 +281,59 @@ int band_field_side_pair(const uint8_t *codes, const int n[3], float rmax, int m
     return rc ? -1 : 0;
 }
 
+static int near2(const uint8_t *c0, int32_t f0, const uint8_t *c1, int32_t f1, long z, long y, long x, const int n0[3], const int n1[3], const int off[3],
+                 float *d, float v[3], int *code) {   /* (nn_band.cu bg_near2, the same expressions) */
+    *d = BINF;
+    if (f0 >= 0) {
+        const long s0 = (long)n0[1] * n0[2], fz = f0 / s0, fy = (f0 / n0[2]) % n0[1], fx = f0 % n0[2];
+        v[0] = (float)(fz - z); v[1] = (float)(fy - y); v[2] = (float)(fx - x); *d = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]; *code = c0[f0];
+    }
+    if (f1 >= 0) {
+        const long s1 = (long)n1[1] * n1[2], gz = f1 / s1, gy = (f1 / n1[2]) % n1[1], gx = f1 % n1[2];
+        const long lz = 2 * gz - off[0], ly = 2 * gy - off[1], lx = 2 * gx - off[2];
+        if (lz < 0 || ly < 0 || lx < 0 || lz + 1 >= n0[0] || ly + 1 >= n0[1] || lx + 1 >= n0[2]) {
+            const float wz = (float)(lz - z) + 0.5f, wy = (float)(ly - y) + 0.5f, wx = (float)(lx - x) + 0.5f, e = wz * wz + wy * wy + wx * wx;
+            if (e < *d) { *d = e; v[0] = wz; v[1] = wy; v[2] = wx; *code = c1[f1]; }
+        }
+    }
+    return *d < BINF;
+}
+int band_field_phase_pair2(const uint8_t *codes0, const int n0[3], const uint8_t *codes1, const int n1[3], const int off[3], float rmax, uint8_t *phase) {
+    const size_t N0 = (size_t)n0[0] * n0[1] * n0[2], N1 = (size_t)n1[0] * n1[1] * n1[2];
+    if (off[0] < 0 || off[1] < 0 || off[2] < 0) return -1;
+    uint8_t *sd = malloc(N0 > N1 ? N0 : N1); int32_t *ie = malloc(N0 * 4), *io = malloc(N0 * 4), *je = malloc(N1 * 4), *jo = malloc(N1 * 4);
+    int rc = !sd || !ie || !io || !je || !jo;
+    for (int lv = 0; lv < 2 && !rc; lv++) for (int par = 0; par < 2 && !rc; par++) {
+        const uint8_t *c = lv ? codes1 : codes0; const size_t N = lv ? N1 : N0;
+        for (size_t i = 0; i < N; i++) { const int lab = c[i] > 0 && c[i] < 255; sd[i] = lab && (((c[i] - 1) / BAND_STEPS) & 1) == par; }
+        rc = edt_feature_cap(sd, lv ? n1 : n0, BINF, nullptr, lv ? (par ? jo : je) : (par ? io : ie));
+    }
+    if (!rc) {
+        const float r2 = rmax * rmax;
+        for (size_t i = 0; i < N0; i++) {
+            phase[i] = PHASE_UNKNOWN;
+            const int c = codes0[i];
+            if (c > 0 && c < 255) { phase[i] = 0; continue; }
+            const long z = (long)(i / ((size_t)n0[1] * n0[2])), y = (long)((i / n0[2]) % n0[1]), x = (long)(i % n0[2]);
+            const size_t p = ((size_t)((z + off[0]) >> 1) * n1[1] + (size_t)((y + off[1]) >> 1)) * n1[2] + (size_t)((x + off[2]) >> 1);
+            float de, dd, a[3], b[3]; int ca, cb;
+            if (!near2(codes0, ie[i], codes1, je[p], z, y, x, n0, n1, off, &de, a, &ca)) continue;
+            if (!near2(codes0, io[i], codes1, jo[p], z, y, x, n0, n1, off, &dd, b, &cb)) continue;
+            if (de > r2 || dd > r2) continue;
+            const int ka = (ca - 1) / BAND_STEPS, kb = (cb - 1) / BAND_STEPS;
+            int dk = ((kb - ka) % 14 + 14) % 14; if (dk > 7) dk -= 14;
+            if (dk != 1 && dk != -1) continue;
+            const float da = sqrtf(de), db = sqrtf(dd);
+            if (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] > -0.5f * da * db) continue;
+            const float f = dk == 1 ? da / (da + db) : db / (da + db);
+            int q = (int)lrintf(f * PHASE_PERIOD); if (q >= PHASE_PERIOD) q -= PHASE_PERIOD;
+            phase[i] = (uint8_t)q;
+        }
+    }
+    free(sd); free(ie); free(io); free(je); free(jo);
+    return rc ? -1 : 0;
+}
+
 int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing) { return band_field_phase_pair_ex(codes, n, rmax, phase, spacing, nullptr, nullptr); }
 int band_field_phase_pair_ex(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing, int32_t *lo, int32_t *hi) {
     const size_t N = (size_t)n[0] * n[1] * n[2], sy = (size_t)n[2], sz = (size_t)n[1] * n[2];

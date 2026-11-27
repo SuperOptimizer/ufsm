@@ -53,6 +53,11 @@ int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint
 /* the same, plus per voxel the index (into the n[0] x n[1] x n[2] block) of the nearest labelled voxel of the lower winding (lo) and
    of the higher (hi) that set its phase (both the voxel itself on a labelled sheet; -1 where the phase is unknown); lo / hi may be
    nullptr. Used by ufsm surf-labels (which sheets, i.e. wraps, a voxel's phase comes from). Block size < 2^31 voxels. */
+/* the two-level pair rule (option 3, w24 2026-11-27): codes0 a level-0 tile (n0, a small halo), codes1 the level-1 codes over the same region
+   with a halo of rmax / 2 + 2 level-1 voxels (n1; the level-0 voxel z lies in the level-1 cell (z + off) / 2). A voxel's nearest sheet of each
+   parity: the level-0 tile's, or its level-1 cell's nearest (taken at that cell's centre) when that cell is not wholly inside the level-0
+   tile and nearer. rmax in level-0 voxels. The phase of every level-0 tile voxel into phase (n0) */
+int band_field_phase_pair2(const uint8_t *codes0, const int n0[3], const uint8_t *codes1, const int n1[3], const int off[3], float rmax, uint8_t *phase);
 int band_field_phase_pair_ex(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing, int32_t *lo, int32_t *hi);
 
 /* Recto / verso side of every voxel from the labelled recto faces alone (no axis): between consecutive windings k and k + 1 the
