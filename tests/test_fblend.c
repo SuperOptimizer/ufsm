@@ -320,12 +320,30 @@ static void test_fuse(void) {
     char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf %s", tmp); if (system(cmd)) {}
 }
 
+/* --snap (fb_phase_snap): a = phase 0, confidence 0.8; sp 64 at h 2 = 16 native voxels a turn; R 2 voxels = 1/8 turn (0.785 rad).
+   b 0.5 rad off: a's sheet moves to b's place (b's direction, a's length); 1.0 rad off: a unchanged (b's sheet is not a's); no spacing,
+   no b phase, no a phase: a unchanged. */
+static void test_snap(void) {
+    const double r = 0.8 * 127, ang[5] = {0.5, 1.0, -0.5, 0.5, 0.5};
+    uint8_t pca[5], psa[5], pcb[5], psb[5], sp[5] = {64, 64, 64, 0, 64}, oc[5], os[5];
+    for (int j = 0; j < 5; j++) { pca[j] = (uint8_t)lrint(128 + r); psa[j] = 128; pcb[j] = (uint8_t)lrint(128 + 100 * cos(ang[j])); psb[j] = (uint8_t)lrint(128 + 100 * sin(ang[j])); }
+    pcb[4] = psb[4] = 128;   /* (no b phase) */
+    fb_phase_snap(pca, psa, pcb, psb, sp, 2, 2.0, 5, oc, os);
+    for (int j = 0; j < 5; j++) {
+        const double ph = atan2(os[j] - 128.0, oc[j] - 128.0), cf = hypot(os[j] - 128.0, oc[j] - 128.0) / 127;
+        const int moved = j == 0 || j == 2;
+        if (moved) CHECK(fabs(ph - atan2(psb[j] - 128.0, pcb[j] - 128.0)) < 0.01 && fabs(cf - 0.8) < 0.01, "snap %d: phase %g conf %g", j, ph, cf);
+        else CHECK(oc[j] == pca[j] && os[j] == psa[j], "snap %d: a unchanged (%d %d)", j, oc[j], os[j]);
+    }
+    uint8_t z0[1] = {128}; fb_phase_snap(z0, z0, pcb, psb, sp, 2, 2.0, 1, oc, os); CHECK(oc[0] == 128 && os[0] == 128, "snap: no a phase stays none");
+}
 int main(void) {
     test_cells();
     test_tiles();
     test_sets();
     test_paste();
     test_fuse();
+    test_snap();
     if (fails) { fprintf(stderr, "test_fblend: %d FAILED\n", fails); return 1; }
     printf("test_fblend: ok\n");
     return 0;

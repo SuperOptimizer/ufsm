@@ -51,7 +51,13 @@ double fb_tile_w(long long o, int h, int c, double S, double g);
    The winding mod 4 planes measure W over w4_d native voxels: inputs whose w4_d x um differs from the first contributing input's are left
    out of w4 (DEFAULTED), and the output's w4_d is that offset in in[0]'s voxels (refused when not whole). */
 enum { FB_G_PHASE, FB_G_NORMAL, FB_G_SP, FB_G_W, FB_G_W4, FB_G_R, FB_NGRP };
-typedef struct { int tile; double stride[3], grid[32][3]; int conf; int paste; double feather; int box; long long b0[3], bn[3]; int pw_on[FB_NGRP]; float pw[FB_NGRP][32]; } fb_opts;
+typedef struct { int tile; double stride[3], grid[32][3]; int conf; int paste; double feather; int box; long long b0[3], bn[3]; int pw_on[FB_NGRP]; float pw[FB_NGRP][32]; double snap_um; } fb_opts;
+/* --snap R (um, 2026-11-27, lead: "take the sheet count from try9, use w24 only to place each try9 sheet"): the phase of in[0] turned to
+   in[1]'s where the two sheets lie within R of each other (|dphi| / 2 pi x in[0]'s sheet spacing sp h / 8 native voxels x um <= R), else
+   in[0]'s unchanged; in[0]'s confidence (length) kept. Never adds a wrap: far from an in[0] sheet (> R) in[1] is ignored. Cells with no
+   in[0] / in[1] phase or no spacing keep in[0]. r_vox: R in in[0]'s native voxels, h its cell size. */
+void fb_phase_snap(const uint8_t *pca, const uint8_t *psa, const uint8_t *pcb, const uint8_t *psb, const uint8_t *sp, int h, double r_vox, size_t ncell,
+                   uint8_t *opc, uint8_t *ops);
 int fb_plane_group(const char *plane);   /* the FB_G_* group of a plane name, -1 none (passed-through planes) */
 int fb_group_id(const char *name);       /* "phase" "normal" "sp" "w" "w4" "r" -> FB_G_*, -1 unknown */
 

@@ -3711,9 +3711,11 @@ static int cmd_occ_tiles(int argc, char **argv) {
    --paste F [--box z,y,x,nz,ny,nx]: IN2.. are sub-box predicts pasted over IN1 with F-cell feathered faces (src/fblend.h); --box
    writes only that part of IN1 (shard-aligned), for scripts/spiralqa/field_paste_link.sh to overlay on IN1's shards.
    --plane-w GROUP=w1,w2,..[:GROUP=..] (field fusion): per plane group (phase normal sp w w4 r) its own input weights; weight 0 (there or
-   in --weights) leaves the input out of the plane. E.g. try9 + w24: --weights 1,0 --plane-w phase=0,1 (src/fblend.h). */
+   in --weights) leaves the input out of the plane. E.g. try9 + w24: --weights 1,0 --plane-w phase=0,1 (src/fblend.h).
+   --snap R (um): IN1's phase turned to IN2's where their sheets lie within R (in IN1's spacing), else IN1's: IN2 places IN1's sheets,
+   never adds one (fb_phase_snap). E.g. try9 + w24: --weights 1,0 --snap 9.6. */
 static int cmd_field_blend(int argc, char **argv) {
-    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant", *paste = nullptr, *box = nullptr, *pws = nullptr; int nt = ufsm_threads(0, 8);
+    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant", *paste = nullptr, *box = nullptr, *pws = nullptr, *snap = nullptr; int nt = ufsm_threads(0, 8);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], opt_n("--weights")) && i + 1 < argc) { ws = argv[++i]; continue; }
         if (!strcmp(argv[i], opt_n("--threads")) && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
@@ -3723,6 +3725,7 @@ static int cmd_field_blend(int argc, char **argv) {
         if (!strcmp(argv[i], opt_n("--paste")) && i + 1 < argc) { paste = argv[++i]; continue; }
         if (!strcmp(argv[i], opt_n("--box")) && i + 1 < argc) { box = argv[++i]; continue; }
         if (!strcmp(argv[i], opt_n("--plane-w")) && i + 1 < argc) { pws = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--snap")) && i + 1 < argc) { snap = argv[++i]; continue; }
         if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "field-blend: unknown option %s\n", argv[i]); return 2; }
         if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "field-blend: at most 32 inputs\n"); return 2; }
     }
@@ -3756,6 +3759,11 @@ static int cmd_field_blend(int argc, char **argv) {
             o.pw_on[g] = 1;
         }
         free(t);
+    }
+    if (snap) {   /* --snap R: both inputs' phase is read (phase weights 1,1 unless given) */
+        o.snap_um = atof(snap); if (!(o.snap_um > 0) || n != 2) { fprintf(stderr, "field-blend: --snap R (um > 0) with exactly two inputs\n"); return 2; }
+        if (!o.pw_on[FB_G_PHASE]) { o.pw_on[FB_G_PHASE] = 1; o.pw[FB_G_PHASE][0] = o.pw[FB_G_PHASE][1] = 1; }
+        if (!(o.pw[FB_G_PHASE][0] > 0 && o.pw[FB_G_PHASE][1] > 0)) { fprintf(stderr, "field-blend --snap: both inputs need a phase weight > 0\n"); return 2; }
     }
     if (paste) { o.paste = 1; o.feather = atof(paste); if (!(o.feather >= 1) || tile || ws) { fprintf(stderr, "field-blend: --paste F (cells >= 1), without --tile / --weights\n"); return 2; } }
     if (box) {
