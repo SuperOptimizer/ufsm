@@ -151,13 +151,47 @@ VOUT=$([ "$INKMODE" = r3 ] && echo "--volume-out 0")
 # r3pre OUT GPU SURF..: ONE ink-ext over every surface that has no map in OUT yet (decoded chunks resident across surfaces, --ct-mem LRU;
 # the fetched ones in the run's shared --cache $O/ink/ct.cache: neighbouring 1667 wraps share ~83 % of their chunks, a cold wrap was 46 of 50 s
 # CT fetch, warm 12 s, unrollperf 11-17); r3ink.sh then takes OUT/<name>_<model>.tif (R3PRE). GPU "": the run's device.
+# CTSHELL (inkeval 11-27, lead: lossless / q2 CT gave reader3 +.035 on clean 1447, +.010-.013 on 0139 / 0009B, nil on pooled reads; DESIGN
+# "Per-scroll / per-recipe ink eval" addendum): on a coarse scan (UM >= 7: reader3 reads level 0, which the mirror holds at q8) r3pre first
+# grows a q2 shell of that level around its surfaces from the S3 original, $SHD/$K (ink-ext --shell-list: exactly the chunks the render
+# reads, one box per 1024^3 shard; latvol --volcomp 2 --boxes from S3CT), then reads ink through ink-ext --ct-shell. The shell is shared by
+# the run's r3pre calls (flock $SHD.lock: built exclusively, read shared; a grown shard is rewritten). A shell that cannot be built:
+# DEFAULTED, the ink from the q8 store. CTSHELL=0 off, 1 on any scan; SHELLQ (2), SHELLTH (6 threads), SHELLDIR, S3CT.
+CTSHELL=${CTSHELL:-auto}; [ "$CTSHELL" = auto ] && CTSHELL=$(awk -v u=$UM 'BEGIN { print (u >= 7) ? 1 : 0 }')
+SHD=${SHELLDIR:-$O/ink/ctshell}; S3CT=${S3CT:-https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com}; SHLCB=${SHLCB:-/vesuvius/ufsm/v2/lat/codec/klt1.lcb}
+# ctshell SURFACE-ARGS..: grow $SHD for those --surface args; sets SHX to the ink-ext flags ("" when the shell is not used) and holds
+# $SHD.lock shared on fd shfd (the caller's local) until shclose
+shclose() { [ -n "${shfd:-}" ] && exec {shfd}>&-; shfd=; }
+ctshell() {
+  SHX=; [ "$CTSHELL" = 1 ] || return 0
+  local t0=$(date +%s) s3k="${K%%/*}/volumes/${K##*/}" lev rc prev=() sz sy sx n
+  mkdir -p $SHD/tmp $SHD/grp/$s3k || { log "DEFAULTED: ctshell: cannot create $SHD: ink from the q8 store $R"; return 0; }
+  exec {shfd}> $SHD.lock; flock -x -w ${SHELLWAIT:-7200} $shfd || { log "DEFAULTED: ctshell: $SHD.lock busy ${SHELLWAIT:-7200} s: ink from the q8 store $R"; shclose; return 0; }
+  [ -s $SHD/$K/shell.boxes ] && prev=(--shell-prev $SHD/$K/shell.boxes)
+  nice -n 10 $U ink-ext --model $R3MODEL --weights $R3W "$@" --ct $R $K --out $SHD/tmp --threads $R3TH $R3X --shell-list $SHD/new.boxes "${prev[@]}" >> $O/logs/ctshell.log 2>&1; rc=$?
+  lev=$(sed -n 's/^# level \([0-9]*\) shard 1024.*/\1/p' $SHD/new.boxes 2> /dev/null)
+  if [ $rc != 0 ] || [ -z "$lev" ]; then log "DEFAULTED: ctshell: ink-ext --shell-list rc $rc ($O/logs/ctshell.log): ink from the q8 store $R"; shclose; return 0; fi
+  if [ ${#prev[@]} -gt 0 ] && [ -s $SHD/new.boxes.redo ]; then
+    while read -r sz sy sx; do rm -f "$SHD/$K/$lev/c/$sz/$sy/$sx"; done < $SHD/new.boxes.redo; fi   # (grown shards: latvol --resume rewrites them)
+  if [ ! -s $SHD/grp/$s3k/zarr.json ]; then
+    case $R in http*) curl -sf "$R/$K/zarr.json" -o $SHD/grp/$s3k/zarr.json;; *) cp "$R/$K/zarr.json" $SHD/grp/$s3k/zarr.json;; esac || { log "DEFAULTED: ctshell: no group zarr.json at $R/$K: ink from the q8 store $R"; shclose; return 0; }
+  fi
+  nice -n 10 $U latvol $SHLCB $S3CT $s3k $SHD/$K --levels $lev --zarr2 1 --volcomp ${SHELLQ:-2} --gpu -1 --threads ${SHELLTH:-6} --resume 1 --boxes $SHD/new.boxes \
+    --group-from $SHD/grp >> $O/logs/ctshell.log 2>&1; rc=$?
+  if [ $rc != 0 ]; then log "DEFAULTED: ctshell: latvol from $S3CT $s3k rc $rc ($O/logs/ctshell.log): ink from the q8 store $R"; rm -f $SHD/$K/shell.boxes; shclose; return 0; fi
+  mv -f $SHD/new.boxes $SHD/$K/shell.boxes
+  n=$(grep -vc '^#' $SHD/$K/shell.boxes); log "ctshell: level $lev q${SHELLQ:-2} shell $SHD/$K: $n shard boxes, $(du -sb $SHD/$K/$lev 2> /dev/null | awk '{printf "%.2f GB", $1 / 1e9}'), $(( $(date +%s) - t0 )) s"
+  flock -s $shfd; SHX="--ct-shell $SHD"   # (shared while ink-ext reads: no rebuild under it; closed after the ink-ext)
+}
 r3pre() {
   local out=$1 g=$2 a=() x; shift 2; [ -n "$g" ] && { g=$(pcard $g) || return 1; }
   for x in "$@"; do [ -s $x/meta.json ] && [ ! -s $out/$(basename $x)_$R3MODEL.tif ] && a+=(--surface $x); done
   [ ${#a[@]} = 0 ] && return 0; mkdir -p $out $O/ink
+  local shfd=; ctshell "${a[@]}"
   ${g:+env CUDA_VISIBLE_DEVICES=$g} nice -n 10 $U ink-ext --model $R3MODEL --weights $R3W "${a[@]}" --ct $R $K --out $out --threads $R3TH \
-    --cache $O/ink/ct.cache $R3X >> $O/logs/r3ink.log 2>&1 || { log "r3pre: ink-ext failed ($O/logs/r3ink.log)"; return 1; }
-  log "r3pre: $(( ${#a[@]} / 2 )) surfaces -> $out: $(grep -oE '[0-9.]+ tiles/s' $O/logs/r3ink.log | tail -1)"
+    --cache $O/ink/ct.cache $R3X $SHX >> $O/logs/r3ink.log 2>&1 || { shclose; log "r3pre: ink-ext failed ($O/logs/r3ink.log)"; return 1; }
+  shclose
+  log "r3pre: $(( ${#a[@]} / 2 )) surfaces -> $out: $(grep -oE '[0-9.]+ tiles/s' $O/logs/r3ink.log | tail -1)$([ -n "$SHX" ] && grep -E '^DEFAULTED: ink-ext: .*outside the shell' $O/logs/r3ink.log | tail -1 | sed 's/^/; /')"
 }
 
 # the run's own copy of the scripts (bash reads scripts incrementally: editing the repo must not change a running driver)

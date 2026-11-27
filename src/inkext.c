@@ -122,8 +122,19 @@ typedef struct {
     cent *e; size_t ne, cap;            /* resident chunks (p == zero: all zero) */
     int64_t *hk; int32_t *hv; size_t hcap;   /* open-addressing key -> index into e (rebuilt per band) */
     uint8_t *zero; uint32_t epoch; uint64_t ndec;
+    /* --ct-shell (inkeval 11-27): a higher-quality partial copy of this level (q2 around the inked surfaces); its chunks are those inside
+       the boxes of its shell.boxes (one per 1024^3 shard: what latvol --boxes wrote), the rest still come from z */
+    z3 *zs; int64_t sg[3]; int32_t *sbox; int64_t (*box)[6]; _Atomic long long nshell, nmain;
 } ctlev;
 static inline int64_t ckey(int64_t a, int64_t b, int64_t c) { return (a << 42) | (b << 21) | c; }
+static int shell_has(const ctlev *L, int64_t k) {   /* chunk key k (128^3 grid) inside the shell's box of its 1024^3 shard */
+    if (!L->zs) return 0;
+    const int64_t c[3] = {k >> 42, (k >> 21) & 0x1fffff, k & 0x1fffff}, s[3] = {c[0] >> 3, c[1] >> 3, c[2] >> 3};
+    for (int d = 0; d < 3; d++) if (s[d] >= L->sg[d]) return 0;
+    const int32_t b = L->sbox[(s[0] * L->sg[1] + s[1]) * L->sg[2] + s[2]]; if (b < 0) return 0;
+    for (int d = 0; d < 3; d++) if (c[d] * 128 < L->box[b][d] || (c[d] + 1) * 128 > L->box[b][d] + L->box[b][3 + d]) return 0;
+    return 1;
+}
 /* (x >> 20) of the product alone (before 2026-11-16) depended only on key bits 0-29 (x and the low bits of y): every chunk differing in z
    alone probed the same slot, ct_find was 45 % of ink9um's CPU samples. A full mix spreads every key bit over the slot index. */
 static inline size_t chash(int64_t k, size_t cap) { uint64_t x = (uint64_t)k; x ^= x >> 31; x *= 0x9E3779B97F4A7C15ull; x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32; return (size_t)x & (cap - 1); }
@@ -142,8 +153,9 @@ static void *dec_worker(void *a) {
     for (size_t t; (t = atomic_fetch_add(&J->next, 1)) < J->n;) {
         const int64_t k = J->todo[t], o[3] = {(k >> 42) * CE, ((k >> 21) & 0x1fffff) * CE, (k & 0x1fffff) * CE}, n[3] = {CE, CE, CE};
         if (o[0] >= J->L->shape[0] || o[1] >= J->L->shape[1] || o[2] >= J->L->shape[2]) { J->out[t] = J->L->zero; continue; }
-        uint8_t *b = malloc(cv);
-        if (!b || z3_read(J->L->z, o, n, b, 1)) { free(b); atomic_store(&J->failed, 1); J->out[t] = J->L->zero; continue; }
+        uint8_t *b = malloc(cv); const int sh = shell_has(J->L, k);
+        if (J->L->zs) atomic_fetch_add(sh ? &J->L->nshell : &J->L->nmain, 1);
+        if (!b || z3_read(sh ? J->L->zs : J->L->z, o, n, b, 1)) { free(b); atomic_store(&J->failed, 1); J->out[t] = J->L->zero; continue; }
         size_t q = 0; const uint64_t *w = (const uint64_t *)b; while (q < cv / 8 && !w[q]) q++;
         if (q == cv / 8) { free(b); J->out[t] = J->L->zero; } else J->out[t] = b;
     }
@@ -419,7 +431,7 @@ typedef struct {
 } gworker;
 static void *gpu_worker(void *a) {
     gworker *G = a; irun *X = G->X; const int D = G->D, T = G->T, Wm = G->Wm, Hm = G->Hm;
-    xnet_bind();   /* --gpu N: this thread's CUDA calls on the same device as xnet_init (else device 0) */
+    if (X->net) xnet_bind();   /* --gpu N: this thread's CUDA calls on the same device as xnet_init (else device 0); (no net: --render-only) */
     for (;;) {
         pthread_mutex_lock(&G->mu);
         while (!G->has && !G->quit) pthread_cond_wait(&G->cv, &G->mu);
@@ -516,6 +528,7 @@ static void pf_surface(ie_pf *P, const irun *X, const isurf *S) {
         if (u) memcpy(all + n, k, u * sizeof *k);
         n += u; free(k);
     }
+    if (R.L->zs) { size_t m = 0; for (size_t i = 0; i < n; i++) if (!shell_has(R.L, all[i])) all[m++] = all[i]; n = m; }   /* (the shell is local) */
     pf_add(P, R.L->z, all, n);
 }
 static ie_pf *pf_open(int nt) {
@@ -595,9 +608,9 @@ static float *run_surface(irun *X, const isurf *S, int *pWm, int *pHm, double *p
             for (size_t i = 0; i < (size_t)D * Wm; i++) if (row[i]) { if (nv == cv) { cv *= 2; v = realloc(v, cv); } v[nv++] = row[i]; }
         }
         if (nv > 1000) {
-            float lo, hi, a, b; ie_robust_params(v, nv, &lo, &hi, &a, &b); ie_set_norm(X->net, 1, lo, hi, a, b); for (int k = 0; k < X->nens; k++) ie_set_norm(X->ens[k], 1, lo, hi, a, b);
+            float lo, hi, a, b; ie_robust_params(v, nv, &lo, &hi, &a, &b); if (X->net) ie_set_norm(X->net, 1, lo, hi, a, b); for (int k = 0; k < X->nens; k++) ie_set_norm(X->ens[k], 1, lo, hi, a, b);
             fprintf(stderr, "ink-ext: %s: sheet normalisation over %zu voxels of %d rows: p1 %.0f p99 %.0f median %.1f scale %.2f\n", S->name, nv, nr, lo, hi, -b / a, 1 / a);
-        } else { ie_set_norm(X->net, 0, 0, 0, 0, 0); for (int k = 0; k < X->nens; k++) ie_set_norm(X->ens[k], 0, 0, 0, 0, 0); fprintf(stderr, "ink-ext: %s: too few voxels for --norm sheet, per-tile normalisation\n", S->name); }
+        } else { if (X->net) ie_set_norm(X->net, 0, 0, 0, 0, 0); for (int k = 0; k < X->nens; k++) ie_set_norm(X->ens[k], 0, 0, 0, 0, 0); fprintf(stderr, "ink-ext: %s: too few voxels for --norm sheet, per-tile normalisation\n", S->name); }
         free(v); free(row);
     }
     float *num = calloc((size_t)Wm * Hm, sizeof *num), *den = calloc((size_t)Wm * Hm, sizeof *den);
@@ -822,7 +835,7 @@ int cmd_ink_ext(int argc, char **argv) {
     if (!mname || !weights) {
         fprintf(stderr, "usage: ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um|reader2|dense9|rectina|trace3b|canon2|studio|tsf --weights W[,W2..] --surface TIFXYZ [--surface ..] --ct ROOT KEY --out DIR\n"
                         "         [--reverse] [--stride S] [--px-um U] [--batch B] [--gpu 0] [--threads 16] [--ct-mem 3] [--cache DIR] [--fetch-threads 16] [--native] [--suffix S] [--prefix P]\n"
-                        "         [--ct-local ROOT --local-levels 1,2] [--ct-um 2.399] [--surf-um U] [--no-overlap] [--norm tile|sheet] [--blend official|norm] [--grid-crop c,r,w,h]\n"
+                        "         [--ct-local ROOT --local-levels 1,2] [--ct-shell ROOT] [--shell-list FILE [--shell-prev OLD]] [--ct-um 2.399] [--surf-um U] [--no-overlap] [--norm tile|sheet] [--blend official|norm] [--grid-crop c,r,w,h]\n"
                         "         [--ct-tif] [--jpeg PATH] [--jpeg-stretch] [--layers DIR [--px-crop x,y,w,h]] [--dump-layers DIR] [--render-only]\n"
                         "         [--shift S] [--zwin a,b,..] [--calib] [--native-only]\n"
                         "       ufsm ink-ext --model M --weights W --raw-in TILES.u8 --raw-out LOGITS.f32 [--batch 2]   (parity: native tiles -> logits)\n"
@@ -854,9 +867,14 @@ int cmd_ink_ext(int argc, char **argv) {
         }
     }
     if (kind == ie_model_kind("hecate24") && !getenv("UFSM_XNET_MX")) { setenv("UFSM_XNET_MX", "5", 1); fprintf(stderr, "ink-ext: hecate24 in MX5 (UFSM_XNET_MX=0: fp16)\n"); }
-    if (xnet_init(opt_atoi("--gpu", iopt(argc, argv, "--gpu", "0")))) return 1;
-    enum { MAXE = 16 }; ie_net *nets[MAXE]; int nnet = 0;
-    {   /* --weights W1,W2,..: each checkpoint loaded once */
+    /* --shell-list FILE (inkeval 11-27): no inference. The CT chunks the render of every --surface reads (render_keys: the same set the
+       renderer decodes), as one "z y x nz ny nx" box per 1024^3 shard (the bounding box of its chunks, in voxels of the level read), with a
+       "# level L shard 1024" header: latvol --boxes of a q2 shell, then --ct-shell. No GPU, no weights, no chunk read (shapes only). */
+    const char *slist = iopt(argc, argv, "--shell-list", nullptr);
+    const int nonet = slist || iflag(argc, argv, "--render-only");   /* (--render-only: the rendered layers alone, no net: no GPU either, 11-27) */
+    if (!nonet && xnet_init(opt_atoi("--gpu", iopt(argc, argv, "--gpu", "0")))) return 1;
+    enum { MAXE = 16 }; ie_net *nets[MAXE] = {0}; int nnet = 0;
+    if (!nonet) {   /* --weights W1,W2,..: each checkpoint loaded once */
         char wl[4096]; snprintf(wl, sizeof wl, "%s", weights);
         for (char *sv = nullptr, *t = strtok_r(wl, ",", &sv); t && nnet < MAXE; t = strtok_r(nullptr, ",", &sv)) {
             const double tl = inow(); nets[nnet] = ie_load(kind, t); if (!nets[nnet]) return 1;
@@ -936,6 +954,7 @@ int cmd_ink_ext(int argc, char **argv) {
     X.batch = opt_atoi("--batch", iopt(argc, argv, "--batch", "0"));
     const double gmem = opt_atof("--gpu-mem", iopt(argc, argv, "--gpu-mem", "0"));   /* GB of device memory for activations + cache (default: free - 1 GB) */
     if (gmem > 0) xnet_set_budget((size_t)(gmem * (1 << 30)));
+    if (nonet && X.batch < 1) X.batch = 1;
     if (X.batch < 1) {   /* fit the batch to the free device memory (half of it) */
         size_t fr = 0, tot = 0; xnet_mem_info(&fr, &tot);
         X.batch = (int)(fr / 2 / ie_tile_bytes_gpu(kind)); if (X.batch < 1) X.batch = 1; if (X.batch > 32) X.batch = 32;
@@ -960,10 +979,38 @@ int cmd_ink_ext(int argc, char **argv) {
         L->budget = X.ct_mem; L->zero = calloc((size_t)CE * CE * CE, 1); X.nlev = l + 1;
     }
     if (!X.nlev) { fprintf(stderr, "ink-ext: no CT levels under %s %s: %s\n", argv[ci + 1], argv[ci + 2], z3_error()); return 1; }
+    const char *shroot = iopt(argc, argv, "--ct-shell", nullptr);
+    if (shroot) {   /* --ct-shell ROOT: ROOT/KEY/<L> (a latvol --boxes copy of level L) and ROOT/KEY/shell.boxes (its boxes, ink-ext --shell-list) */
+        char bp[1400]; snprintf(bp, sizeof bp, "%s/%s/shell.boxes", shroot, argv[ci + 2]); FILE *bf = fopen(bp, "r"); int sl = -1, ssh = 0, nb = 0, cap = 0; int64_t (*bx)[6] = nullptr;
+        if (bf) { char ln[512];
+            while (fgets(ln, sizeof ln, bf)) { long long v[6];
+                if (ln[0] == '#') { sscanf(ln, "# level %d shard %d", &sl, &ssh); continue; }
+                if (sscanf(ln, "%lld %lld %lld %lld %lld %lld", v, v + 1, v + 2, v + 3, v + 4, v + 5) != 6) continue;
+                if (nb == cap) { cap = cap ? 2 * cap : 1024; bx = realloc(bx, (size_t)cap * sizeof *bx); }
+                for (int d = 0; d < 6; d++) bx[nb][d] = v[d]; nb++; }
+            fclose(bf); }
+        ctlev *L = sl >= 0 && sl < X.nlev ? &X.lev[sl] : nullptr; z3 *zs = nullptr;
+        if (L && L->z && ssh == 1024 && nb) { char k[1100]; snprintf(k, sizeof k, "%s/%d", argv[ci + 2], sl); store *ss = store_open(shroot); zs = ss ? z3_open(ss, k, nullptr) : nullptr; }
+        if (zs) { const z3_meta *m = z3_meta_of(zs);
+            if (m->chunk[0] != CE || m->chunk[1] != CE || m->chunk[2] != CE || m->shape[0] != L->shape[0] || m->shape[1] != L->shape[1] || m->shape[2] != L->shape[2]) zs = nullptr; }
+        if (!zs) fprintf(stderr, "DEFAULTED: ink-ext: --ct-shell %s: no usable shell for %s (%s: level %d, shard %d, %d boxes; or its level does not match the CT's shape / "
+                                 "128^3 chunks): every chunk read from %s\n", shroot, argv[ci + 2], bp, sl, ssh, nb, argv[ci + 1]);
+        else {
+            for (int d = 0; d < 3; d++) L->sg[d] = (L->shape[d] + 1023) / 1024;
+            const size_t ng = (size_t)(L->sg[0] * L->sg[1] * L->sg[2]); L->sbox = malloc(ng * sizeof *L->sbox); for (size_t i = 0; i < ng; i++) L->sbox[i] = -1;
+            int bad = 0;
+            for (int b = 0; b < nb; b++) { int64_t s3[3]; for (int d = 0; d < 3; d++) { s3[d] = bx[b][d] / 1024; if (s3[d] >= L->sg[d] || bx[b][d] + bx[b][3 + d] > (s3[d] + 1) * 1024) bad = 1; }
+                if (bad) break; L->sbox[(s3[0] * L->sg[1] + s3[1]) * L->sg[2] + s3[2]] = b; }
+            if (bad) { fprintf(stderr, "ink-ext: --ct-shell: %s: a box crosses a 1024^3 shard (not an ink-ext --shell-list file)\n", bp); return 2; }
+            L->zs = zs; L->box = bx; bx = nullptr;
+            fprintf(stderr, "ink-ext: CT level %d: %d shard boxes from the shell %s, the rest from %s\n", sl, nb, shroot, argv[ci + 1]);
+        }
+        free(bx);
+    }
     fprintf(stderr, "ink-ext: batch %d, CT %s %s (%d levels, %.3f um), stride %d\n", X.batch, argv[ci + 1], argv[ci + 2], X.nlev, X.lev_um[0], X.stride > 0 ? X.stride : X.sp->stride);
 surfaces:;
     char p[1400]; snprintf(p, sizeof p, "mkdir -p '%s'", outdir); if (system(p)) return 1;
-    int rc = 0, ns = 0, nsurf = 0;
+    int rc = 0, ns = 0, nsurf = 0, sh_lev = -1; int64_t *sh_keys = nullptr; size_t sh_n = 0, sh_cap = 0;   /* (--shell-list) */
     for (int a = 2; a + 1 < argc; a++) nsurf += !strcmp(argv[a], opt_n("--surface"));
     /* the CT prefetcher: with --cache and a remote CT only (a local store has nothing to fetch) */
     ie_pf *pf = nullptr; int pf_next = -1;
@@ -975,6 +1022,17 @@ surfaces:;
         if (lonly) { memset(&S, 0, sizeof S); snprintf(S.name, sizeof S.name, "%s", iopt(argc, argv, "--name", "layers")); S.scale = 1; S.vox_um = X.px_um; S.w = S.h = 2; }
         else if (isurf_load(&S, argv[a + 1])) { fprintf(stderr, "ink-ext: cannot read tifxyz %s\n", argv[a + 1]); rc = 1; continue; }
         { const int sp = lonly ? 0 : surf_prep(&X, &S, argc, argv, 0); if (sp) { if (sp == -1) fprintf(stderr, "ink-ext: bad --grid-crop\n"); return 2; } }
+        if (slist) {   /* --shell-list: this surface's chunk keys, all rows */
+            irender R; const int L = X.stk ? -1 : render_init(&X, &S, &R);
+            if (L < 0 || !R.L->z) { fprintf(stderr, "ink-ext: --shell-list needs --ct (no level for %s)\n", S.name); isurf_free(&S); return 1; }
+            if (sh_lev >= 0 && L != sh_lev) { fprintf(stderr, "ink-ext: --shell-list: %s reads level %d, an earlier surface level %d: one level per list\n", S.name, L, sh_lev); isurf_free(&S); return 1; }
+            sh_lev = L; size_t u; int64_t *k = render_keys(&R, 0, R.Hm, &u);
+            if (sh_n + u > sh_cap) { sh_cap = (sh_n + u) * 2; sh_keys = realloc(sh_keys, sh_cap * sizeof *sh_keys); }
+            if (u) memcpy(sh_keys + sh_n, k, u * sizeof *k);
+            sh_n += u; free(k); ns++;
+            fprintf(stderr, "ink-ext: --shell-list: %s: %zu chunks of level %d\n", S.name, u, L);
+            isurf_free(&S); continue;
+        }
         if (pf) {   /* this surface's chunks (unless queued as the previous one's next), then the next surface's behind them */
             if (a != pf_next) pf_surface(pf, &X, &S);
             pf_next = -1;
@@ -1007,7 +1065,7 @@ surfaces:;
         X.ens = one ? nets : nullptr; X.nens = one ? nnet : 0;
         float *wsum = nullptr, *ad = nullptr; X.want_vis = tviews > 8 || fuse; long long adskip = 0;
         float **fst = fuse ? calloc(nvp, sizeof *fst) : nullptr; uint8_t **fvis = fuse ? calloc(nvp, sizeof *fvis) : nullptr;   /* --tta-fuse: every view's map and coverage */   /* --tta-views > 8: per-pixel weights (sum of views over the passes covering it) */
-        for (int k = 0; k < (one ? 1 : nnet) && !bad; k++) for (int z = 0; z < nzw && !bad; z++) for (int v = 0; v < nvp && !bad; v++) {
+        for (int k = 0; k < (one || !nnet ? 1 : nnet) && !bad; k++) for (int z = 0; z < nzw && !bad; z++) for (int v = 0; v < nvp && !bad; v++) {
             const int vp = fuse ? v / 8 : v;   /* the grid phase / depth row */
             X.net = nets[k]; X.shift = shift0 + zw[z] + (tviews ? ie_vpass[vp][2] : 0); X.dump_req = dreq && !npass;
             if (tviews) { X.tta = fuse ? 1 : tviews - 8 * v < 8 ? tviews - 8 * v : 8; X.tta_k0 = fuse ? v % 8 : 0; X.goff_y = ie_vpass[vp][0]; X.goff_x = ie_vpass[vp][1]; }
@@ -1113,6 +1171,48 @@ surfaces:;
         free(g); free(pm); isurf_free(&S); ns++;
     }
     if (pf) { fprintf(stderr, "ink-ext: prefetcher: %lld CT chunks fetched ahead (%d threads)%s\n", (long long)atomic_load(&pf->nf), pf->nt, atomic_load(&pf->nfail) ? ", some failed (read again by the renderer)" : ""); pf_close(pf); }
+    if (slist) {   /* the union of the surfaces' chunks, one box per 1024^3 shard */
+        if (rc || !sh_n) { fprintf(stderr, "ink-ext: --shell-list: no chunks (%d surfaces)\n", ns); free(sh_keys); return 1; }
+        qsort(sh_keys, sh_n, sizeof *sh_keys, i64cmp); size_t u = 0; for (size_t i = 0; i < sh_n; i++) if (!u || sh_keys[i] != sh_keys[u - 1]) sh_keys[u++] = sh_keys[i];
+        const ctlev *L = &X.lev[sh_lev]; int64_t (*sb)[6] = nullptr; size_t nsb = 0;   /* per shard: chunk-index bbox lo[3], hi[3] */
+        if (u >= (1u << 22)) { fprintf(stderr, "ink-ext: --shell-list: %zu chunks > 2^22\n", u); free(sh_keys); return 1; }
+        int64_t *ord = malloc(u * sizeof *ord);   /* (shard key << 22 | chunk index), sorted: the chunks shard by shard */
+        const int64_t sgy = (L->shape[1] + 1023) / 1024 + 1, sgx = (L->shape[2] + 1023) / 1024 + 1;   /* (a compact shard index: ckey << 22 overflowed, 11-27) */
+        for (size_t i = 0; i < u; i++) { const int64_t k = sh_keys[i]; ord[i] = ((((k >> 42) >> 3) * sgy + (((k >> 21) & 0x1fffff) >> 3)) * sgx + ((k & 0x1fffff) >> 3)) << 22 | (int64_t)i; }
+        qsort(ord, u, sizeof *ord, i64cmp); sb = malloc(u * sizeof *sb); int64_t prev = -1;
+        for (size_t j = 0; j < u; j++) { const int64_t k = sh_keys[ord[j] & ((1 << 22) - 1)], c[3] = {k >> 42, (k >> 21) & 0x1fffff, k & 0x1fffff}, shk = ord[j] >> 22;
+            if (c[0] * CE >= L->shape[0] || c[1] * CE >= L->shape[1] || c[2] * CE >= L->shape[2]) continue;   /* (outside the array: read as zero) */
+            if (shk != prev) { for (int d = 0; d < 3; d++) { sb[nsb][d] = c[d]; sb[nsb][3 + d] = c[d]; } nsb++; prev = shk; continue; }
+            for (int d = 0; d < 3; d++) { if (c[d] < sb[nsb - 1][d]) sb[nsb - 1][d] = c[d]; if (c[d] > sb[nsb - 1][3 + d]) sb[nsb - 1][3 + d] = c[d]; } }
+        /* --shell-prev OLD (a shell grown run by run): OLD's boxes (chunk units here) are merged in shard by shard; a shard whose box grows
+           is named in SLIST.redo ("sz sy sx"): its written shard file must go before latvol --resume 1 rewrites it with the larger box */
+        const char *sprev = iopt(argc, argv, "--shell-prev", nullptr); FILE *redo = nullptr; size_t nredo = 0;
+        if (sprev) { FILE *pf2 = fopen(sprev, "r"); char ln[512], rp[1400]; snprintf(rp, sizeof rp, "%s.redo", slist); redo = fopen(rp, "w");
+            if (!pf2 || !redo) { fprintf(stderr, "ink-ext: --shell-prev %s / %s: cannot open\n", sprev, rp); return 1; }
+            while (fgets(ln, sizeof ln, pf2)) { long long v[6]; int pl, psh;
+                if (ln[0] == '#') { if (sscanf(ln, "# level %d shard %d", &pl, &psh) == 2 && (pl != sh_lev || psh != 1024)) { fprintf(stderr, "ink-ext: --shell-prev %s: level %d shard %d, this list level %d shard 1024\n", sprev, pl, psh, sh_lev); return 1; } continue; }
+                if (sscanf(ln, "%lld %lld %lld %lld %lld %lld", v, v + 1, v + 2, v + 3, v + 4, v + 5) != 6) continue;
+                int64_t lo[3], hi[3]; for (int d = 0; d < 3; d++) { lo[d] = v[d] / CE; hi[d] = (v[d] + v[3 + d]) / CE - 1; }
+                size_t b = 0; while (b < nsb && !(sb[b][0] >> 3 == lo[0] >> 3 && sb[b][1] >> 3 == lo[1] >> 3 && sb[b][2] >> 3 == lo[2] >> 3)) b++;
+                if (b == nsb) { sb = realloc(sb, (nsb + 1) * sizeof *sb); for (int d = 0; d < 3; d++) { sb[b][d] = lo[d]; sb[b][3 + d] = hi[d]; } nsb++; continue; }
+                int grew = 0; for (int d = 0; d < 3; d++) { if (sb[b][d] < lo[d]) grew = 1; if (sb[b][3 + d] > hi[d]) grew = 1; if (lo[d] < sb[b][d]) sb[b][d] = lo[d]; if (hi[d] > sb[b][3 + d]) sb[b][3 + d] = hi[d]; }
+                if (grew) { fprintf(redo, "%lld %lld %lld\n", (long long)(lo[0] >> 3), (long long)(lo[1] >> 3), (long long)(lo[2] >> 3)); nredo++; } }
+            fclose(pf2); if (fclose(redo)) { fprintf(stderr, "ink-ext: cannot write %s\n", rp); return 1; }
+            fprintf(stderr, "ink-ext: --shell-prev %s: %zu shards to rewrite (%s)\n", sprev, nredo, rp); }
+        FILE *f = fopen(slist, "w"); double vox = 0;
+        if (!f) { fprintf(stderr, "ink-ext: cannot write %s\n", slist); return 1; }
+        fprintf(f, "# level %d shard 1024 (ink-ext --shell-list: %zu chunks of 128^3 under %d surfaces, %s %s)\n", sh_lev, u, ns, argv[ci + 1], argv[ci + 2]);
+        for (size_t b = 0; b < nsb; b++) { int64_t o[3], n[3]; for (int d = 0; d < 3; d++) { o[d] = sb[b][d] * CE; n[d] = (sb[b][3 + d] + 1) * CE - o[d]; }
+            vox += (double)n[0] * n[1] * n[2]; fprintf(f, "%lld %lld %lld %lld %lld %lld\n", (long long)o[0], (long long)o[1], (long long)o[2], (long long)n[0], (long long)n[1], (long long)n[2]); }
+        if (fclose(f)) { fprintf(stderr, "ink-ext: cannot write %s\n", slist); return 1; }
+        fprintf(stderr, "ink-ext: --shell-list %s: level %d, %zu chunks (%.1f Gvox) in %zu shard boxes (%.1f Gvox to encode)\n", slist, sh_lev, u, u * (double)CE * CE * CE / 1e9, nsb, vox / 1e9);
+        free(sh_keys); free(ord); free(sb); return 0;
+    }
+    for (int l = 0; l < X.nlev; l++) if (X.lev[l].zs) {   /* --ct-shell: where the chunks came from */
+        const long long a = atomic_load(&X.lev[l].nshell), b = atomic_load(&X.lev[l].nmain);
+        fprintf(stderr, "ink-ext: CT level %d: %lld chunks decoded from the shell, %lld from the main store\n", l, a, b);
+        if (b) fprintf(stderr, "DEFAULTED: ink-ext: %lld of %lld level-%d CT chunks outside the shell %s: read from the main store %s\n", b, a + b, l, shroot, argv[ci + 1]);
+    }
     if (!ns && !rc) fprintf(stderr, "ink-ext: no --surface given\n");
     return rc;
 }

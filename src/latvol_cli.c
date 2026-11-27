@@ -247,6 +247,8 @@ int cmd_latvol(int argc, char **argv) {
         FILE *bf = fopen(opt(argc, argv, "--boxes", ""), "r"); char ln[512]; if (!bf) { fprintf(stderr, "latvol: cannot read --boxes %s\n", opt(argc, argv, "--boxes", "")); return 2; }
         while (nbox < MAXBOX && fgets(ln, sizeof ln, bf)) { for (char *c = ln; *c; c++) if (*c == ',' || *c == '\t') *c = ' ';
             if (sscanf(ln, "%lld %lld %lld %lld %lld %lld", bx[nbox], bx[nbox] + 1, bx[nbox] + 2, bx[nbox] + 3, bx[nbox] + 4, bx[nbox] + 5) == 6) nbox++; }
+        long long more[6]; while (nbox == MAXBOX && fgets(ln, sizeof ln, bf)) { for (char *c = ln; *c; c++) if (*c == ',' || *c == '\t') *c = ' ';   /* (11-27: the rest was dropped silently) */
+            if (sscanf(ln, "%lld %lld %lld %lld %lld %lld", more, more + 1, more + 2, more + 3, more + 4, more + 5) == 6) { fprintf(stderr, "latvol: --boxes: more than %d boxes in %s (merge them per shard: ink-ext --shell-list)\n", MAXBOX, opt(argc, argv, "--boxes", "")); fclose(bf); return 2; } }
         fclose(bf); if (!nbox) { fprintf(stderr, "latvol: --boxes: no box read\n"); return 2; }
     }
     const int v2 = opt_atoi("--zarr2", opt(argc, argv, "--zarr2", "0")), shard_opt = opt_atoi("--shard", opt(argc, argv, "--shard", "1024")); const double vq = opt_atof("--volcomp", opt(argc, argv, "--volcomp", "-1"));

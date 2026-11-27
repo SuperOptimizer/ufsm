@@ -289,6 +289,7 @@ test_ink_ext_surfum                            |              |     2 | python3 
 test_ink_devcrops                              |              |     2 | python3 tests/test_ink_devcrops.py
 test_ink_fuse                                  |              |     2 | python3 tests/test_ink_fuse.py
 test_ink_band                                  |              |     2 | python3 tests/test_ink_band.py
+test_ink_shell                                 |              |     5 | python3 tests/test_ink_shell.py
 test_ink_strat                                 |              |     2 | python3 tests/test_ink_strat.py
 test_ink_runs                                  |              |     2 | python3 tests/test_ink_runs.py
 test_dvprobe                                   |              |     3 | ./$B/test_dvprobe
