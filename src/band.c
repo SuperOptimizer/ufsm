@@ -281,7 +281,7 @@ int band_field_side_pair(const uint8_t *codes, const int n[3], float rmax, int m
     return rc ? -1 : 0;
 }
 
-static int near2(const uint8_t *c0, int32_t f0, const uint8_t *c1, int32_t f1, long z, long y, long x, const int n0[3], const int n1[3], const int off[3],
+static int near2(const uint8_t *c0, int32_t f0, const uint8_t *c1, int32_t f1, long z, long y, long x, const int n0[3], const int n1[3], const int off[3], int ls,
                  float *d, float v[3], int *code) {   /* (nn_band.cu bg_near2, the same expressions) */
     *d = BINF;
     if (f0 >= 0) {
@@ -290,17 +290,17 @@ static int near2(const uint8_t *c0, int32_t f0, const uint8_t *c1, int32_t f1, l
     }
     if (f1 >= 0) {
         const long s1 = (long)n1[1] * n1[2], gz = f1 / s1, gy = (f1 / n1[2]) % n1[1], gx = f1 % n1[2];
-        const long lz = 2 * gz - off[0], ly = 2 * gy - off[1], lx = 2 * gx - off[2];
-        if (lz < 0 || ly < 0 || lx < 0 || lz + 1 >= n0[0] || ly + 1 >= n0[1] || lx + 1 >= n0[2]) {
-            const float wz = (float)(lz - z) + 0.5f, wy = (float)(ly - y) + 0.5f, wx = (float)(lx - x) + 0.5f, e = wz * wz + wy * wy + wx * wx;
+        const long k = 1L << ls, lz = k * gz - off[0], ly = k * gy - off[1], lx = k * gx - off[2]; const float hc = 0.5f * (float)(k - 1);   /* (the cell's first voxel; its centre) */
+        if (lz < 0 || ly < 0 || lx < 0 || lz + k - 1 >= n0[0] || ly + k - 1 >= n0[1] || lx + k - 1 >= n0[2]) {
+            const float wz = (float)(lz - z) + hc, wy = (float)(ly - y) + hc, wx = (float)(lx - x) + hc, e = wz * wz + wy * wy + wx * wx;
             if (e < *d) { *d = e; v[0] = wz; v[1] = wy; v[2] = wx; *code = c1[f1]; }
         }
     }
     return *d < BINF;
 }
-int band_field_phase_pair2(const uint8_t *codes0, const int n0[3], const uint8_t *codes1, const int n1[3], const int off[3], float rmax, uint8_t *phase) {
+int band_field_phase_pair2(const uint8_t *codes0, const int n0[3], const uint8_t *codes1, const int n1[3], const int off[3], int ls, float rmax, uint8_t *phase) {
     const size_t N0 = (size_t)n0[0] * n0[1] * n0[2], N1 = (size_t)n1[0] * n1[1] * n1[2];
-    if (off[0] < 0 || off[1] < 0 || off[2] < 0) return -1;
+    if (off[0] < 0 || off[1] < 0 || off[2] < 0 || ls < 1 || ls > 3) return -1;
     uint8_t *sd = malloc(N0 > N1 ? N0 : N1); int32_t *ie = malloc(N0 * 4), *io = malloc(N0 * 4), *je = malloc(N1 * 4), *jo = malloc(N1 * 4);
     int rc = !sd || !ie || !io || !je || !jo;
     for (int lv = 0; lv < 2 && !rc; lv++) for (int par = 0; par < 2 && !rc; par++) {
@@ -315,10 +315,10 @@ int band_field_phase_pair2(const uint8_t *codes0, const int n0[3], const uint8_t
             const int c = codes0[i];
             if (c > 0 && c < 255) { phase[i] = 0; continue; }
             const long z = (long)(i / ((size_t)n0[1] * n0[2])), y = (long)((i / n0[2]) % n0[1]), x = (long)(i % n0[2]);
-            const size_t p = ((size_t)((z + off[0]) >> 1) * n1[1] + (size_t)((y + off[1]) >> 1)) * n1[2] + (size_t)((x + off[2]) >> 1);
+            const size_t p = ((size_t)((z + off[0]) >> ls) * n1[1] + (size_t)((y + off[1]) >> ls)) * n1[2] + (size_t)((x + off[2]) >> ls);
             float de, dd, a[3], b[3]; int ca, cb;
-            if (!near2(codes0, ie[i], codes1, je[p], z, y, x, n0, n1, off, &de, a, &ca)) continue;
-            if (!near2(codes0, io[i], codes1, jo[p], z, y, x, n0, n1, off, &dd, b, &cb)) continue;
+            if (!near2(codes0, ie[i], codes1, je[p], z, y, x, n0, n1, off, ls, &de, a, &ca)) continue;
+            if (!near2(codes0, io[i], codes1, jo[p], z, y, x, n0, n1, off, ls, &dd, b, &cb)) continue;
             if (de > r2 || dd > r2) continue;
             const int ka = (ca - 1) / BAND_STEPS, kb = (cb - 1) / BAND_STEPS;
             int dk = ((kb - ka) % 14 + 14) % 14; if (dk > 7) dk -= 14;

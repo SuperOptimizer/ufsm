@@ -29,6 +29,82 @@ Originally no teacher models; since 2026-11-15 published ink networks run as tea
   - Their PTX differs from the pin in 117 of the 132 units (every lp_*, most nn_*).
   - 285d308 itself has been in the pin since before 01873d0 (an ancestor). Only the note asking for its review is outside.
 
+## w24 eval at step 2000, phase-near, and the w11 (1.1 um) prep (2026-11-27, branches phasenear-20261127 / w11prep-20261127, unrollperf)
+
+**wb24, step 2000** (w24 at DLV -2, native 2.4 um input, vs try9 at DLV 0; the same pinned fitter; 20 boxes clean for both):
+
+| set | ids Δ (w24 - try9) | 95 % CI |
+|---|---|---|
+| packed (C19 C21 C22 C24) | -0.122 | [-0.158, -0.086] |
+| controls (16) | -0.168 | [-0.255, -0.089] |
+
+All 4 packed boxes are negative. The worst controls are C10 -0.65, C12 -0.47 and C2 -0.32.
+
+**Context ladder** (snap 2000, C10 C12 C2 C19). Larger inference windows do not help:
+
+| box | WIN 640 | 768 | 896 |
+|---|---|---|---|
+| C10 | 0.294 | 0.288 | 0.254 |
+| C12 | 0.525 | 0.530 | 0.531 |
+| C2 | 0.605 | 0.589 | 0.576 |
+| C19 | 0.599 | 0.613 | 0.590 |
+
+- The halos were 128 / 192 / 256: `--fit-zarr` needs a stride of k x 512, and `--lat 4` needs WIN % 128 = 0.
+- WIN 1024 runs out of memory at DLV -2: the fused fit kernel holds the whole window's fp32 logits (vramperf).
+
+**ufsm phase-near.** It measures sheet position at native resolution, with no fitter:
+- a prediction's phase-0 voxels (an integer wrap between 6-neighbours) against the GT sheets (phase 0 of a sources file's level-0 phase);
+- both directions: pred → GT counts misplaced or extra sheets; GT → pred counts misplaced or missed ones;
+- fields of any level are upsampled.
+
+test_phase_near recovers known offsets of tilted planes within 0.5 voxel, at h 1 and at 4x coarser fields. Distances are voxel-quantised (±0.5 voxel).
+
+Centre 512^3 of the four boxes, um, p50:
+
+| box | pred → GT, w24 / try9 | GT → pred, w24 / try9 | pred sheet voxels, w24 / try9 |
+|---|---|---|---|
+| C19 | 11.3 / 6.8 | 12.2 / 12.0 | 265k / 221k |
+| C10 | 28.1 / 9.6 | 13.1 / 16.8 | 1.25M / 311k |
+| C12 | 37.9 / 12.0 | 15.4 / 19.8 | 949k / 229k |
+| C2 | 17.6 / 14.6 | 19.3 / 19.8 | 1.33M / 1.31M |
+
+- w24 lies slightly nearer the GT sheets, but it adds 3-4x extra wraps on C10 / C12.
+- The extra wraps are confident: at conf > 0.6, C10 pred → GT is 19.8 um vs 4.8 for try9.
+- w24's confidence is lower overall: C19 has no wraps above 0.6 (try9: 35k).
+
+**Two-level pair rule, generalised.** `"pair_coarse": L` (1..3) takes the codes L levels coarser:
+- L = 1 is the 2.4 um rule (w24, its dcache key unchanged);
+- L = 2 keeps a 384 um reach at 1.1 um in a 3 GB slot (rmax 340; the coarse tile at L 1 would be ~2 GB more);
+- test_band_pair checks L 1 and 2 against the level-0 rule.
+
+**phase-cmp --map REG.** A is on the map's fine scan; B is sampled at A's voxel centres (rmap_f2c, nearest).
+- A missing math.h made floor / ceil / llround implicit, so every mapped box collapsed to 0,0,0 ("known B 0.0000"). mcc gave no diagnostic; test_implicit_decl covers it since d9237c4c.
+- UFSM_PCMP_DUMP writes the first box's phases.
+
+**w11 prep** (native 1.129 um winding; not launched, init open):
+- Inventory:
+
+| | Paris 4 (20260608103018) | 1667 (20260323082859) |
+|---|---|---|
+| level 0 on the NAS | 59969 x 36006 x 32354 | 42209 x 22122 x 20276 |
+| footprint in the 2.4 frame (z) | 28079-56357 | 12504-32410 |
+| GT 512^3 tiles inside, with 1.1 CT | 36256 of 152245 (23.8 %) | 9149 of 18799 (48.7 %) |
+
+- Holdouts: 64 holdout-w24 boxes mapped into the 1.129 frames (affine, + 32).
+- `sources-w11.json` (/vesuvius/ufsm/unrollperf/w11, mksrc11.py) uses the w24 GT meshes through the published 2.4 → 1.129 reg.json, rmax 340, pair_coarse 2, pair_h0 12.
+- Mapped 1.1 labels vs the 2.4 labels (phase-cmp --map, 12 x 256^3):
+
+| source | lost | within 2 codes | within 6 codes |
+|---|---|---|---|
+| Paris 4 June | 1.3 % | 0.83 | 0.993 |
+| Paris 4 July | 1.0 % | 0.89 | 0.998 |
+| 1667 | 1.9 % | 0.94 | 0.995 |
+
+  6 codes is ~3 um at 150 um spacing: the ~1 um reg error plus the 2.4 grid's nearest sampling.
+- Hand check on a 1667 box: CT 63 on both label sets' sheets vs 40 in the gaps; z-shift profiles are identical, so the two frames have no offset.
+- Memory: P 640 plans (7.74 of 7.83 GB); P 768 does not fit.
+- CPU sampler-only: 1 window in 93 s.
+
 ## Two-level pair rule for the 2.4 um labels (option 3) and the w24 trainer memory fixes (2026-11-27, branch opt3-20261127, unrollperf)
 
 **Pair rule.** At rmax 160 the level-0 rule needs a 162-voxel halo: a 3072 MB tile (edge 588) keeps only a 264^3 interior.
