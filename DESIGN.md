@@ -169,6 +169,10 @@ box bootstrap 95 % CI:
   touching sheets, which is the information the nets' fields lack in packed regions (pseudolab 11-18). With today's fields a
   minimum-spacing arc would place sheets by the constraint, not by the evidence.
 - Scripts and rows: /vesuvius/ufsm/globwind (arm.sh, h1.sh, h2.sh, res/*.tsv, gpuchk.sh).
+- **wbench REFSNAP=1** (lead, same day; branch wbsnap-20261127): box rows scored the way the unroll fits. count-field (L2, CPU,
+  `--model-only 1`, CFX for extra flags) on the box's fields, then fit `--ref-model --ref-snap 1`; boxes only, its own fitter config
+  tag. Needs U = a build with count-field (the pinned b29b1bda predates it), and the plain arm scored with the same U. Smoke: C19
+  bl-t9 0.7617, the same as arm bl-t9.snap.
 
 ## try9 + w24 at fit time: a phase mean helps the packed boxes; train --cond-fields for a try9-conditioned 2.4 um net (2026-11-27, branch condnet-20261127, condnet)
 

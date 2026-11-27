@@ -74,6 +74,10 @@ at peak LR that is only a ~1k-step average.
 - There are no ceiling fits: the clean set uses wind96's ceilings.
 - Fields are kept in `$WB/fields/TAG`, and a rerun skips everything that already has rows.
 
+**REFSNAP=1** scores the boxes the way the unroll fits them: the box's own count-field ref (L2), then `fit --ref-snap 1`.
+Use it with U = a current master build, and score the plain arm with the same U (the pinned build has no count-field).
+`CFX` adds count-field flags. try9 gains +0.040 ids on 20 boxes against the plain fit (DESIGN "Global winding assignment").
+
 Env: `REF` (wind96), `BOXES`, `SITES` ("" = boxes only, ~10 min), `FL` (box lanes), `UP` (predict binary, default
 `$WB/bin/ufsm-gate`), `U` (fitter pin).
 
