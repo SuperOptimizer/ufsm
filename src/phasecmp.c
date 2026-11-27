@@ -31,6 +31,7 @@ int cmd_phase_cmp(int argc, char **argv) {
     if (A->n != B->n) { fprintf(stderr, "phase-cmp: %d vs %d sources\n", A->n, B->n); return 1; }
     if (phase_onfly_config(gpu, opt_atoi("--slots", opt(argc, argv, "--slots", "2")), opt_atoi("--mb", opt(argc, argv, "--mb", "1024")), 0)) { fprintf(stderr, "phase-cmp: --gpu %d: no GPU pair rule\n", gpu); return 1; }
     mesh_codes_gpu_config(gpu);
+    setvbuf(stdout, nullptr, _IOLBF, 0);   /* (a line per source as it finishes) */
     const size_t N = (size_t)P * P * P; uint8_t *a = malloc(N), *b = malloc(N);
     if (!a || !b) return 1;
     int rc = 0;
