@@ -34,6 +34,8 @@ test_lat_head~FP8                              | gpu          |        4 | TLH_F
 test_inksurf                                   | gpu          |        7 | UFSM_TEST_QUICK=1 ./$B/test_inksurf
 test_inksurf~full                              | gpu,slow     |       15 | ./$B/test_inksurf
 test_pgrad                                     | gpu          |     1 | ./$B/test_pgrad
+test_topo                                      | gpu          |     2 | ./$B/test_topo
+test_topo_train                                | gpu          |    40 | ./$B/test_topo_train ./$B/ufsm ./$B/make_wind_fixture
 test_gyrec                                     | gpu          |     1 | ./$B/test_gyrec
 test_unwrap2_sampler                           | gpu          |     9 | ./$B/test_unwrap2_sampler $TMPDIR/unwrap2_fixture
 test_phase_pool                                |              |     3 | UFSM_PHASE_POOL_SLAB=90000 ./$B/test_phase_pool $TMPDIR/phase_pool
@@ -133,6 +135,7 @@ test_surf                                      | smoke        |     3 | ./$B/tes
 test_wraps_core                                | smoke        |     1 | ./$B/test_wraps_core
 test_stitch                                    |              |     3 | ./$B/test_stitch
 test_fblend                                    |              |     1 | ./$B/test_fblend
+test_sample_cond                               |              |     1 | ./$B/test_sample_cond
 test_fields_pack                               |              |     2 | ./$B/test_fields_pack
 test_fields_phase                              | smoke        |     2 | ./$B/test_fields_phase
 test_ink_gate                                  |              |     2 | ./$B/test_ink_gate
@@ -157,6 +160,7 @@ test_score_par                                 |              |     8 | ./$B/tes
 test_grid_sparse                               | gpu,smoke    |     2 | ./$B/test_grid_sparse
 test_density_lambda                            | gpu          |    40 | ./$B/test_density_lambda ./$B/ufsm ./$B/make_wind_fixture
 test_coreline                                  | smoke        |     2 | ./$B/test_coreline
+test_umbfind                                   |              |     5 | ./$B/test_umbfind
 test_fit_w4                                    | gpu          |    16 | ./$B/test_fit_w4
 test_repair                                    |              |    90 | UFSM_TEST_QUICK=1 ./$B/test_repair
 test_repair~full                               | slow         |   475 | ./$B/test_repair
@@ -255,6 +259,7 @@ test_chunk_map                                 | smoke        |     2 | ./$B/tes
 test_wrapxsec                                  | smoke        |     2 | ./$B/test_wrapxsec
 test_wraprays                                  | smoke        |     2 | ./$B/test_wraprays
 test_ink_blend_block                           |              |     5 | ./$B/test_ink_blend_block
+test_ink_proto                                 | gpu          |     3 | ./$B/test_ink_proto
 test_tile_list                                 |              |     1 | ./$B/test_tile_list
 test_http_reader                               |              |    29 | python3 tests/test_http_reader.py
 test_checkpoint_runtime                        | smoke        |     1 | ./$B/test_checkpoint_runtime
@@ -280,6 +285,8 @@ test_ink_teach_up                              |              |     2 | python3 
 test_ink_ext_surfum                            |              |     2 | python3 tests/test_ink_ext_surfum.py
 test_ink_devcrops                              |              |     2 | python3 tests/test_ink_devcrops.py
 test_ink_fuse                                  |              |     2 | python3 tests/test_ink_fuse.py
+test_ink_band                                  |              |     2 | python3 tests/test_ink_band.py
+test_ink_strat                                 |              |     2 | python3 tests/test_ink_strat.py
 test_ink_runs                                  |              |     2 | python3 tests/test_ink_runs.py
 test_dvprobe                                   |              |     3 | ./$B/test_dvprobe
 test_ink_place                                 |              |     2 | python3 tests/test_ink_place.py
@@ -396,6 +403,7 @@ test_split~gn_stored,policy                    | gpu          |    47 | UFSM_TES
 test_split_lat                                 | gpu2,l2      |    20 | ./$B/test_split_lat
 test_split_lat~gnema                           | gpu          |    15 | UFSM_TEST_GN_EMA=1 UFSM_ONLY_NET=1 ./$B/test_split_lat
 test_split_lat~gfilm                           | gpu          |    15 | UFSM_TEST_GFILM=1 UFSM_ONLY_NET=1 ./$B/test_split_lat
+test_cond_net                                  | gpu          |     8 | ./$B/test_cond_net
 test_split_gnbwd                               | gpu,smoke    |     2 | ./$B/test_split_gnbwd
 test_formats                                   | smoke        |     1 | ./tests/test_formats.sh
 test_pyramid_rel                               |              |     1 | ./$B/test_pyramid_rel $TMPDIR/pyramid_rel
@@ -472,3 +480,4 @@ test_wbench_gpulock                            |              |     1 | tests/te
 test_wbench_fail                               |              |     2 | tests/test_wbench_fail.sh
 test_occ_cache                                 |              |     1 | ./$B/test_occ_cache $TMPDIR
 test_relaunch_argv                             |              |     2 | tests/test_relaunch_argv.sh $TMPDIR
+test_phase_near                                |              |     1 | ./$B/test_phase_near

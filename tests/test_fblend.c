@@ -269,11 +269,81 @@ static void test_paste(void) {
     char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf %s", tmp); if (system(cmd)) {}
 }
 
+/* --plane-w (field fusion, 2026-11-27): A (9.6 um, h 2, w4_d 16) and F, a 2.4 um h 8 set on the same cells (w4_d 64: the same 153.6 um).
+   phase=0,1: pc ps are F's alone (fb_phase of F), every other plane A's alone; w4=0,1: the winding planes F's, w4_d 16 in A's voxels;
+   F with w4_d 60 (another offset) in a plain blend is left out of w4 (A's alone); w4 only from a set whose offset is not whole in A's
+   voxels (w4_d 30 x 2.4 = 7.5 x 9.6) is refused. */
+static void fuse_one(const char *ra, const char *rf, const char *out, int g, int expect_from_f, const char *what) {
+    static fb_opts op; memset(&op, 0, sizeof op); op.pw_on[g] = 1; op.pw[g][0] = expect_from_f ? 0 : 1; op.pw[g][1] = expect_from_f ? 1 : 0;
+    const float wt[2] = {1, 0};   /* the other groups: A alone */
+    const char *in[2] = {ra, rf}; CHECK(fblend_run2(out, 2, in, wt, &op, 2) == 0, "fuse %s", what);
+}
+static void test_fuse(void) {
+    char tmp[] = "/tmp/test_fblend_fuse_XXXXXX"; if (!mkdtemp(tmp)) { CHECK(0, "mkdtemp"); return; }
+    char ra[256], zb[256], rf[256], rg[256], rh[256], o1[256], o2[256], o3[256], o4[256];
+    snprintf(ra, sizeof ra, "%s/a", tmp); snprintf(zb, sizeof zb, "%s/b", tmp); snprintf(rf, sizeof rf, "%s/f", tmp); snprintf(rg, sizeof rg, "%s/g", tmp);
+    snprintf(rh, sizeof rh, "%s/h", tmp); snprintf(o1, sizeof o1, "%s/o1", tmp); snprintf(o2, sizeof o2, "%s/o2", tmp); snprintf(o3, sizeof o3, "%s/o3", tmp);
+    snprintf(o4, sizeof o4, "%s/o4", tmp);
+    mkfields(ra, zb);
+    const long long forg[3] = {400, 800, 1200}; const int sh[3] = {D, H, W}; const int na = D * 8 + 1;
+    float cy[D * 8 + 1], cx[D * 8 + 1]; for (int z = 0; z < na; z++) { cy[z] = 14; cx[z] = -9; }
+    uint8_t *b14[14]; for (int k = 0; k < 14; k++) b14[k] = B[k];
+    CHECK(fit_fields_save_ex(rf, forg, sh, 8, 2.4, b14, 64, B[14], cy, cx, na) == 0, "save F");
+    CHECK(fit_fields_save_ex(rg, forg, sh, 8, 2.4, b14, 60, B[14], cy, cx, na) == 0, "save G");
+    CHECK(fit_fields_save_ex(rh, forg, sh, 8, 2.4, b14, 30, B[14], cy, cx, na) == 0, "save H");
+    const size_t n = D * H * W; const float w1[2] = {1, 1}; uint8_t e0[D * H * W], e1[D * H * W], e4[4][D * H * W];
+    fit_fields_buf g;
+    fuse_one(ra, rf, o1, FB_G_PHASE, 1, "phase from F");
+    { const uint8_t *pc[2] = {nullptr, B[0]}, *ps[2] = {nullptr, B[1]}; fb_phase(2, pc, ps, w1, n, e0, e1); }
+    { const uint8_t *const d[2][4] = {{A[10], A[11], A[12], A[13]}, {nullptr, nullptr, nullptr, nullptr}}; uint8_t *const o[4] = {e4[0], e4[1], e4[2], e4[3]}; fb_wind4(2, d, w1, n, o); }
+    CHECK(fit_fields_load(o1, 0, 0, 1, &g) == 0, "load fused");
+    { int bad = 0; for (size_t i = 0; i < n; i++) bad += g.a[0][i] != e0[i] || g.a[1][i] != e1[i]; CHECK(!bad, "fused phase: %d cells not F's", bad); }
+    for (int k = 2; k < 10; k++) { int bad = 0; for (size_t i = 0; i < n; i++) bad += g.a[k][i] != A[k][i]; CHECK(!bad, "fused plane %d: %d cells not A's", k, bad); }
+    for (int k = 10; k < 14; k++) { int bad = 0; for (size_t i = 0; i < n; i++) bad += g.a[k][i] != e4[k - 10][i]; CHECK(!bad, "fused w4 plane %d: %d cells not A's", k, bad); }
+    { int bad = 0; for (size_t i = 0; i < n; i++) bad += g.a[14][i] != A[14][i]; CHECK(!bad, "fused recto: %d cells not A's", bad); }
+    CHECK(g.f.w4_d == 16 && fabs(g.um - 9.6) < 1e-9 && g.h == 2 && g.origin[0] == 100, "fused geometry of A (w4_d %d)", g.f.w4_d);
+    fit_fields_free(&g);
+    fuse_one(ra, rf, o2, FB_G_W4, 1, "w4 from F");
+    { const uint8_t *const d[2][4] = {{nullptr, nullptr, nullptr, nullptr}, {B[10], B[11], B[12], B[13]}}; uint8_t *const o[4] = {e4[0], e4[1], e4[2], e4[3]}; fb_wind4(2, d, w1, n, o); }
+    CHECK(fit_fields_load(o2, 0, 0, 1, &g) == 0, "load fused w4");
+    for (int k = 10; k < 14; k++) { int bad = 0; for (size_t i = 0; i < n; i++) bad += g.a[k][i] != e4[k - 10][i]; CHECK(!bad, "w4 from F, plane %d: %d cells differ", k, bad); }
+    CHECK(g.f.w4_d == 16, "w4 from F: w4_d %d in A's voxels (64 x 2.4 / 9.6 = 16)", g.f.w4_d);
+    fit_fields_free(&g);
+    { const char *in[2] = {ra, rg}; CHECK(fblend_run(o3, 2, in, nullptr, 2) == 0, "blend A + G");
+      const uint8_t *const d[2][4] = {{A[10], A[11], A[12], A[13]}, {nullptr, nullptr, nullptr, nullptr}}; uint8_t *const o[4] = {e4[0], e4[1], e4[2], e4[3]}; fb_wind4(2, d, w1, n, o);
+      CHECK(fit_fields_load(o3, 0, 0, 1, &g) == 0, "load A + G");
+      int bad = 0; for (int k = 10; k < 14; k++) for (size_t i = 0; i < n; i++) bad += g.a[k][i] != e4[k - 10][i]; CHECK(!bad, "another w4 offset left out: %d cells differ", bad);
+      fit_fields_free(&g); }
+    { static fb_opts op; memset(&op, 0, sizeof op); op.pw_on[FB_G_W4] = 1; op.pw[FB_G_W4][1] = 1; const char *in[2] = {ra, rh}; const float wt[2] = {1, 0};
+      CHECK(fblend_run2(o4, 2, in, wt, &op, 2) != 0, "w4 offset 7.5 voxels refused"); }
+    CHECK(fb_group_id("phase") == FB_G_PHASE && fb_group_id("w4") == FB_G_W4 && fb_group_id("x") == -1 && fb_plane_group("t3") == FB_G_NORMAL && fb_plane_group("ct") == -1, "group names");
+    char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf %s", tmp); if (system(cmd)) {}
+}
+
+/* --snap (fb_phase_snap): a = phase 0, confidence 0.8; sp 64 at h 2 = 16 native voxels a turn; R 2 voxels = 1/8 turn (0.785 rad).
+   b 0.5 rad off: a's sheet moves to b's place (b's direction, a's length); 1.0 rad off: a unchanged (b's sheet is not a's); no spacing,
+   no b phase, no a phase: a unchanged. */
+static void test_snap(void) {
+    const double r = 0.8 * 127, ang[5] = {0.5, 1.0, -0.5, 0.5, 0.5};
+    uint8_t pca[5], psa[5], pcb[5], psb[5], sp[5] = {64, 64, 64, 0, 64}, oc[5], os[5];
+    for (int j = 0; j < 5; j++) { pca[j] = (uint8_t)lrint(128 + r); psa[j] = 128; pcb[j] = (uint8_t)lrint(128 + 100 * cos(ang[j])); psb[j] = (uint8_t)lrint(128 + 100 * sin(ang[j])); }
+    pcb[4] = psb[4] = 128;   /* (no b phase) */
+    fb_phase_snap(pca, psa, pcb, psb, sp, 2, 2.0, 5, oc, os);
+    for (int j = 0; j < 5; j++) {
+        const double ph = atan2(os[j] - 128.0, oc[j] - 128.0), cf = hypot(os[j] - 128.0, oc[j] - 128.0) / 127;
+        const int moved = j == 0 || j == 2;
+        if (moved) CHECK(fabs(ph - atan2(psb[j] - 128.0, pcb[j] - 128.0)) < 0.01 && fabs(cf - 0.8) < 0.01, "snap %d: phase %g conf %g", j, ph, cf);
+        else CHECK(oc[j] == pca[j] && os[j] == psa[j], "snap %d: a unchanged (%d %d)", j, oc[j], os[j]);
+    }
+    uint8_t z0[1] = {128}; fb_phase_snap(z0, z0, pcb, psb, sp, 2, 2.0, 1, oc, os); CHECK(oc[0] == 128 && os[0] == 128, "snap: no a phase stays none");
+}
 int main(void) {
     test_cells();
     test_tiles();
     test_sets();
     test_paste();
+    test_fuse();
+    test_snap();
     if (fails) { fprintf(stderr, "test_fblend: %d FAILED\n", fails); return 1; }
     printf("test_fblend: ok\n");
     return 0;

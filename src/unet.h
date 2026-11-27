@@ -121,7 +121,11 @@ typedef struct {
                               L: the latent input's lat_c coefficients (cin - 3) as input_latc_k quantises them, or (lat_dec_raw) the cell's 64 voxels.
                               Params appended last (A [H][widths[0]], a [H], B [Cl][27][H], W2 [64 ng][H]; W2 0: the donor's function); header key
                               "lat_dec" only when on. The head slabs (unet_head_fwd_z / _bwd_z) run it; the backward's gy16 needs room for H more rows */
+    int cond_ch;           /* K > 0 (train --cond-fields, 2026-11-27): a latent-grid net (half_res 3 with the cell transform) reads K conditioning channels
+                              (another model's fit fields, nn_cond_mx) as a second 32-channel MX input block: cin = C + 3 + 32. The stem's new input columns
+                              start at zero (init-from's copy_conv_in), so the donor's function is unchanged. Header key "cond_ch" only when on */
 } unet_cfg;
+static inline int unet_cond_cin(const unet_cfg *c) { return c->cond_ch > 0 ? 32 : 0; }   /* the input channels of the conditioning block */
 /* the sub-cell head's layout (lat_guide 64): the channels with sub-cell rows, their first row (sbase + 64 k), -1 for a channel without */
 static inline int unet_lat_nsub(const unet_cfg *c) { return c->lat_guide != 64 ? 0 : c->lat_nsub ? c->lat_nsub : 2; }
 static inline int unet_lat_subch(const unet_cfg *c, int k) { return c->lat_nsub ? c->lat_sub[k] : k; }
@@ -438,6 +442,9 @@ int unet_logits_in_gx(const unet *u);   /* the logits share the head's input-gra
    holds each sample's radial record: the 4 MX input channels are built on the device (nn_input_rad). nullptr: x has all 4 channels */
 void unet_set_input_rad(unet *u, const void *rec);
 void unet_set_input_aux(unet *u, const void *aux);   /* --aux-input with --gpu-input: the fifth channel from these boxes (nn.h nn_input_rad_aux) */
+/* cfg.cond_ch: the device int8 conditioning planes [n][cond_ch][gd][gh][gw] (2^3 latent cells per coarse cell) the next forwards read
+   (nn_cond_mx after the cell channels; nullptr: the block is 0, e.g. a dropped window). Predict's 16-bit inputs carry them themselves (nn_cond_h16) */
+void unet_set_cond_input(unet *u, const void *cd, int gd, int gh, int gw);
 /* latent-grid nets (half_res 3) with the learned cell transform (latfit.h): bas [C][64], gain [C], the quantiser step (0: none); cfg.cin = C + 3.
    Saved in the checkpoint header and set again by unet_load. unet_lat_basis: C (0: plain cell means) and the device copies. */
 void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, float step);

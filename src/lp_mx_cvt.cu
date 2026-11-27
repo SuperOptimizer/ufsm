@@ -237,7 +237,7 @@ __global__ void input_lat_k(const TI *ct, const uint8_t *recs, size_t rec_bytes,
    latfit.h: row 0 the mean direction), quantised to step (0: not quantised; |q| <= 127, the mean 32767: what a latent store keeps),
    times gain[c]; then the 3 radial cell means. C + 3 channels in one MX row (16 or 32 wide) */
 template <int B, typename TI>
-__global__ void input_latc_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, uint8_t *y) {
+__global__ void input_latc_k(const TI *ct, const uint8_t *recs, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, uint8_t *y, int Ct) {
     const size_t cv = (size_t)d * p * p, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= (size_t)N * cv) return;
     const int n = (int)(i / cv); const size_t v = i % cv;
@@ -258,7 +258,56 @@ __global__ void input_latc_k(const TI *ct, const uint8_t *recs, size_t rec_bytes
         r[c] = rnd16<TI>(s * gain[c]);
     }
     for (int c = 0; c < 3; c++) r[C + c] = rnd16<TI>(acc[c] * (1.f / 64.f));
-    mx_store_row_b<B>(y, mx_sc<B>(y, N, C + 3, cv), i, mx_bw(C + 3), r);
+    /* Ct > C + 3 (unet_cfg.cond_ch): the first 32-channel block of a 64-channel input; cond_mx_k writes the second */
+    mx_store_row_b<B>(y, mx_sc<B>(y, N, Ct, cv), Ct == C + 3 ? i : (size_t)n * mx_nb(Ct) * cv + v, mx_bw(C + 3), r);
+}
+/* train --cond-fields (unet_cfg.cond_ch): the second 32-channel MX block of a 64-channel latent input: channel k < K is the int8 conditioning
+   plane k (v / 127) of the coarse grid cd [N][K][gd][gh][gw] (2 x 2 x 2 latent cells per coarse cell) upsampled trilinearly (cell centres,
+   clamped at the faces) and rounded to fp16 like every input value (cond_h16_k: the same values in a 16-bit window, predict's path); the
+   other channels 0; cd nullptr: the whole block 0 (no conditioning: a dropped window) */
+__device__ __forceinline__ float cond_val(const int8_t *cd, int K, int k, int gd, int gh, int gw, int n, int z, int yy, int xx) {
+    const float cz = (z + 0.5f) * 0.5f - 0.5f, cy = (yy + 0.5f) * 0.5f - 0.5f, cx = (xx + 0.5f) * 0.5f - 0.5f;
+    const int z0 = (int)floorf(cz), y0 = (int)floorf(cy), x0 = (int)floorf(cx);
+    const float fz = cz - z0, fy = cy - y0, fx = cx - x0;
+    const int8_t *pl = cd + ((size_t)n * K + k) * gd * gh * gw;
+    float s = 0.f;
+    for (int a = 0; a < 8; a++) {
+        int iz = z0 + (a >> 2), iy = y0 + ((a >> 1) & 1), ix = x0 + (a & 1);
+        iz = iz < 0 ? 0 : iz >= gd ? gd - 1 : iz; iy = iy < 0 ? 0 : iy >= gh ? gh - 1 : iy; ix = ix < 0 ? 0 : ix >= gw ? gw - 1 : ix;
+        const float w = ((a >> 2) ? fz : 1.f - fz) * (((a >> 1) & 1) ? fy : 1.f - fy) * ((a & 1) ? fx : 1.f - fx);
+        s = __fmaf_rn(w, (float)pl[((size_t)iz * gh + iy) * gw + ix], s);
+    }
+    return __half2float(__float2half_rn(__fmul_rn(s, 1.f / 127.f)));
+}
+template <int B>
+__global__ void cond_mx_k(const int8_t *cd, int N, int K, int d, int h, int w, int gd, int gh, int gw, uint8_t *y, int Ct) {
+    const size_t cv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * cv) return;
+    const int n = (int)(i / cv); const size_t v = i % cv;
+    const int z = (int)(v / ((size_t)h * w)), yy = (int)((v / w) % h), xx = (int)(v % w);
+    float r[32];
+#pragma unroll
+    for (int k = 0; k < 32; k++) r[k] = 0.f;
+    if (cd) for (int k = 0; k < K; k++) r[k] = cond_val(cd, K, k, gd, gh, gw, n, z, yy, xx);
+    mx_store_row_b<B>(y, mx_sc<B>(y, N, Ct, cv), ((size_t)n * mx_nb(Ct) + 1) * cv + v, 32, r);
+}
+__global__ void cond_h16_k(const int8_t *cd, int N, int K, int d, int h, int w, int gd, int gh, int gw, __half *y, int Ct) {
+    const size_t cv = (size_t)d * h * w, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * 32 * cv) return;
+    const size_t v = i % cv; const int k = (int)(i / cv % 32), n = (int)(i / (cv * 32));
+    const int z = (int)(v / ((size_t)h * w)), yy = (int)((v / w) % h), xx = (int)(v % w);
+    y[((size_t)n * Ct + 32 + k) * cv + v] = __float2half_rn(cd && k < K ? cond_val(cd, K, k, gd, gh, gw, n, z, yy, xx) : 0.f);
+}
+extern "C" void lp_cond_mx(const void *cd, int N, int K, int d, int h, int w, int gd, int gh, int gw, void *y, int Ct, int bits) {
+    const size_t n = (size_t)N * d * h * w;
+    if (bits == 4) cond_mx_k<4><<<nblk_(n, 128), 128>>>((const int8_t *)cd, N, K, d, h, w, gd, gh, gw, (uint8_t *)y, Ct);
+    else cond_mx_k<8><<<nblk_(n, 128), 128>>>((const int8_t *)cd, N, K, d, h, w, gd, gh, gw, (uint8_t *)y, Ct);
+    LPCK();
+}
+extern "C" void lp_cond_h16(const void *cd, int N, int K, int d, int h, int w, int gd, int gh, int gw, void *y, int Ct) {
+    const size_t n = (size_t)N * 32 * d * h * w;
+    cond_h16_k<<<nblk_(n, 256), 256>>>((const int8_t *)cd, N, K, d, h, w, gd, gh, gw, (__half *)y, Ct);
+    LPCK();
 }
 /* train --lat-direct-p: input_latc_k's row for the cells [cz0, cz0 + ncz) of window n with its C coefficient channels from stored latvol
    cells (int8 [ncz][p][p][stride]: bytes 0-1 the mean index, then the axes; nn_latvol_decode's layout) instead of the quantised transform of
@@ -358,14 +407,17 @@ extern "C" void lp_input_rad_pack(const void *ct16, int dt, const void *rec, siz
 #undef IRP
     LPCK();
 }
-extern "C" void lp_input_latc(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, void *y, int bits) {
+extern "C" void lp_input_latc_ct(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, void *y, int bits, int Ct) {
     const size_t n = (size_t)N * d * p * p;
     const uint8_t *rr = (const uint8_t *)rec; uint8_t *yy = (uint8_t *)y;
-#define ILC(B, T) input_latc_k<B, T><<<nblk_(n, 128), 128>>>((const T *)ct16, rr, rec_bytes, N, d, p, bas, gain, C, step, yy)
+#define ILC(B, T) input_latc_k<B, T><<<nblk_(n, 128), 128>>>((const T *)ct16, rr, rec_bytes, N, d, p, bas, gain, C, step, yy, Ct)
     if (bits == 4) { if (dt == 2) ILC(4, __half); else ILC(4, bf16); }
     else { if (dt == 2) ILC(8, __half); else ILC(8, bf16); }
 #undef ILC
     LPCK();
+}
+extern "C" void lp_input_latc(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, void *y, int bits) {
+    lp_input_latc_ct(ct16, dt, rec, rec_bytes, N, d, p, bas, gain, C, step, y, bits, C + 3);
 }
 extern "C" void lp_input_latq(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, int n, int cz0, int ncz, const void *cells, int stride,
                               const float *gain, int C, float sraw, float mean, float isd, void *y, int bits) {

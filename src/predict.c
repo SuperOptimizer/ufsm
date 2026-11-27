@@ -1,5 +1,6 @@
 /* ufsm predict: sliding-window inference of a checkpoint over a CT box, written as a volcomp zarr v3
    probability pyramid (uint8 p*255, q=8) in the published layout. */
+#include "sample_cond.h"
 #include "imgops.h"
 #include "scannorm.h"
 #include "optcheck.h"
@@ -35,6 +36,8 @@
 #include "sample.h"   /* (--aux-level: sample_aux_nc / sample_aux_byte, the trainer's coarse aux box) */
 #include "winauto.h"
 #include "fblend.h"
+#include "inkproto.h"
+static ink_proto_pred *g_proto_pp;   /* (--proto-seed / --proto: closed at the end; mgpu: main) */
 #include <errno.h>
 #include <openssl/evp.h>
 #include <fcntl.h>
@@ -1837,7 +1840,21 @@ static int predict_one(int argc, char **argv) {
                                      fprintf(stderr, " %s (ch %d%s%s%s)", PH[k].name, PH[k].c0, c1, PH[k].sb0 >= 0 ? " sub-cell" : "", PH[k].s0 >= 0 ? " stem" : ""); } fprintf(stderr, "\n"); }
     if (!ffd && tta > 1 && (split || half || sheet_task || rvfuse)) { fprintf(stderr, "predict: probability --tta: not with --split, half-resolution, sheet or recto/verso-fused outputs\n"); return 2; }
     if (ffd && out_ch && tta > 1) { fprintf(stderr, "predict: --channel N with --fit-* and --tta: not supported (the probability volume would come from the last symmetry pass)\n"); return 2; }
-    if (ffd && (split || (ngpu > 1 && !ffz))) { fprintf(stderr, "predict: --fit-fields runs on one GPU\n"); return 2; }   /* (--fit-zarr: z-layer workers with --gpus) */   /* (--channel N: the probability volume of channel N beside the fields, e.g. --channel ink) */
+    if (ffd && (split || (ngpu > 1 && !ffz))) { fprintf(stderr, "predict: --fit-fields runs on one GPU\n"); return 2; }
+    /* --proto-seed OUT.proto / --proto P.proto (2026-11-27, inkproto; src/inkproto.h): the seed sums of the trunk's level-0 features at the
+       voxels whose own output probability is >= --proto-thr, and / or the output replaced by (1 + cos(features, prototype)) / 2 */
+    const char *proto_seed = opt(argc, argv, "--proto-seed", nullptr), *proto_p = opt(argc, argv, "--proto", nullptr);
+    const double proto_thr = opt_atof("--proto-thr", opt(argc, argv, "--proto-thr", "0.95"));
+    const int proto_mode = !strcmp(opt(argc, argv, "--proto-mean", "unit"), "raw");
+    if (strcmp(opt(argc, argv, "--proto-mean", "unit"), "unit") && !proto_mode) { fprintf(stderr, "predict: --proto-mean unit | raw\n"); return 2; }
+    if (proto_seed || proto_p) {
+        const char *why = half ? "a low-resolution / latent net" : lhm ? "--heads" : mch_n > 1 ? "--channels" : tta > 1 ? "--tta" : ffd || ffz ? "--fit-*" : sheet_task ? "a sheet task"
+                        : rvfuse ? "--channel rv" : nwork > 1 ? "--gpus" : split ? "--split" : lat_store ? "--latents" : fea ? "--feather"
+                        : proto_seed && (opt_atoi("--seam-inproc", opt(argc, argv, "--seam-inproc", "0")) || opt_atoi("--seamless", opt(argc, argv, "--seamless", "0")) > 1) ? "--seamless (the seed would count the two grids' windows twice)" : nullptr;
+        if (why) { fprintf(stderr, "predict: --proto / --proto-seed: not with %s (one voxel net's channel on one GPU)\n", why); return 2; }
+        if (!(proto_thr > 0 && proto_thr < 1)) { fprintf(stderr, "predict: --proto-thr: 0 < thr < 1\n"); return 2; }
+        if (proto_p) snprintf(content, sizeof content, "ink-proto cosine 255 (1 + cos) / 2 (trunk level-0 features vs prototype)");
+    }   /* (--fit-zarr: z-layer workers with --gpus) */   /* (--channel N: the probability volume of channel N beside the fields, e.g. --channel ink) */
     z3 *auxz = nullptr; uint8_t *auxd = nullptr, *auxh = nullptr;   /* --aux ROOT KEY: the fifth input of 5-input checkpoints (train --aux-input) */
     const int aux_lv = opt_atoi("--aux-level", opt(argc, argv, "--aux-level", "-1"));   /* the aux volume's CT level (default: this level); coarser: the
                                                                                          trainer's device box path, sample_aux_byte (the cascade input) */
@@ -2344,6 +2361,7 @@ static int predict_one(int argc, char **argv) {
     shape5 xs = {1, !half && (cfg.cin == 5 || cfg.cin == 7) ? cfg.cin : 4, Dl, W, W};   /* (7: a train --cond net, its condition inputs zero here) */
     const shape5 xn = half ? (shape5){1, cfg.cin, W / hdiv, W / hdiv, W / hdiv} : xs;   /* the network's input */
     int latin = 0; void *x2 = nullptr, *lrt = nullptr; float *lgf = nullptr;   /* half: the network's input, the intermediate grid (div 4), the full-resolution logits */
+    source cnd_src = {0}; int8_t *cnd_h = nullptr; void *cnd_d = nullptr; size_t cnd_n = 0;   /* cfg.cond_ch: the conditioning sets, host / device planes of a window */
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
     /* --fit-zarr in z-chunk slabs (fzs below, the plane path): the 1^3 head per chunk over the cell planes the chunk reads (unet_head_fwd_z32,
        each plane once: two plane buffers, the overlap with the previous chunk copied) instead of the whole window's fp32 cell logits
@@ -2412,6 +2430,16 @@ static int predict_one(int argc, char **argv) {
                   && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")); }
         if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz || aux_zero) { auxd = nn_malloc(w3); auxh = malloc(w3); }
+        if (half && cfg.cond_ch) {   /* train --cond-fields checkpoints: the conditioning planes of every window (sample_cond.h, no symmetry) from --cond-fields DIR[,DIR..] */
+            const char *cf = opt(argc, argv, "--cond-fields", nullptr);
+            if (!cf) { fprintf(stderr, "predict: the checkpoint reads %d conditioning planes (train --cond-fields): --cond-fields DIR[,DIR..] (fit-field sets on this scan) or none\n", cfg.cond_ch); return 2; }
+            if (cfg.cond_ch != COND_K || !h16 || tta > 1 || W % 8 || Wz != W || hdiv != 4) { fprintf(stderr, "predict: --cond-fields: %d planes, fp16 activations, no --tta, cube windows of a multiple of 8\n", COND_K); return 2; }
+            memset(&cnd_src, 0, sizeof cnd_src); cnd_src.name = (char *)"predict"; cnd_src.um = um;
+            if (strcmp(cf, "none")) { char *t = strdup(cf), *sv = nullptr; for (char *q = strtok_r(t, ",", &sv); q && cnd_src.ncond < 16; q = strtok_r(nullptr, ",", &sv)) cnd_src.cond_dir[cnd_src.ncond++] = strdup(q); free(t); }
+            else UFSM_DEFAULTED("predict: --cond-fields none: the checkpoint's conditioning block is 0 (a dropped window's input)");
+            cnd_n = (size_t)COND_K * (W / 8) * (W / 8) * (W / 8); cnd_h = malloc(cnd_n); cnd_d = nn_malloc(cnd_n);
+            fprintf(stderr, "predict: %d conditioning planes from %d fit-field sets (%s)\n", COND_K, cnd_src.ncond, cf);
+        }
         if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4));   /* (lgf, and lrt with the direct latent input: at their first use; the direct latent rv path has none) */
             if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
         if (lat_store && gpath) lz_d = nn_malloc(w3 / 64 * (lz_c + 1));   /* (a voxel checkpoint too: its CT window rebuilt from the cells) */
@@ -3274,6 +3302,11 @@ static int predict_one(int argc, char **argv) {
                 if (skw && !nn_skip_build(ctd, Wz, W, W, 4, skip_nl, skip_thr, skip_margin)) { skip_wins++; if (ufsm_env_on("UFSM_SKIP_REPORT")) { const double sh0 = nn_skip_share(0); skip_share0 += sh0; skip_zero += sh0 <= 0; } }
                 if (skw && ufsm_env_on("UFSM_SKIP_AB")) skip_ab(u, x2, xn, h16, ctd, Wz, W, cfg.cout);   /* the dense / masked A/B of this window */
                 if (cfg.lat_dec) { if (!xd || !h16) { fprintf(stderr, "predict: the sub-cell decoder (lat_dec) reads the fp16 CT window (xd)\n"); return 1; } unet_set_latdec_ct(u, xd, Wz, W, W); }
+                if (cnd_h) {   /* cfg.cond_ch: channels 32 .. 63 of the 16-bit input from the window's conditioning planes */
+                    static const int id3[3] = {0, 1, 2}, nf3[3] = {0, 0, 0};
+                    if (sample_cond_window(&cnd_src, 8, level, o, W, W, id3, nf3, nullptr, cnd_h)) { fprintf(stderr, "predict: --cond-fields: read failed\n"); return 1; }
+                    nn_h2d(cnd_d, cnd_h, cnd_n); nn_cond_h16(x2, xn, cnd_d, COND_K, W / 8, W / 8, W / 8);
+                }
                 const float *l2 = unet_forward_x(u, x2, xn, 0, h16); nn_ptick("trunk forward");
                 if (skw) { long m_, c_; nn_skip_counts(&m_, &c_); skip_masked += m_; skip_calls += c_; nn_skip_off(); }
                 /* train --fstem: the fine voxel stem on the CT channel (xd channel 0) into the planes the path holds: output o of the stem's list
@@ -3530,6 +3563,12 @@ static int predict_one(int argc, char **argv) {
             if (mch_n > 1 && lg) lg = (const float *)(mch_lg + (size_t)(out_ch - mch_lo) * mch_cs);
             if (ffd && out_ch && lg) lg =(const float *)((const char *)lg + (size_t)out_ch * w3 * (unet_logits_h16(u) ? 2 : 4));   /* every head computed: channel out_ch of the [c][window] logits for the probability volume (e.g. --channel ink beside --fit-zarr) */
             if (sheet_task) lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1); otherwise the only one */
+            if ((proto_seed || proto_p) && lg) {   /* (inkproto) the seed sums from the ink logits, then the cosine over them */
+                static ink_proto_pred *PP;   /* mgpu: main (one GPU: refused with --gpus above) */
+                if (!PP && !(PP = ink_proto_pred_open(cfg.widths[0], proto_seed, proto_thr, proto_p, proto_mode))) return 1;
+                if (ink_proto_pred_window(PP, u, (void *)lg, unet_logits_h16(u), Wz, W, hz, halo)) return 1;
+                g_proto_pp = PP;
+            }
             if (!ffd && tta > 1) {   /* --tta on the probability: the mean of the K passes' probabilities, as logit(mean) in the last pass's buffer */
                 if (!g_ps.tacc && !(g_ps.tacc = nn_malloc_try(w3 * 2))) { fprintf(stderr, "predict: --tta: no device memory for the accumulator (%.2f GB)\n", w3 * 2 / 1e9); return 1; }
                 const int lh0 = unet_logits_h16(u);
@@ -3820,6 +3859,7 @@ static int predict_one(int argc, char **argv) {
     if (mch_n > 1) fprintf(stderr, "predict: --channels: %d more channel stores (%s ...) from the same windows\n", mch_n - 1, mch_out[1]);
     free(MC);
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs end-to-end, the windows %.0fs)\n", out, ntiles, now() - t0, t_win);
+    if (g_proto_pp) { const int r_ = ink_proto_pred_close(g_proto_pp); g_proto_pp = nullptr; if (r_) return 1; }
     if (SF) { const int r_ = sf_feats[0] ? surfp_write_feats(SF, sf_feats, sf_fst) : surfp_write(SF, sf_out); surfp_free(SF); SF = nullptr; if (r_) return 1; }
     /* (the share only with UFSM_SKIP_REPORT: without it the line read "... masked-1.000", taken for "every conv skipped" (latcodec 11-20); a
        masked launch runs the active tiles of its mask, not none) */

@@ -120,6 +120,9 @@ void lp_input_rad(const void *ct16, int dt, const void *rec, size_t rec_bytes, i
 void lp_input_latq(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, int n, int cz0, int ncz, const void *cells, int stride,
                    const float *gain, int C, float sraw, float mean, float isd, void *y, int bits);   /* nn_input_latq */
 void lp_input_latc(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, void *y, int bits);   /* nn_input_latc */
+void lp_input_latc_ct(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, const float *bas, const float *gain, int C, float step, void *y, int bits, int Ct);   /* the same into the first block of a Ct-channel input */
+void lp_cond_mx(const void *cd, int N, int K, int d, int h, int w, int gd, int gh, int gw, void *y, int Ct, int bits);   /* nn_cond_mx */
+void lp_cond_h16(const void *cd, int N, int K, int d, int h, int w, int gd, int gh, int gw, void *y, int Ct);   /* nn_cond_h16 (fp16 window) */
 void lp_input_lat(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, void *y, int bits);   /* nn_input_lat */
 void lp_fakeq_w4(float *w, int Co, int Ci, int T, int Bo, int Bi);   /* nn_fakeq_w4_2d / nn_fakeq_w4 */
 void lp_input_rad_pack(const void *ct16, int dt, const void *rec, size_t rec_bytes, int N, int d, int p, void *y, int bits);   /* nn_input_rad_pack */

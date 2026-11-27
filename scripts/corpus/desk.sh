@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # desk.sh: the desk side of the corpus unroll (see common.sh). Lanes (one process; restart-safe: done markers + flock claims):
 #   prep     every scroll up front, PREPPAR (3) at once: box of the scanprep mask (object cells padded one cell, origin on the 512-voxel
-#            grid: predict --fit-zarr slab rows are 256 cells = 512 voxels), axis (list.tsv umbilicus or ufsm axis = per-z CT centroid)
+#            grid: predict --fit-zarr slab rows are 256 cells = 512 voxels), axis (list.tsv umbilicus or unroll/auto_axis.sh: ufsm umbilicus vote; AXIS_METHOD=centroid the per-z CT centroid)
 #   gpu 0/1  wind96 fit fields of one scroll per GPU (run3-cf predict settings) + lossless repack to 512^3 shards; waits for SPACEGB
 #   push     fields + box + axis -> forlindesk as soon as the fields are done (FDGB 250 free there), byte-checked ->
 #            forlindesk:<S>/state/fields.ready (fields kept here); forlindesk computes the count-field ref itself before its slabs
@@ -40,7 +40,7 @@ prep() {
       printf "%d,%d,%d,%d,%d,%d\n", o[1], o[2], o[3], e[1], e[2], e[3] }' > $O/box.txt
   [ -s $O/box.txt ] || return 1
   jq -r '.stats.otsu' /vesuvius/ufsm/u0/prep/$S-$id.json > $O/otsu.txt
-  if [ "$AXS" = auto ]; then MEMGB=60 memok; N $U axis $R $K $O/axis.json > $O/logs/axis.log 2>&1 || return 1; else cp $AXS $O/axis.json; fi
+  if [ "$AXS" = auto ]; then MEMGB=60 memok; N bash $H/../unroll/auto_axis.sh $U $R $K $UM $O/axis.json > $O/logs/axis.log 2>&1 || return 1; else cp $AXS $O/axis.json; fi
   log "box $(cat $O/box.txt) (level $LV, $LUM um), axis $AXS"
 }
 fields() {   # (GPU $G)
