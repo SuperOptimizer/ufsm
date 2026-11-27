@@ -256,6 +256,10 @@ void nn_fit_finalize_w4(const float *acc, size_t nf, uint8_t *a);
    plane 12), the CT sheet spacing of the cells centred in the window (network normal and spacing from the logits, the CT along the
    normal: native voxels) into acc_cs (plane 13), and both finalized into the uint8 ct / cs planes (acc: 14 planes of nf cells) */
 void nn_fit_accum_ct(const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3], float *acc_ct);
+/* predict --fit-dv: the log-variance channel ch's material sums into acc_dv (one plane of the accumulators); finalize: the "dv" plane from
+   the material plane (acc plane 1) and plane kdv (dv = (mean s + 12) x 255 / 18; 0 no material) */
+void nn_fit_accum_dv(const float *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3], int ch, float *acc_dv);
+void nn_fit_finalize_dv(const float *acc, size_t nf, int kdv, uint8_t *odv);
 void nn_fit_accum_cs(const float *lg, const uint8_t *ct, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3],
                      int ch_normal, int ch_density, float dscale, int dcode, float um, float *acc_cs);
 void nn_fit_finalize_ct(const float *acc, size_t nf, int h, uint8_t *oct, uint8_t *ocs);
@@ -318,6 +322,7 @@ int fit_fields_material_box(const char *dir, int margin, int align, int crop[4],
    each row (their fit_fields carry oy ox H0 W0: positions stay the box's), the w plane copied from wbox (or read when null); on = 0 off */
 void fit_fields_crop(int on, int oy, int ox, int H, int W, const uint8_t *wbox);
 void fit_fields_mf_weight(double k);   /* K > 0: later fit_fields_load calls scale pc ps w by 1 - K mf / 255 (the fields' merge-flag plane mf; count-field --mf-w) */
+void fit_fields_dv_weight(double k, double sref);   /* K > 0: later fit_fields_load calls scale w by min(1, e^(-K (s - sref))) (the fields' dv plane: predict --fit-dv; count-field --dv-w K --dv-ref S) */
 void fit_fields_skip_planes(int mask);   /* optional planes later fit_fields_load calls leave out (bit 0 the recto plane r, bit 1 the winding mod 4 planes dz dy dx dq, bit 2 the normals, bit 3 sp, bit 4 the phase pc ps (unpooled loads); default none): RAM and reads for fits whose terms do not read them */
 void fit_fields_recycle(int on);   /* 1: fit_fields_load_ex's prev without shared rows lends its planes to the new block (zarr fields: same bytes, no fresh pages) */
 int fit_fields_zchunk(const char *dir, long long *zoff);   /* the z rows per chunk of the fields' arrays (zarr; 128 for raw) and the box's z offset in them (*zoff; 0 raw): loads of chunk-aligned rows decode each chunk once */
