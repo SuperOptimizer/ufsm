@@ -19,7 +19,7 @@ typedef struct {
     int nsamp, ncand;            /* villa: 10000 sampled segments, 1000 RANSAC candidates */
     double near;                 /* hill-climb weight floor 1 / max(near, d), level-0 voxels (villa: 100 grid units) */
     double step0, step_min;      /* hill-climb start / stop step, level-0 voxels (villa 1024 -> 1) */
-    double uncrush;              /* villa --uncrush beta (0: off; 1.5 their measured setting) */
+    double uncrush;              /* villa --uncrush beta (0: off; 1.5 their measured setting, ufsm umbilicus's default) */
     int max_moves;               /* cap on hill-climb moves (villa: none; a walk off the section stops here) */
 } umb_cfg;
 

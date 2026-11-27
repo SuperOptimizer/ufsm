@@ -6,6 +6,41 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## ufsm umbilicus: the umbilicus by sheet-normal voting, a villa vc_gen_umbilicus port (2026-11-27, branch axisfind-20261127, axisfind)
+
+`ufsm umbilicus OUT.json --um0 UM (--ct-root R --ct-key K --level L | --fields DIR)` (src/umbfind.c) ports villa's
+`vc_gen_umbilicus` (`align_and_extract_umbilicus` + `fit_umbilicus_along_z`, origin/main a7d4f88; research/villa.md idea 3).
+- Per xy slice (every `--dz-mm 1`, 4 input rows averaged): 10k points drawn by weight, 1k random candidates scored by sum cos^2
+  (radial direction vs sheet normal), the best hill-climbed on villa's weighted sum cos^2 / max(0.94 mm, d); optional un-crush
+  (villa's cell-balanced normal tensor, beta `--uncrush`, default 1.5). Then villa's robust LOWESS along z (half width 4.7 mm,
+  3 bisquare rounds). Seeded per slice, so any thread count repeats exactly.
+- Normals: the CT's 2-D structure tensor (sigma 1 / 3 px, every 4th pixel with coherence >= 0.2, weight = coherence), or the fit
+  fields' in-plane n n^T block (t1 t2 t5, w-weighted, pooled 4 cells). No net fields are needed: the CT path is the default input.
+- `--ref AXIS` prints vote + zfit / vote per slice / CT>0 centroid (ufsm axis's estimator, same slices) against a reference;
+  `ufsm axis-diff A B --um0 U [--z0 --z1]` compares two axis files. Same json as `ufsm axis` (control_points z, y, x, level-0).
+- test_umbfind: rendered spirals (pitch 24 voxels, 12 turns, noise) around a tilted + bowed axis: fitted median 0.84 / max 1.66
+  voxels; crushed x0.6: 0.98 / 1.28 (uncrush 0), 0.95 / 1.54 (1.5); LOWESS exact on a line and rejects a 400-voxel outlier.
+
+Per-z distance from the reference, mm (median / p90 / max; CPU, 6 threads, 1-3 min per scroll at level 3-4):
+
+| scroll (input) | reference | vote, uncrush 1.5 | vote, uncrush 0 | CT centroid |
+|---|---|---|---|---|
+| PHerc1667 (CT L3) | upstream umbilicus | 1.04 / 2.29 / 3.15 | 1.13 / 2.28 / 2.56 | **0.87** / 2.16 / 4.65 |
+| PHercParis4 (CT L3) | teacher/axis-0 | **0.70** / 2.65 / 6.48 | 0.78 / 2.69 / 5.87 | 3.75 / 6.65 / 10.61 |
+| PHerc1203 (CT L2) | hand, all z | 2.01 / 4.21 / 5.90 | 1.83 / 4.37 / 6.67 | 3.11 / 5.78 / 6.45 |
+| PHerc1203 (CT L2) | hand, clear core z 11264-14336 | **0.73** / 1.45 / 1.55 | 0.91 / 1.52 / 1.62 | 4.05 / 5.60 / 5.99 (corpus axis.json) |
+| PHerc1203 (fit fields lat) | hand, all z / clear core | - | 2.19 / 4.71 / 6.75; 0.97 / 1.59 / 1.84 | - |
+| PHercParis3 (CT L4) | hand, all z | **3.24** / 10.2 / 11.7 | 4.34 / 9.42 / 12.7 | 6.55 / 12.3 / 13.6 |
+| PHercParis3 (CT L4) | hand, clear core z 28672-47360 | **2.48** / 7.87 / 10.3 | 2.64 / 7.03 / 7.73 | 11.2 / 13.4 / 13.6 (corpus axis.json) |
+
+- The vote beats the centroid on every scroll but 1667, where the centroid's median is 0.17 mm lower but its max 1.5 mm higher
+  (1667 is round and centred: the centroid's best case). Where the hand axis is clear, the vote sits 0.7 mm (1203) and 2.5 mm
+  (Paris3) from it against 4.1 / 11.2 mm for the centroid axes in use. The hand axes are weak between their few clicks (1203: 6
+  points), so the all-z rows mostly measure the references.
+- The fit fields gave no gain over the CT on 1203 (0.97 vs 0.91 mm clear core), so CT-only is enough; no GPU needed.
+- Proposal: `ufsm umbilicus` (CT, --uncrush 1.5) replaces `ufsm axis` as the auto axis for scrolls without a hand / upstream one.
+  Outputs: /vesuvius/ufsm/axisfind/out/*.json (PHerc1203 stays local).
+
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
 
 - Why: under -std=c23, phasecmp.c called floor / ceil / llround without <math.h> (fixed in b32c16ca). mcc took them as int f()

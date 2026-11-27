@@ -412,7 +412,7 @@ static void usage_umb(void) {
         "  --fields DIR      fit-field input (zarr planes t1 t2 t5 w; fields.json um / origin / h): the in-plane n n^T pooled --pool 4 cells\n"
         "  --dz-mm 1         slice spacing; --rows 4: input rows averaged per slice; --z0 / --z1 level-0 range\n"
         "  --zfit-mm 4.7     LOWESS half width (villa's measured 4.7 mm; 0: each slice's own estimate)\n"
-        "  --uncrush 0       villa un-crush beta (1.5 their crushed-scroll setting); --samples 10000 --cands 1000 --near-mm 0.94 --seed 1\n"
+        "  --uncrush 1.5     villa un-crush beta (their measured setting; vs 0: lower median on 1667 / P4 / Paris3 and 1203's clear core, DESIGN 11-27); --samples 10000 --cands 1000 --near-mm 0.94 --seed 1\n"
         "  --min-pts 200     slices with fewer points are skipped (reported); --threads 6; --csv FILE per-slice table\n"
         "  --ref AXIS.json   also report the per-z distance (mm) of the fitted, raw and CT-centroid axes from AXIS\n");
 }
@@ -427,7 +427,7 @@ int cmd_umbilicus(int argc, char **argv) {
     cfg.nsamp = opt_atoi("--samples", opt(argc, argv, "--samples", "10000"));
     cfg.ncand = opt_atoi("--cands", opt(argc, argv, "--cands", "1000"));
     cfg.near = opt_atof("--near-mm", opt(argc, argv, "--near-mm", "0.94")) * v;
-    cfg.uncrush = opt_atof("--uncrush", opt(argc, argv, "--uncrush", "0"));
+    cfg.uncrush = opt_atof("--uncrush", opt(argc, argv, "--uncrush", "1.5"));
     if (!(cfg.uncrush >= 0 && cfg.uncrush <= 4)) { fprintf(stderr, "umbilicus: --uncrush must be in [0, 4]\n"); return 2; }
     const double dz = opt_atof("--dz-mm", opt(argc, argv, "--dz-mm", "1")) * v, zfit = opt_atof("--zfit-mm", opt(argc, argv, "--zfit-mm", "4.7")) * v;
     const int rows = opt_atoi("--rows", opt(argc, argv, "--rows", "4")), nt = opt_atoi("--threads", opt(argc, argv, "--threads", "6"));
