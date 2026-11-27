@@ -6,7 +6,77 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
-## 1667 comparison unrolls: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
+## Upstream villa's ray-slab winding net vs our counts on the wbench boxes: KILLED; count-field --method ray loses 0.55 GT ids (2026-11-27, rayslab)
+
+Question (lead): port villa's ray-slab winding-count net (`neural_tracing/winding_models`)? It is aimed at packed-sheet undercounting.
+The design is in /vesuvius/ufsm/rayslab/design.md:
+- the input is one 128² x 384 slab at ~9.6 um, along the sheet normal;
+- the encoder halves only the transverse axes, and 6 axial blocks attend along the ray (L 384) and across the plane;
+- the phase is cumsum(softplus), so it cannot decrease along the ray;
+- the loss is shift-invariant;
+- training uses 0139, 1667 and Paris 4.
+
+The published metrics (`scrollprize/winding_model_9um`) are in-sample only (validation_mode train_batch): a count error of 0.22-0.34
+windings per 3.7 mm column. A port is ~3 weeks, so S0 was a one-day kill test first.
+
+**S0, a measurement only.** The published checkpoint ran in inference only, in a PyTorch env outside ufsm, on the CPU (6 threads), with
+bf16 autocast as in villa's own inference. Nothing upstream entered ufsm.
+- **Harness:** /vesuvius/ufsm/rayslab/s0 (prep.sh, rs0.py, summ.py; rows in res/).
+- **Segments** are fit-compare's turn-count segments: 0.5 mm radial segments in z planes, the reference being the label oracle's phase
+  unwrapped along the segment. They are reimplemented in rs0.py and checked against fit-compare on 500P2-1 / try9 at stride 4:
+
+| | segments | phase off | phase off, packed | density off |
+|---|---|---|---|---|
+| rs0.py | 462 | 0.242 | 0.667 | 0.314 |
+| fit-compare | 461 | 0.243 | 0.690 | 0.312 |
+
+- **Slabs** are drawn on segments, two thirds of them packed (mean label spacing < 100 um). The ray is the radial direction, and the
+  slab frame is villa's own (slab_frame). Every 0.5 mm window along the central column that passes the fit-compare tests is scored.
+- **Villa's count** = phase(end) - phase(start) on the 4 centre columns.
+- **Our counts** use the same windows: try9 (`bl-t9`, cooled 33333) and u1 (`u1-fd615-ho`), each by phase and by density.
+- **Out of sample** = 0500P2 and 0814, which villa never trained on. They are held-out boxes for our nets.
+
+**Results.** Share of windows off by >= 1/2 turn, with 95 % CIs from a bootstrap resampled by slab. The paired difference is villa
+minus the best of our four counts on the same windows.
+
+| group | class | windows (slabs) | villa | try9 phase | try9 density | u1 phase | u1 density | villa - best ours | median error: villa / try9 density / u1 density |
+|---|---|---|---|---|---|---|---|---|---|
+| OOS 0500P2-1 | packed | 73 (67) | 0.77 | 0.67 | **0.48** | 0.52 | 0.52 | **+0.29 [+0.14, +0.42]** | -0.87 / +0.48 / +0.50 |
+| OOS 0500P2-1 | other | 51 (45) | 0.39 | 0.25 | 0.33 | 0.27 | 0.47 | +0.14 [-0.02, +0.31] | -0.35 / +0.35 / +0.38 |
+| OOS 0814 (8 boxes) | other | 135 (104) | 0.57 | - | - | 0.38 | 0.91 | +0.19 [+0.10, +0.28] | +0.77 / - / +1.91 |
+| in-sample P4 PH1-3 | packed | 236 (69) | 0.46 | 0.91 | 0.45 | 0.93 | **0.36** | +0.09 [+0.00, +0.19] | -0.25 / -0.30 / +0.08 |
+| in-sample P4 PH1-3 | other | 147 (52) | 0.44 | 0.70 | 0.39 | 0.68 | 0.63 | +0.05 [-0.11, +0.20] | +0.16 / +0.29 / +0.57 |
+| in-sample P4 HOLD | packed | 23 (13) | 0.26 | 0.78 | 0.39 | 0.70 | 0.48 | -0.13 [-0.39, +0.15] | +0.14 / +0.05 / +0.37 |
+
+**Kill rule** (pre-registered): villa must be >= 10 points better than our counts on out-of-sample packed segments. It is 29 points
+**worse** than try9's density on 0500P2. It undercounts packed sheets there, with a median of -0.87 turn per 0.5 mm, which is exactly
+the failure it was meant to fix. 0814 has only 2 packed windows (the boxes' packed share is 0-5.5 %, and all 0814 boxes are
+label-noise), so the out-of-sample packed evidence is 0500P2 alone. The kill stands anyway: villa is also worse on 0814's unpacked
+windows (+0.19, CI above 0).
+
+On Paris 4, where it trained, villa only matches our density counts:
+- on PH1-3 packed, 0.46 against try9 density 0.45 and u1 density 0.36;
+- it is far better than either net's phase count (0.91-0.93);
+- on HOLD it is 0.26 against 0.39, with the CI spanning 0 (n 23).
+
+So the architecture's gain over a local density head is not visible even in-sample. **The port (S1-S4) is not started.**
+
+**Caveats.**
+- Villa's input is our volcomp CT: q 8 at level 0 for 0814 / 0500P2 (9.362 um, 113 keV scans), and level 2 for Paris 4.
+- The ray is radial, not the sheet normal it trained along (+-3 deg).
+- Its output depends on the slab's orientation. On 4 packed 0500P2 segments, flipping H / W moved the count by 0.04-0.18 turn, and
+  swapping H and W moved it by up to 0.27. Rays at tens of degrees from the normal would add more. Neither effect is a 29-point one.
+
+**Side check: count-field --method ray vs ls**, the per-ray counting the design would have fed. This used the unroll's ref recipe
+(`--R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 --model-only 1 --iters 1200 --dir -1`) on try9's kept wbench fields of
+the 54 clean 1667 boxes. Each box was solved alone, then GT-scored with gtboxes.sh on the CPU. Script:
+/vesuvius/ufsm/rayslab/s0/cfray2.sh; rows in cf2/score.txt. The whole-band r3 fields of the 11-18 1667 run no longer hold their
+arrays, hence the per-box solves.
+- Voxel-weighted ids right: **ls 0.874, ray 0.329**.
+- ray is worse on all 54 boxes.
+- `--method ray` stays a tool, not a candidate.
+
+: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
 
 Question (lead, for the user): what do the new ideas change in a real unroll, scored on GT? Same region and downstream steps for each
 arm, only the named input differs.
