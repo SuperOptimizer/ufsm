@@ -59,6 +59,10 @@ Everything stays local: the clone and runs are in /vesuvius/ufsm/upspiral, nothi
   - z 8800-9000, 3000 steps: eager 16.7-18.3 ms/step; upstream COMPILE 17.6; + ours 13.7; + PREFETCH 12.2.
   - Same-seed eager runs differ by 3.4 % in loss and 5.8 / 15.2 vox (mean / p95) in mesh. The compiled arms stay inside that noise;
     prefetch uses a different RNG stream and falls outside it.
+- **c2 accepted downstream** (lead's rule): 3000-step z 8800-9000 meshes, 5 eager same-seed runs vs 3 compiled (c2, split + c2, graph + c2).
+  HercUeNet surf-near p50 eager 6.40-6.74 vs c2 6.50-6.61; ≤ 2 vox 0.132-0.141 vs 0.135-0.139; id changes 0.365-0.380 vs 0.363-0.376;
+  top-sheet share 0.376-0.392 vs 0.368-0.391; wrap-align mean 0.6840-0.6871 vs 0.6846-0.6872. Inside the eager spread (excursions ≤ 0.008,
+  both directions), so 13.7 ms/step (c2) stands.
 - **800-slice band** (z 8500-9300, ACW, 30k steps, c2 + cache miss + first compile): 1488 s wall, ~44.6 ms/step, peak GPU memory 2.5 GB.
   - A new band end to end: track extraction 131 s + ingest 294 s + fit 1488 s ≈ 32 min (ingest alone was 37 min before).
 - **Not done:** the whole-step CUDA graph is held for the user. It needs the native CPU track-crossing sampler (.item / nonzero /
