@@ -2343,17 +2343,16 @@ static int predict_one(int argc, char **argv) {
     const int Dl = split ? W / 2 + H0 : Wz;   /* planes per GPU */
     shape5 xs = {1, !half && (cfg.cin == 5 || cfg.cin == 7) ? cfg.cin : 4, Dl, W, W};   /* (7: a train --cond net, its condition inputs zero here) */
     const shape5 xn = half ? (shape5){1, cfg.cin, W / hdiv, W / hdiv, W / hdiv} : xs;   /* the network's input */
-    int latin = 0; void *x2 = nullptr, *lrt = nullptr; float *lgf = nullptr;   /* half: the network's input, the intermediate grid (div 4), the full-resolution logits */
+    int latin = 0, x2_shared = 0; void *x2 = nullptr, *lrt = nullptr; float *lgf = nullptr;   /* half: the network's input, the intermediate grid (div 4), the full-resolution logits */
     /* the 16-bit input in the network's shared a1 scratch when it has one (free until the stem conv, after the input conversion) */
     /* --fit-zarr in z-chunk slabs (fzs below, the plane path): the 1^3 head per chunk over the cell planes the chunk reads (unet_head_fwd_z32,
        each plane once: two plane buffers, the overlap with the previous chunk copied) instead of the whole window's fp32 cell logits
        [cout][(W/4)^3] (u1, 144 outputs: 2.4 GB at W 640, 13.8 GB at 1152: no 1152 window on a 16 GB card). The same bits (the ranged head
        kernel, the _c upsampling / shuffle over held planes). Decided before the build (the window's buffers alias the network's); the fzs
-       test is the one below. UFSM_PRED_HEADZ=0: the whole-window logits */
+       test is the one below. UFSM_PRED_HEADZ=0: the whole-window logits. Since 2026-11-27 under the fused fit kernel too (nn_fit_accum_lat_planes:
+       it reads the held planes; --fit-h 8, the wbench DLV -2 setting, had kept the whole-window logits: 15.29 GB at w24's WIN 1152) */
     {   const int fzs_pre = ffd && ffzm && half && hdiv == 4 && hmode == 1 && h16 && gpath && !ffct && tta <= 1 && !fea && !sheet_task && !slab && WR.skip && !(W % 4) && (!getenv("UFSM_PRED_FIT_SLAB") || ufsm_env_on("UFSM_PRED_FIT_SLAB"));
-        const int fzl_pre = fzs_pre && (ffh == 8 || ((ffh == 1 || ffh == 2 || ffh == 4) && ufsm_env_on("UFSM_PRED_FIT_FUSED_SMALLH"))) && cfg.lat_guide != 8 &&
-                            (!getenv("UFSM_PRED_FIT_FUSED") || ufsm_env_on("UFSM_PRED_FIT_FUSED"));
-        unet_set_head_infer_z(u, fzs_pre && !fzl_pre && !lhm && (!getenv("UFSM_PRED_HEADZ") || ufsm_env_on("UFSM_PRED_HEADZ"))); }
+        unet_set_head_infer_z(u, fzs_pre && !lhm && (!getenv("UFSM_PRED_HEADZ") || ufsm_env_on("UFSM_PRED_HEADZ"))); }
     unet_build(u, xn, 0);
     const int headz = unet_head_infer_z_on(u);
     if (headz) fprintf(stderr, "predict: --fit-zarr: the head per z chunk (no whole-window logits; UFSM_PRED_HEADZ=0: them)\n");
@@ -2403,7 +2402,7 @@ static int predict_one(int argc, char **argv) {
         fzl = fzs && (ffh == 8 || ((ffh == 1 || ffh == 2 || ffh == 4) && ufsm_env_on("UFSM_PRED_FIT_FUSED_SMALLH"))) && cfg.lat_guide != 8 &&
               (!getenv("UFSM_PRED_FIT_FUSED") || ufsm_env_on("UFSM_PRED_FIT_FUSED"));
         if (fzl) fprintf(stderr, "predict: --fit-zarr: the fit fields fused from the cell logits (nn_fit_accum_lat)\n");
-        if (headz && (!fzs || fzl)) { fprintf(stderr, "predict: the per-chunk head without the plane path (fzs %d fzl %d)\n", fzs, fzl); return 2; }
+        if (headz && !fzs) { fprintf(stderr, "predict: the per-chunk head without the plane path (fzs %d)\n", fzs); return 2; }
         gdir = !cfg.fstem && rv2c < 0 && (cfg.lat_guide == 5 || cfg.lat_guide == 64) && half && hdiv == 4 && hmode == 1 && rvfuse && gpath && !fea && !ffd && tta <= 1 && !sheet_task && !slab && (!getenv("UFSM_PRED_LAT_DIRECT") || ufsm_env_on("UFSM_PRED_LAT_DIRECT"));
         if (((gdir && cfg.lat_guide == 5) || (fzs && (cfg.lat_guide == 8 || cfg.fstem)) || lhm) && ct_shared && !ctcp && !(ctcp = nn_malloc(w3))) { fprintf(stderr, "predict: no device memory for the guided head's CT copy\n"); return 1; }   /* (the forward overwrites ctd) */
         { const float *b_, *g_; float s_; const int lc_ = half == 3 ? unet_lat_basis(u, &b_, &g_, &s_) : 0;   /* (--latents and the guided head's slab path read the full-resolution input; a
@@ -2412,7 +2411,10 @@ static int predict_one(int argc, char **argv) {
                   && (!getenv("UFSM_PRED_LAT_INPUT") || ufsm_env_on("UFSM_PRED_LAT_INPUT")); }
         if (!xd && !ct_stem && !latin) xd = nn_malloc((size_t)xs.c * w3 * (h16 ? 2 : 4));
         if (auxz || aux_zero) { auxd = nn_malloc(w3); auxh = malloc(w3); }
-        if (half) { x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4));   /* (lgf, and lrt with the direct latent input: at their first use; the direct latent rv path has none) */
+        /* half: the network's cell input in its a1 scratch (unet_input_scratch: read only by the forward's input conversion, before the stem
+           writes there; 1.53 GB at w24's WIN 1152, 2026-11-27); its own buffer when that scratch is missing / small, or with UFSM_SKIP_AB (two forwards per input) */
+        if (half && !xd_shared && !ufsm_env_on("UFSM_SKIP_AB") && (!getenv("UFSM_PRED_X2_SCRATCH") || ufsm_env_on("UFSM_PRED_X2_SCRATCH"))) { x2 = unet_input_scratch(u, shape_numel(xn) * (h16 ? 2 : 4)); x2_shared = x2 != nullptr; }
+        if (half) { if (!x2) x2 = nn_malloc(shape_numel(xn) * (h16 ? 2 : 4));   /* (lgf, and lrt with the direct latent input: at their first use; the direct latent rv path has none) */
             if (hdiv > 2 && !latin) lrt = nn_malloc(w3 / 8 * 16); }
         if (lat_store && gpath) lz_d = nn_malloc(w3 / 64 * (lz_c + 1));   /* (a voxel checkpoint too: its CT window rebuilt from the cells) */
         /* a latvol CT array (src/latvol.h): the window's chunk streams go up as stored and the device decodes them into the cells, from
@@ -3063,11 +3065,28 @@ static int predict_one(int argc, char **argv) {
     double p_wait = 0, p_h2d = 0, p_gpu = 0, p_copy = 0, p_wr = 0, p_ffw = 0, pt, lv_up = 0; int lv_fb = 0; long lv_nfb = 0;   /* lv_fb: this window came as voxels (the reader's fallback) */
     /* the next window's CT uploaded on the copy stream during this window's forward (into ctpre, w3 bytes; at the window's start one
        device copy into ctd): the synchronous upload left the GPU idle ~9 ms per 384 x 640^2 window. Not with --aug-* (degrade rewrites
-       the host window first); UFSM_PRED_CTPRE=0 off. long pre_i: the window whose CT ctpre holds (or is receiving) */
+       the host window first); UFSM_PRED_CTPRE=0 off. long pre_i: the window whose CT ctpre holds (or is receiving). Allocated at the second
+       window (2026-11-27), when the first one's buffers (the workspaces, the chunk head) are in place and only if w3 + 512 MB stay free: taken
+       up front it was 1.53 GB of w24's WIN 1152 that the chunk head then missed */
     uint8_t *ctpre = nullptr; void *ev_pre = nullptr, *ev_preu = nullptr; long pre_i = -1;
-    if (gpath && !degrade && !split && !lat_store && !lvm && !rd.dbuf[0] && (!getenv("UFSM_PRED_CTPRE") || ufsm_env_on("UFSM_PRED_CTPRE")) && (ctpre = nn_malloc_try(w3))) {
-        ev_pre = nn_event_create(); ev_preu = nn_event_create();
+    /* the chunk head's plane buffer and the fused kernel's winding planes before the first forward (2026-11-27): allocated in the first
+       window they came after the forward's workspaces, which grow into the free memory (the fp4 prenorm copy takes the largest slab that
+       fits), and missed it at w24's WIN 1152. Sized for the largest chunk (a larger one regrows below) */
+    if (headz && fzs) {
+        const size_t pl = (size_t)(W / 4) * (W / 4); int np = (ffzc * ffh + 2 * ffw4d + 8) / 4 + 3 + 2 * fzl; if (np > Wz / 4) np = Wz / 4;
+        if (!(hzb[0] = nn_malloc_try((size_t)cfg.cout * np * pl * 4))) { fprintf(stderr, "predict: no device memory for the chunk head (%.2f GB)\n", (double)cfg.cout * np * pl * 4 / 1e9); return 1; }
+        hzcap = np; hzv = 0;
+        if (fzl && fzw4p && ffw4d) {
+            const size_t hw = (size_t)W * W;
+            if (!(fzW = nn_malloc_try((size_t)2 * (ffzc * ffh + ffw4d) * hw * 2))) { fprintf(stderr, "predict: --fit-zarr: no memory for the winding pair's planes\n"); return 1; }
+            fprintf(stderr, "predict: --fit-zarr: the winding pass from the pair's fp16 planes (%.0f MB; UFSM_PRED_FIT_W4P=0: the partner regions)\n", (double)2 * (ffzc * ffh + ffw4d) * hw * 2 / 1e6);
+        }
     }
+    /* the forward's optional prenorm copies grow into the free memory (the largest slab that fits) unless a floor stays free for what the window
+       loop allocates later (the CT prefetch, the fit path's lazy buffers, kernel scratch): at w24's WIN 1280 they left 0 MB and the next
+       allocation failed. UFSM_PRED_WS_KEEP_MB (default 1024; 0 off). Same bits: smaller prenorm slabs or the in-kernel GroupNorm */
+    { const char *e = getenv("UFSM_PRED_WS_KEEP_MB"); nn_ws_keep_free((size_t)(e ? atoll(e) : 1024) << 20); }
+    int ctpre_want = gpath && !degrade && !split && !lat_store && !lvm && !rd.dbuf[0] && (!getenv("UFSM_PRED_CTPRE") || ufsm_env_on("UFSM_PRED_CTPRE"));
     if (split) {   /* both GPUs on every window */
         J.rd = &rd; J.WR = &WR; J.tiles = rd.tiles; J.ntiles = rd.ntiles;
         J.W = W; J.halo = halo; J.shard = shard; J.Dl = Dl; J.H0 = H0; J.kss = kss; J.h16 = h16; J.sign = (int)radial_sign;
@@ -3182,7 +3201,7 @@ static int predict_one(int argc, char **argv) {
             if (!gpath) nn_h2d(ctd, ctu, w3);
             nn_h2d(dyd, dyo, 2 * (size_t)W * sizeof(float));
             if (pprof) { nn_sync(); p_h2d += now() - pt; pt = now(); }
-            if ((xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) || (ct_shared && unet_input_scratch2(u, w3) != ctd)) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
+            if ((xd_shared && unet_input_scratch(u, 4 * w3 * 2) != xd) || (x2_shared && unet_input_scratch(u, shape_numel(xn) * (h16 ? 2 : 4)) != x2) || (ct_shared && unet_input_scratch2(u, w3) != ctd)) { fprintf(stderr, "predict: the network was rebuilt under its input scratch\n"); return 1; }
             if (!ct_stem && !latin) nn_pred_input_d(ctd, Wz, W, (float)mean, (float)(1.0 / sd), dyd, dxd, ax.n > 0 ? (int)radial_sign : 0, xd, h16);
             nn_ptick("input build");
             if (cfg.cin == 7 && !half) nn_zero((char *)xd + 4 * w3 * (h16 ? 2 : 4), 3 * w3 * (h16 ? 2 : 4));   /* no condition: inputs 4-6 zero */
@@ -3332,6 +3351,11 @@ static int predict_one(int argc, char **argv) {
             if (rvfuse && !ldir && !fzs && !lhm) { nn_rv_fuse((void *)lg, w3, half ? cfg.lat_guide != 0 : unet_logits_h16(u)); nn_ptick("rv fuse"); }
             pred_mem_out(u, o);
             if (SF && surfp_window(SF, u, i, o, Wz, W, W)) return 1;
+            if (ctpre_want && !ctpre && i >= 1) {   /* (after the first window: see ctpre) */
+                ctpre_want = 0;
+                if (nn_mem_free() >= w3 + ((size_t)512 << 20) && (ctpre = nn_malloc_try(w3))) { ev_pre = nn_event_create(); ev_preu = nn_event_create(); }
+                else fprintf(stderr, "DEFAULTED: predict: no next-window CT prefetch (%.2f GB free after the first window, it takes %.2f + 0.5): plain uploads (the same bytes)\n", nn_mem_free() / 1e9, w3 / 1e9);
+            }
             if (ctpre && i + 1 < rd.ntiles && atomic_load(&rd.filled) > i + 1) {   /* the next window's CT during this forward (its slot stays held
                                                                                          until that window's statistics, as with the plain upload) */
                 if (pre_i >= 0) nn_stream_wait(1, ev_preu);   /* (the previous prefetch's device copy has read ctpre) */
@@ -3391,6 +3415,28 @@ static int predict_one(int argc, char **argv) {
                         if (fzs) {   /* the chunk's planes a .. b of the window (whole coarse planes around them: the fast upsampling), the accumulators on the slab as a window of its own; the winding's planes with its +-d neighbours */
                             const int a = (int)(cz * ffh - tz), bq = a + lbox[0], zs = a & ~3, ze = (bq + 3) & ~3, nzs = ze - zs, wc = W / 4, lh = unet_logits_h16(u), g8 = cfg.lat_guide == 8, g64 = cfg.lat_guide == 64, cup = g8 || g64 ? 11 : cfg.cout;
                             const size_t hw = (size_t)W * W, ns = (size_t)nzs * hw, cv_ = w3 / 64, es_ = lh ? 2 : 4;
+                            int q0 = 0, qd = Wz / 4; size_t cq_ = cv_;   /* the cell planes l2d holds (q0 .. q0 + qd, channel stride cq_ cells) */
+                            if (headz) {   /* this chunk's planes zs .. ze and the winding pair's, +- 1 cell (the upsampling taps), each computed once */
+                                const int zlo = ffw4d && ((a - ffw4d) & ~3) < zs ? (a - ffw4d) & ~3 : zs, zhi = ffw4d && ((bq + ffw4d + 3) & ~3) > ze ? (bq + ffw4d + 3) & ~3 : ze;
+                                const int n0 = zlo / 4 - 1 > 0 ? zlo / 4 - 1 : 0, n1 = zhi / 4 + 1 + 2 * fzl < Wz / 4 ? zhi / 4 + 1 + 2 * fzl : Wz / 4;   /* (the fused kernel: its 8-voxel blocks' staged cells reach up to 2 past) */
+                                const size_t pl = (size_t)wc * wc; const int hr = cfg.cout;
+                                if (n1 - n0 > hzcap) {   /* (first chunk, or a larger one: the buffer anew, nothing kept) */
+                                    nn_free(hzb[0]); hzb[0] = nn_malloc((size_t)hr * (n1 - n0) * pl * 4); if (!hzb[0]) { fprintf(stderr, "predict: no device memory for the chunk head (%.2f GB)\n", (double)hr * (n1 - n0) * pl * 4 / 1e9); return 1; }
+                                    hzcap = n1 - n0; hzv = 0;
+                                }
+                                if (za == 0 || n0 < hzq0) hzv = 0;   /* a new window (or a chunk behind the held planes): nothing held */
+                                const int o0 = n0 > hzq0 ? n0 : hzq0, o1 = n1 < hzq0 + hzv ? n1 : hzq0 + hzv, nw = 0;   /* the overlap with the held planes */
+                                const size_t cs = (size_t)hzcap * pl;   /* (the buffer's channel stride) */
+                                /* one buffer (2026-11-27; two before, 1.38 GB more at w24's WIN 1152): the held overlap moves down by n0 - hzq0 planes in place,
+                                   plane by plane in ascending order (stream-ordered: each copy reads a plane no earlier copy wrote) */
+                                if (o1 > o0 && n0 > hzq0) for (int o = o0; o < o1; o++) nn_d2d_2d_async(hzb[0] + (size_t)(o - n0) * pl, cs * 4, hzb[0] + (size_t)(o - hzq0) * pl, cs * 4, pl * 4, (size_t)hr);
+                                /* the new planes [n0, o0) and [o1, n1) (one of them empty: chunks advance in z), written in place (plane stride cs) */
+                                const int ra[2][2] = {{n0, o1 > o0 ? o0 : n1}, {o1 > o0 ? o1 : n1, n1}};
+                                for (int r_ = 0; r_ < 2; r_++) { const int p0 = ra[r_][0], p1 = ra[r_][1]; if (p1 <= p0) continue;
+                                    if (unet_head_fwd_z32(u, p0, p1, hzb[nw] + (size_t)(p0 - n0) * pl, cs)) { fprintf(stderr, "predict: the chunk head failed\n"); return 1; } }
+                                hzi = nw; hzq0 = n0; hzv = n1 - n0; l2d = hzb[hzi]; q0 = n0; qd = hzcap; cq_ = (size_t)hzcap * pl;
+                                nn_ptick("fit: chunk head");
+                            }
                             if (fzl && !g8 && a >= hz && bq <= Wz - hz) {   /* the fused kernel (nn_fit_accum_lat): the same sums straight from the cell logits, no planes */
                                 int so_[16]; const int stm = cfg.fstem && !fstem_off;
                                 for (int c = 0; c < 16; c++) so_[c] = stm ? phead_stem_row(&cfg, c) : -1;
@@ -3402,36 +3448,19 @@ static int predict_one(int argc, char **argv) {
                                     fprintf(stderr, "predict: --fit-zarr: the winding pass from the pair's fp16 planes (%.0f MB; UFSM_PRED_FIT_W4P=0: the partner regions)\n",
                                             (double)2 * (ffzc * ffh + ffw4d) * hw * 2 / 1e6);
                                 }
-                                if (!nn_fit_accum_lat_w4p(l2d, lh, Wz / 4, wc, wc, g64 ? unet_lat_sbase(&cfg) : -1, stm ? unet_active_params(u) + unet_fstem_off(u) : nullptr, cfg.fstem, so_,
+                                nn_fit_accum_lat_planes(headz ? q0 : 0, headz ? qd : 0, headz ? cq_ : 0);   /* (headz: the chunk's held cell planes, fp32) */
+                                const int frc_ = nn_fit_accum_lat_w4p(l2d, headz ? 0 : lh, Wz / 4, wc, wc, g64 ? unet_lat_sbase(&cfg) : -1, stm ? unet_active_params(u) + unet_fstem_off(u) : nullptr, cfg.fstem, so_,
                                                           ct_shared ? ctcp : ctd, ct_shared ? nullptr : ctd, ct_shared ? ctm : nullptr, (float)mean, (float)(1.0 / sd), hz, halo,
                                                           (int)(tz - cz * ffh), (int)(ty - (int64_t)c0[1] * ffh), (int)(tx - (int64_t)c0[2] * ffh), lbox, ffh, ncz,
-                                                          ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc, ffw4d ? ff_w4 : -1, ffw4d, ffacc4, w4p ? fzW : nullptr, a, bq + ffw4d - a)) {
+                                                          ff_rec, ff_ph, ff_nrm, ff_den, ffds, ffdc, ffacc, ffw4d ? ff_w4 : -1, ffw4d, ffacc4, w4p ? fzW : nullptr, a, bq + ffw4d - a);
+                                nn_fit_accum_lat_planes(0, 0, 0);
+                                if (!frc_) {
                                     nn_ptick("fit: fused"); goto fz_done;
                                 }
                                 fzl = 0; fprintf(stderr, "predict: --fit-zarr: the fused fit kernel does not take this configuration (--fit-h %d): the plane path\n", ffh);
                             }
                             if (!fzA) { fzP = ffzc * ffh + 8; fzA = nn_malloc((size_t)(cup + (g8 ? 8 : 0)) * fzP * hw * 2); if (ffw4d) fzB = nn_malloc((size_t)2 * (fzP + 2 * ffw4d) * hw * 2); if (g8 || cfg.fstem) fzX = nn_malloc((size_t)(fzP + 2 * ffw4d + 8) * hw * 2); }
                             if (nzs > fzP || a < hz || bq > Wz - hz) { fprintf(stderr, "predict: --fit-zarr: a z chunk outside its slab (%d .. %d of %d)\n", a, bq, fzP); return 1; }
-                            int q0 = 0, qd = Wz / 4; size_t cq_ = cv_;   /* the cell planes l2d holds (q0 .. q0 + qd, channel stride cq_ cells) */
-                            if (headz) {   /* this chunk's planes zs .. ze and the winding pair's, +- 1 cell (the upsampling taps), each computed once */
-                                const int zlo = ffw4d && ((a - ffw4d) & ~3) < zs ? (a - ffw4d) & ~3 : zs, zhi = ffw4d && ((bq + ffw4d + 3) & ~3) > ze ? (bq + ffw4d + 3) & ~3 : ze;
-                                const int n0 = zlo / 4 - 1 > 0 ? zlo / 4 - 1 : 0, n1 = zhi / 4 + 1 < Wz / 4 ? zhi / 4 + 1 : Wz / 4;
-                                const size_t pl = (size_t)wc * wc; const int hr = cfg.cout;
-                                if (n1 - n0 > hzcap) {   /* (first chunk, or a larger one: both buffers anew, nothing kept) */
-                                    for (int k = 0; k < 2; k++) { nn_free(hzb[k]); hzb[k] = nn_malloc((size_t)hr * (n1 - n0) * pl * 4); if (!hzb[k]) { fprintf(stderr, "predict: no device memory for the chunk head (%.2f GB)\n", (double)hr * (n1 - n0) * pl * 4 / 1e9); return 1; } }
-                                    hzcap = n1 - n0; hzv = 0;
-                                }
-                                if (za == 0) hzv = 0;   /* a new window: nothing held */
-                                const int o0 = n0 > hzq0 ? n0 : hzq0, o1 = n1 < hzq0 + hzv ? n1 : hzq0 + hzv, nw = hzi ^ 1;   /* the overlap with the held planes */
-                                const size_t cs = (size_t)hzcap * pl;   /* (the channel stride of both buffers) */
-                                if (o1 > o0) nn_d2d_2d_async(hzb[nw] + (size_t)(o0 - n0) * pl, cs * 4, hzb[hzi] + (size_t)(o0 - hzq0) * pl, cs * 4, (size_t)(o1 - o0) * pl * 4, (size_t)hr);
-                                /* the new planes [n0, o0) and [o1, n1) (one of them empty: chunks advance in z), written in place (plane stride cs) */
-                                const int ra[2][2] = {{n0, o1 > o0 ? o0 : n1}, {o1 > o0 ? o1 : n1, n1}};
-                                for (int r_ = 0; r_ < 2; r_++) { const int p0 = ra[r_][0], p1 = ra[r_][1]; if (p1 <= p0) continue;
-                                    if (unet_head_fwd_z32(u, p0, p1, hzb[nw] + (size_t)(p0 - n0) * pl, cs)) { fprintf(stderr, "predict: the chunk head failed\n"); return 1; } }
-                                hzi = nw; hzq0 = n0; hzv = n1 - n0; l2d = hzb[hzi]; q0 = n0; qd = hzcap; cq_ = (size_t)hzcap * pl;
-                                nn_ptick("fit: chunk head");
-                            }
                             nn_ptick("fit: before the chunk");
                             /* train --fstem: the fine stem on planes z0 .. z0 + nz of the planes P (channel c at plane MAP), its CT taps (planes z0 - 1 .. z0 + nz) z-scored
                                from the window's bytes into fzX (the stem reads the window as if whole: only those planes) */
@@ -3754,7 +3783,7 @@ static int predict_one(int argc, char **argv) {
         free(acc); free(cyb); free(cxb);
     }
     if (gpath) { for (int k = 0; k < WR.nb; k++) nn_host_free(WR.buf[k]); nn_free(dsh); } else for (int k = 0; k < WR.nb; k++) free(WR.buf[k]);
-    nn_free(stsc); nn_free(x2); nn_free(lgf); nn_free(lrt);
+    nn_free(stsc); if (!x2_shared) nn_free(x2); nn_free(lgf); nn_free(lrt);
     if (pf_on) { atomic_store(&PF.stop, 1); pthread_mutex_lock(&rd.mu); pthread_cond_broadcast(&rd.cv); pthread_mutex_unlock(&rd.mu); pthread_join(pfth, nullptr);
                  if (pprof) fprintf(stderr, "predict profile (s): prefetch: %ld chunks fetched ahead of the reader in %.2f s (%d windows ahead, %d threads)%s\n", PF.nfetch, PF.t_fetch, PF.ahead, PF.nt, atomic_load(&PF.bad) ? ", some failed (the reader fetched them)" : ""); }
     pthread_join(rth, nullptr);

@@ -746,6 +746,8 @@ int nn_ws_sealed(void);   /* the current device's workspaces sealed by a memory 
 void *nn_ws(int id, size_t bytes);       /* the current device's workspace id of >= bytes (grown if needed; nullptr: no memory, or over a soft limit after the seal) */
 int nn_ws_reserve(int id, size_t bytes); /* grow it to >= bytes now (before the first step); -1 if the device is full */
 void nn_ws_limit(int id, size_t bytes);  /* after the seal, larger requests return nullptr (callers with a fallback); 0: none */
+void nn_ws_keep_free(size_t bytes);     /* the current device: the optional prenorm copies (fp4 / s2 fp8; same-bits fallbacks) grow only while that much stays free
+                                            (predict, 2026-11-27: the greedy copy left 0 MB of w24's WIN 1280 for the rest); 0: no floor */
 void nn_ws_seal(int on);                 /* on: later growth on this device is reported as outside the plan */
 size_t nn_ws_bytes(int id);              /* its bytes on the current device (id -1: all) */
 const char *nn_ws_name(int id);
