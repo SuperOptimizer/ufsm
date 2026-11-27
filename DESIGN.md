@@ -68,8 +68,9 @@ Runs: A, the coarse dev crops (inksdk/dev/crops, 7.9-9.4 um, 7 scans, 91 tiles);
   mccdecl, who is adding the double functions to microc.
 - **Audit:** cut .03 costs the coarse HP contrast 3 % and nothing in aLDA; cuts .06 / .12 cost more (aLDA −.014 at .06). The A/B uses .03.
 
-**A/B (queued, card-0 slot n3):** /vesuvius/ufsm/inkaug/ab.sh. E2D2-avg is fine-tuned 2000 steps on inklabelfix's recipe; arm A is
-the control, arm F adds `--aug-fourier-p .3 --aug-fourier-cut .03`. inkeval's ab.sh scores 1447 / 0841 per scroll, F − A paired by crop
+**A/B (queued, card-0 slot n3):** /vesuvius/ufsm/inkaug/ab2.sh. E2D2-avg is fine-tuned 2000 steps on inklabelfix's recipe; arm A is
+the control, F adds `--aug-fourier-p .3 --aug-fourier-cut .03`, G sets `--aug-gin-p 0`, B sets `--aug-blur-s 0.8` (G / B change the
+argv's own value: opt() takes the first occurrence). inkeval's ab.sh scores 1447 / 0841 per scroll, F − A paired by crop
 (LEVEL_0841 2, PWIN 288). Results will be added here.
 
 ## Hard-spot sampling: a share of the draws from merge-flagged / id-change cells (2026-11-27, branch hardspot-20261127, hardspot)
