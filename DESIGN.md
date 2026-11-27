@@ -6,6 +6,45 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Native 2.4 um winding labels on the fly: the meshes' pair rule on the GPU, its cost by rmax (2026-11-27, branch w24-20261127, unrollperf)
+
+Goal (user): a native 2.4 um winding net (unwrap2, init try9) trained on level-0 CT with level-0 labels built from the GT meshes on the
+fly. Run kit: /vesuvius/ufsm/unrollperf/w24 (mksrc.py, sources-w24-*.json, args.sh, w24.train.sh, lock0.sh).
+
+**Sources (level 0).**
+- Paris4 June / July: q-assigned meshes rebuilt from the NAS copy of the published segments. Seed and assign are byte-identical to 10-19.
+- 1667 A + B: the existing q meshes.
+- 0139 / 0814 / 0500P2: their 9.362 um meshes through the reg maps (c2f, p90 2.7 um) onto the 2.2-2.4 um twins.
+  - 0814: 15 per-segment sets, re-seeded 19/19 identical.
+  - 0500P2: set B only; the re-seeded A lost its order evidence.
+- Holdouts: holdouts-20261114 united with the wbench holdouts.json (164 boxes).
+- Level 0 is not on the desk disk (~700 GB), so it streams from the ~/nas2 volcomp mirror ("ct_mirror").
+- Planner at try9's widths, fallback mode: P 768 4.25 GB, P 896 6.73 GB, P 1024 10.02 GB of 10.07 free. P 896 chosen.
+
+**Fixes (byte-identical where it applies).**
+- Meshes onfly opens its CT grid from ct_mirror.
+- Derived covers raised 4 -> 64 (Z3_MAX_COVER). A 6th onfly set failed as "set 5 has another shape". test_derived_cover.
+- The meshes' (derived) codes now get the GPU pair rule.
+  - Before, they fell to the CPU: no P 896 window in 12 min.
+  - First version: tile_gpu_derived, host chunks uploaded raw.
+  - Then band_pair_gpu_fill + mesh_codes_stamp_dev: the stamp writes straight into the device tile.
+  - Then a shared pool of 4 stamp contexts with 512 MB slab keys. At 64 MB a 580^3 tile took ~25 slabs, each walking every mesh tile.
+  - Stamp cost per tile: ~480 -> ~150 ms.
+  - test_mesh_phase GPU leg: 327/327 tiles on the GPU, 0 voxels differ from the stored codes' phase.
+- `ufsm phase-cmp A B`: per source, the share of B's known phase that A leaves unknown, printed as a DEFAULTED line.
+
+**Cost by rmax** (sampler-only, P 896, cold windows, 2 x 3072 MB tiles; band kernels at a 580^3 tile: parity 0 / 1 ~62 ms each, pair 13 ms):
+
+| rmax (2.4 um voxels) | s / window | lost vs rmax 160: Paris4 june / july / 1667 / 0139 / 0814 |
+|---|---|---|
+| 80 (192 um) | ~6-8 | 17.8 / 13.0 / 42.6 / 22.3 / 70.7 % |
+| 120 (288 um) | ~17 | 0.9 / 3.0 / 8.9 / 5.5 / 17.5 % |
+| 160 (384 um, the 9.6 um rung's reach) | ~30 | 0 |
+
+The remaining cost is the halo: rmax + 2 per side, so a 588 tile computes 264^3 of output (~11x).
+- The disk derived cache (512 cells) stores ~25 MB a cell. The labelled extents run to Tvox, so the cache only covers revisits.
+- Run choice: rmax 120. Per-source losses go into the run log as DEFAULTED lines.
+
 ## Upstream villa spiral fit on PHerc1203 vs our -p unroll; 3 upstream speed-ups (2026-11-26, unrollperf)
 
 The upstream fitter (villa spiral-fitting @659e2fad) ran on scan 20250820131727 (9.362 µm) with upstream's own 1203 inputs: 22 auto_grown
