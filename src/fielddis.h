@@ -61,7 +61,10 @@ int cmd_field_disagree(int argc, char **argv);
    kind plane: 0 none, 1 agree, 2 A chosen, 3 B chosen, 4 abstained, 5 between (0.1 .. 0.25: unlabelled). phase plane: 0..251 (x 252),
    255 none; conf plane x 255. GT (oracle fields, sampled at the cell centres, confidence > 0.3) scores: a disagreement label is
    correct when |chosen - GT| <= 0.25 turn; an agree label when |consensus - GT| <= 0.25. */
-typedef struct { double conf, agree, max_err, min_margin; int rmin, rmax, nang, min_samp; } fdl_cfg;
+/* evidence 1 (--fibres): instead of the tangent ring, the fibre polylines (fib_set, points in fib_um voxels of the scan frame) through the
+   cell: each fibre's agreeing cells (circular mean of their consensus) vote for every disagreement cell on it, when >= min_samp of the
+   fibre's cells agree (fibres lie in the sheet, so a sheet's phase is constant along them); conf = R x min(1, margin / 0.5). */
+typedef struct { double conf, agree, max_err, min_margin; int rmin, rmax, nang, min_samp; int evidence; const void *const *fib; int nfib; double fib_um; } fdl_cfg;
 typedef struct {
     size_t ndis, nlab, ncorrect, nA, nB, nB_ok, nAwrong_Bright, nAwrong_Bright_pickB, base_a, base_b, any_right;   /* disagree cells with GT: labelled, correct; picks; always-A / always-B correct; either right */
     size_t bin_n[10], bin_ok[10], bin_a[10];                            /* labelled by conf / 0.1: cells, correct, A right there (the always-A baseline on the same cells) */

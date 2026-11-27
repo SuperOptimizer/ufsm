@@ -129,7 +129,7 @@ int main(void) {
     {   /* field-label: B (2.4 um) half a turn off in one quarter; the agreeing cells around the quarter decide for A near its edges,
            deep inside (no agreeing cell on the tangent ring) it abstains; every label is right against A as the GT, B is never picked.
            With the grids swapped (S the grid, A second) the picks are B's. */
-        const fdl_cfg lc = {.conf = 0.2, .agree = 0.1, .max_err = 0.2, .min_margin = 0.1, .rmin = 2, .rmax = 8, .nang = 12, .min_samp = 8};
+        const fdl_cfg lc = {.conf = 0.2, .agree = 0.1, .max_err = 0.2, .min_margin = 0.1, .rmin = 2, .rmax = 8, .nang = 12, .min_samp = 8, .evidence = 0};
         const size_t N = (size_t)64 * 64 * 64; uint8_t *ph = malloc(N), *cf = malloc(N), *kd = malloc(N); fdl_stat st;
         CHECK(!fdis_label(&A, &S, &A, &lc, ph, cf, kd, &st), "field-label run");
         size_t nk[6] = {0}; for (size_t i = 0; i < N; i++) nk[kd[i] < 6 ? kd[i] : 0]++;

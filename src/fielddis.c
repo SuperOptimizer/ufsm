@@ -1,6 +1,7 @@
 /* ufsm field-disagree (src/fielddis.h): model disagreement on fit fields as a labelling query signal, its check against GT oracle
    fields, and a ranked list of labelling regions. */
 #include "fielddis.h"
+#include "afv.h"
 #include "fit.h"
 #include "optcheck.h"
 #include "store.h"
@@ -442,6 +443,7 @@ int cmd_field_disagree(int argc, char **argv) {
 
 typedef struct {
     const fit_fields_buf *A, *B, *G; const fdl_cfg *c; float *pa, *pb, *cons, *cw; uint8_t *cls; uint8_t *phase, *conf, *kind; fdl_stat *st;
+    float *fc, *fs, *fw; uint16_t *fn;   /* evidence 1: the fibre votes per cell */
 } fdl_job;
 static void fdl_cellp(const fit_fields_buf *A, int z, int y, int x, double p[3]) {
     const int ix[3] = {z, y, x}; for (int d = 0; d < 3; d++) p[d] = ((double)A->origin[d] + A->h * (ix[d] + 0.5)) * A->um;
@@ -475,7 +477,8 @@ static void fdl_pass2(void *ctx, int z0, int z1, int t) {
         }
         if (J->cls[i] != 2) continue;
         double v[3], t1[3], t2[3], sc = 0, ss = 0, sw = 0; int ns = 0;
-        if (fd_normal(A, p, v)) {
+        if (c->evidence == 1) { sc = J->fc[i]; ss = J->fs[i]; sw = J->fw[i]; ns = J->fn[i]; }
+        else if (fd_normal(A, p, v)) {
             const int ax = fabs(v[0]) <= fabs(v[1]) && fabs(v[0]) <= fabs(v[2]) ? 0 : fabs(v[1]) <= fabs(v[2]) ? 1 : 2; double e[3] = {0, 0, 0}; e[ax] = 1;
             t1[0] = v[1] * e[2] - v[2] * e[1]; t1[1] = v[2] * e[0] - v[0] * e[2]; t1[2] = v[0] * e[1] - v[1] * e[0];
             const double l = sqrt(t1[0] * t1[0] + t1[1] * t1[1] + t1[2] * t1[2]); for (int d = 0; d < 3; d++) t1[d] /= l;
@@ -489,10 +492,10 @@ static void fdl_pass2(void *ctx, int z0, int z1, int t) {
             }
         }
         int pick = -1; double cf = 0;
-        if (ns >= c->min_samp && sw > 0) {
+        if ((c->evidence == 1 ? ns >= 1 : ns >= c->min_samp) && sw > 0) {
             const double R = hypot(sc, ss) / sw, e = atan2(ss, sc) / (2 * M_PI), ea = fabs(fd_wrap(J->pa[i] - e)), eb = fabs(fd_wrap(J->pb[i] - e));
             const double ek = fmin(ea, eb), m = fabs(ea - eb);
-            if (R >= 0.3 && ek <= c->max_err && m >= c->min_margin) { pick = ea <= eb ? 0 : 1; cf = R * fmin(1, m / 0.5) * fmin(1, (double)ns / (ring / 2.0)); }
+            if (R >= 0.3 && ek <= c->max_err && m >= c->min_margin) { pick = ea <= eb ? 0 : 1; cf = R * fmin(1, m / 0.5) * (c->evidence == 1 ? 1 : fmin(1, (double)ns / (ring / 2.0))); }
         }
         if (pick < 0) J->kind[i] = 4;
         else { J->kind[i] = (uint8_t)(2 + pick); J->phase[i] = fdl_code(pick ? J->pb[i] : J->pa[i]); J->conf[i] = fd_u8(cf * 255); if (!J->conf[i]) J->conf[i] = 1; }
@@ -511,7 +514,29 @@ int fdis_label(const fit_fields_buf *A, const fit_fields_buf *B, const fit_field
     int rc = 0;
     if (!J.pa || !J.pb || !J.cons || !J.cw || !J.cls || !J.st) rc = -1;
     else {
-        fit_par(A->shape[0], fdl_pass1, &J); const int n2 = fit_par(A->shape[0], fdl_pass2, &J);
+        fit_par(A->shape[0], fdl_pass1, &J);
+        if (c->evidence == 1) {   /* the fibre votes: per fibre its cells (consecutive duplicates dropped), the agreeing ones' mean, cast on its disagreement cells */
+            J.fc = calloc(N, 4); J.fs = calloc(N, 4); J.fw = calloc(N, 4); J.fn = calloc(N, 2); size_t *cells = nullptr; size_t cap = 0;
+            if (!J.fc || !J.fs || !J.fw || !J.fn) rc = -1;
+            for (int k = 0; rc == 0 && k < c->nfib; k++) {
+                const fib_set *F = c->fib[k];
+                for (int r = 0; r < F->n; r++) {
+                    size_t nc = 0; double vc = 0, vs = 0, vw = 0; int na = 0;
+                    for (int q = F->off[r]; q < F->off[r + 1]; q++) {
+                        const double pu[3] = {F->pts[3 * q] * c->fib_um, F->pts[3 * q + 1] * c->fib_um, F->pts[3 * q + 2] * c->fib_um}; double cq[3];
+                        if (!fd_cc(A, pu, cq)) continue;
+                        const size_t j = fd_near(A, cq); if (nc && cells[nc - 1] == j) continue;
+                        if (nc == cap) { cap = cap ? 2 * cap : 4096; cells = realloc(cells, cap * sizeof *cells); }
+                        cells[nc++] = j;
+                        if (J.cls[j] == 1) { vc += J.cw[j] * cos(2 * M_PI * J.cons[j]); vs += J.cw[j] * sin(2 * M_PI * J.cons[j]); vw += J.cw[j]; na++; }
+                    }
+                    if (na < c->min_samp) continue;
+                    for (size_t u = 0; u < nc; u++) { const size_t j = cells[u]; if (J.cls[j] != 2) continue; J.fc[j] += (float)vc; J.fs[j] += (float)vs; J.fw[j] += (float)vw; if (J.fn[j] < 65535) J.fn[j]++; }
+                }
+            }
+            free(cells);
+        }
+        const int n2 = rc ? 0 : fit_par(A->shape[0], fdl_pass2, &J);
         for (int t = 0; t < n2; t++) {
             const fdl_stat *s = &J.st[t];
             st->ndis += s->ndis; st->nlab += s->nlab; st->ncorrect += s->ncorrect; st->nA += s->nA; st->nB += s->nB; st->nB_ok += s->nB_ok; st->nAwrong_Bright += s->nAwrong_Bright; st->nAwrong_Bright_pickB += s->nAwrong_Bright_pickB; st->base_a += s->base_a; st->base_b += s->base_b; st->any_right += s->any_right;
@@ -519,7 +544,7 @@ int fdis_label(const fit_fields_buf *A, const fit_fields_buf *B, const fit_field
             for (int b = 0; b < 10; b++) { st->bin_n[b] += s->bin_n[b]; st->bin_ok[b] += s->bin_ok[b]; st->bin_a[b] += s->bin_a[b]; st->agree_bin_n[b] += s->agree_bin_n[b]; st->agree_bin_ok[b] += s->agree_bin_ok[b]; }
         }
     }
-    free(J.pa); free(J.pb); free(J.cons); free(J.cw); free(J.cls); free(J.st);
+    free(J.pa); free(J.pb); free(J.cons); free(J.cw); free(J.cls); free(J.st); free(J.fc); free(J.fs); free(J.fw); free(J.fn);
     return rc;
 }
 static int fdl_write(const char *out, const char *name, const fit_fields_buf *A, const uint8_t *a, const char *attrs) {
@@ -530,7 +555,7 @@ static int fdl_write(const char *out, const char *name, const fit_fields_buf *A,
    [--max-err 0.2] [--min-margin 0.1] [--tag T] [--threads 6]: OUT/{phase,conf,kind} zarr arrays on A's cells (fielddis.h); with --gt
    one row per confidence cut on stdout (and OUT/gt.tsv) */
 int cmd_field_label(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm field-label OUT FIELDS-A FIELDS-B [--gt ORACLE] [--conf 0.2] [--agree 0.1] [--rmin 2] [--rmax 8] [--nang 12] [--min-samp 8] [--max-err 0.2] [--min-margin 0.1] [--tag T] [--threads 6]\n"
+    if (argc < 5) { fprintf(stderr, "usage: ufsm field-label OUT FIELDS-A FIELDS-B [--gt ORACLE] [--fibres F.fib,.. --fib-um U] [--conf 0.2] [--agree 0.1] [--rmin 2] [--rmax 8] [--nang 12] [--min-samp 8] [--max-err 0.2] [--min-margin 0.1] [--tag T] [--threads 6]\n"
                                     "  labels for the cells where two models disagree, from the sheet continuity of the agreeing cells (src/fielddis.h)\n"); return 2; }
     const char *out = argv[2], *gtd = fd_opt(argc, argv, "--gt", nullptr), *tag = fd_opt(argc, argv, "--tag", out);
     fdl_cfg c = {.conf = opt_atof("--conf", fd_opt(argc, argv, "--conf", "0.2")), .agree = opt_atof("--agree", fd_opt(argc, argv, "--agree", "0.1")),
@@ -538,6 +563,14 @@ int cmd_field_label(int argc, char **argv) {
                  .rmin = opt_atoi("--rmin", fd_opt(argc, argv, "--rmin", "2")), .rmax = opt_atoi("--rmax", fd_opt(argc, argv, "--rmax", "8")),
                  .nang = opt_atoi("--nang", fd_opt(argc, argv, "--nang", "12")), .min_samp = opt_atoi("--min-samp", fd_opt(argc, argv, "--min-samp", "8"))};
     fit_set_threads(ufsm_threads(opt_atoi("--threads", fd_opt(argc, argv, "--threads", "6")), 6));
+    const char *fibs = fd_opt(argc, argv, "--fibres", nullptr); fib_set FB[8]; const void *FP[8]; int nfb = 0;
+    if (fibs) {   /* --fibres A.fib,B.fib --fib-um U (the points' voxel size in the scan frame) */
+        c.fib_um = opt_atof("--fib-um", fd_opt(argc, argv, "--fib-um", "0")); if (!(c.fib_um > 0)) { fprintf(stderr, "field-label: --fibres needs --fib-um\n"); return 2; }
+        char *t = strdup(fibs);
+        for (char *q = strtok(t, ","); q && nfb < 8; q = strtok(nullptr, ",")) { if (fib_load(q, &FB[nfb])) { fprintf(stderr, "field-label: cannot load %s\n", q); return 1; } FP[nfb] = &FB[nfb]; nfb++; }
+        free(t); c.evidence = 1; c.fib = FP; c.nfib = nfb;
+        if (!strcmp(fd_opt(argc, argv, "--min-samp", "x"), "x")) c.min_samp = 3;   /* (per fibre: its agreeing cells) */
+    }
     store_global_init();
     fit_fields_buf A, B, G; memset(&A, 0, sizeof A); memset(&B, 0, sizeof B); memset(&G, 0, sizeof G);
     if (fit_fields_load(argv[3], 0, 0, 1, &A) || fit_fields_load(argv[4], 0, 0, 1, &B)) { fprintf(stderr, "field-label: cannot load the fields\n"); return 1; }
@@ -570,6 +603,7 @@ int cmd_field_label(int argc, char **argv) {
         printf("  picks A %zu / B %zu (B right %zu); A wrong + B right on %zu cells, B picked on %zu of them\n", s.nA, s.nB, s.nB_ok, s.nAwrong_Bright, s.nAwrong_Bright_pickB);
     }
     free(ph); free(cf); free(kd); fit_fields_free(&A); fit_fields_free(&B); if (gtd) fit_fields_free(&G);
+    for (int k = 0; k < nfb; k++) fib_free(&FB[k]);
     return 0;
 }
 

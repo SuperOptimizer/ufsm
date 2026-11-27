@@ -859,6 +859,15 @@ The formal gate passes at cut 0.2 (0.909 on 7 % of the cells), but those labels 
 
 The agree-cell labels (0.952, 0.98 at weight >= 0.5) are plain committee pseudo-labels. They label where the models already agree, not the disagreement regions.
 
+**Fibre continuity** (lead follow-up; `field-label --fibres H.fib,V.fib --fib-um 2.399`): each fibre polyline's agreeing cells (at least 3) vote for the disagreement cells on it, since a sheet's phase is constant along a fibre. Input: our 1667 traces, fibtrace/p1667 arm A, ungated (arm B is gated by a winding fit, which is not independent). They cover two of the GT boxes:
+
+| box | disagreement cells labelled | accuracy | always try9 (all) | w24 picked where it is right and try9 wrong |
+|---|---|---|---|---|
+| C12 | 0.7 % | 0.611 | 0.890 | 275 of 45.6k |
+| C2 | 1.0 % | 0.441 | 0.756 | 628 of 114k |
+
+This is worse than trusting try9, and the coverage is ~1 %. The traced fibres do not hold one sheet's phase across the disagreement (cf. the tracer ties that hurt count-field, -0.03). Stopped there (lead: <= 1 h).
+
 What would add information on 1667: human traces in the worklist regions (sparse, with a partial-label loss), or evidence the nets do not share, e.g. a fitter ref-snap count. Rows: /vesuvius/ufsm/disagree/labgt/base (labgt.sh, labsumm.awk).
 
 ## Model disagreement as a labelling query: `ufsm field-disagree`, checked against the GT; a labelling worklist (2026-11-27, branch disagree-20261127, disagree)
