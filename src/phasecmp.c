@@ -81,6 +81,10 @@ int cmd_phase_cmp(int argc, char **argv) {
                     }
                 }
             }
+            if (getenv("UFSM_PCMP_DUMP") && !boxes) {   /* (the first box's A and B phases as raw uint8, P^3 z-major, and its origin) */
+                char fp[1200]; snprintf(fp, sizeof fp, "%s-%s-A.raw", getenv("UFSM_PCMP_DUMP"), sa->name); FILE *fa = fopen(fp, "wb"); if (fa) { fwrite(a, 1, N, fa); fclose(fa); }
+                snprintf(fp, sizeof fp, "%s-%s-B.raw", getenv("UFSM_PCMP_DUMP"), sa->name); FILE *fb = fopen(fp, "wb"); if (fb) { fwrite(b, 1, N, fb); fclose(fb); }
+                fprintf(stderr, "phase-cmp: dumped %s box %lld,%lld,%lld size %d\n", sa->name, (long long)o[0], (long long)o[1], (long long)o[2], P); }
             for (size_t v = 0; v < N; v++) {
                 const int kna = a[v] != PHASE_UNKNOWN, knb = b[v] != PHASE_UNKNOWN; kb += knb; ka += kna; lost += knb && !kna;
                 if (kna && knb) { int d = abs((int)a[v] - (int)b[v]); if (d > PHASE_PERIOD / 2) d = PHASE_PERIOD - d; both++; eq[0] += d == 0; eq[1] += d <= 2; eq[2] += d <= 6; eq[3] += d <= 13; }
