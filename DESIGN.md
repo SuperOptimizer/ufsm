@@ -6,6 +6,170 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Noisy ink labels: label smoothing exists, unlabelled-is-unknown negatives (--ink-neg-guard / --ink-neg-gate), an ADELE design (2026-11-27, branch inklabelfix-20261127, inklabelfix)
+
+What the ink head trains on today (checked in the code):
+
+- **Label smoothing** is already in: `--ink-smooth EPS` (nn_ink_targets_smooth, 2026-11-11). It smooths the voxel BCE target, the soft Dice
+  (same target plane) and the MIL ray label (ink_mil_fin's eps). The production ink and unrollperf recipes run 0.1, the paper's 3-D value;
+  the paper's 0.25 belongs to its 2.5-D nets. Nothing to add here; 0.25 could be one A/B arm.
+- **The mask.** inksplat writes prob254: 254 ink, 0 no ink, 255 unknown. A pixel outside the supervision mask, or one without an open
+  face, is unknown (the MIL rays cover the faceless ones). Inside the supervision mask every untraced pixel is a hard 0. So an untraced
+  letter inside a supervised region trains as "no ink", and so does the rim of a trace drawn a few pixels off the letter. `--ink-air S`
+  adds air voxels as 0 on an S-lattice; they are physics, not labels.
+
+**New, opt-in: unlabelled-is-unknown for the labelled negatives** (nn_ink_neg in nn_elem.cu; train.c head_slab_pass, both passes, training
+only: validation keeps every labelled negative, so val BCE stays comparable across arms). A known negative voxel (prob254 < 127; the
+air lattice reads 255 and is left alone) leaves the mask when:
+
+- `--ink-neg-guard R` (0..8 voxels at the window's level): a label positive (127..254) lies in the (2R + 1)^3 cube around it. This is
+  an explicit ignore band beyond the trace, for traces drawn up to R voxels off the letter. It looks at the labels only, so the net's
+  predictions cannot feed back into it.
+- `--ink-neg-gate T` (0 < T < 1): the ink head's current p > T at that voxel. The net already reads ink there, and the "no ink" label is
+  more likely a missing trace than a measurement. This is ADELE's correction step (below) in its mask form, applied online from the
+  same forward. It risks confirmation bias, so it starts at `--ink-neg-from STEP` (default 0; meant for fine-tunes from a trained net).
+- The log line gets ` inkneg guard F gate G`: the fractions of the known negatives dropped since the last log line (all GPUs).
+
+Both flags default to 0. Off, no kernel runs and no buffer is allocated, so the off path is byte-identical. Cost: one elementwise kernel
+per slab and pass. The guard reads the (2R + 1)^3 cube for known negatives only (R 2: 125 bytes, cached). test_ink_mil checks the
+masks and counts byte-exact against a host rule: five (R, T) cases with air-lattice voxels, a slab inside a 20 x 22 x 24 window.
+
+**ADELE (Liu et al., CVPR 2022, arXiv 2110.03740) on our ink head: the design.** ADELE tracks, per class, the IoU of the training
+predictions against the noisy labels. It fits y(t) = a (1 - exp(-b t^c)) to that curve. Once the slope falls to (1 - r) of its start
+(r 0.9), the net has fitted the clean labels and starts to memorise the noisy ones. From then on, ADELE replaces each label with the
+prediction where the prediction is confident (> 0.8), and adds a multi-scale consistency term so the corrected targets are stable.
+Mapped onto our losses:
+
+1. **Classes and grouping.** Two classes (ink, no ink) **per source**, not per scroll. Label quality differs by source: hand traces,
+   teacher pseudo-labels, HF labels, the atlas. Training IoU per source and class: device counters (tp, fp, fn at p > 0.5 over the known
+   voxels) in the ink loss-stats kernel, summed per window, read on the host at --log-every. The MIL rays get their own counters from
+   ink_mil_fin's pooled logit against the ray label, since the faceless pixels have no voxel IoU.
+2. **Onset detection on the host** (C, a new onset.c + test on synthetic curves): a Gauss-Newton fit of a, b, c on the series of each
+   (source, class) pair every log interval. Correction starts once the slope has fallen by r = 0.9 and at least 10 points exist. This
+   replaces `--ink-neg-from` with a per-source start step. A fine-tune from a trained net starts already saturated, so its onset is step
+   0 and the fixed-step gate built here covers it.
+3. **Correction, voxel targets.** For negatives, p > T masks the voxel (the gate above). Rewriting the target to p, as ADELE does,
+   would be a 2-line change in the same kernel (t := p x 255, m kept); the mask form is the conservative first arm. For positives
+   (`--ink-pos-gate`, to add), p < 1 - T masks the voxel. That covers band voxels off the true sheet and traces of letters that are not there.
+4. **Correction, MIL rays.** In ink_mil_fin, per ray from the pooled zr: label 0 with sigmoid(zr) > T, or label 1 with sigmoid(zr) <
+   1 - T, gets dL/dz = 0 (fin already writes each ray's dL/dz, so no extra pass). The ray label is what misses the depth offset. The MIL
+   max-pool absorbs the offset of a positive ray, so the positive half matters less here than in the voxel targets.
+5. **Onfly labels need no store.** ADELE keeps one corrected label per pixel across epochs. Ours are rebuilt per window, so the
+   correction is always the current net's, from the forward that computes the loss. That is the same rule applied online, at no
+   I/O cost.
+6. **Scale consistency.** ADELE's multi-scale term needs a second forward. Our cheap equivalent is to gate on an EMA or snapshot-averaged
+   net's prediction instead of the live one. That costs a second forward too, so we defer it until the plain gate shows a gain.
+7. **Guards.** The holdouts (0841, 1447, the HOLD boxes) see no correction (validation runs ungated). Per cycle, the gate must not lower
+   HOLD AUC; that is the confirmation-bias check from ink-labels.md #6.
+
+## ink-proto: prototype x teacher 3-D ink labels (arXiv 2606.29085 stage 2) with our own features lose to the teacher on HOLD (2026-11-27, branch inkproto-20261127, inkproto)
+
+**Idea.** The paper builds conservative 3-D labels as sigmoid(teacher) x minmax_chunk(cos(feature, ink prototype)) > 0.5, with air
+(CT < 50) masked. Its features come from an upstream DINO ViT, which we do not use. **Features:** the only per-voxel 3-D features of
+our own at ~2.4 um are our ink nets' trunk features. J1 died with no snapshot, the DINO2A ssl arm lost (−0.069), and dinovol is
+upstream. So this test uses R11P-12000's level-0 trunk output, the head's input (32 channels, `unet_head_feat_z`).
+
+**Code (opt-in; the off path is unchanged).**
+- `predict --proto-seed OUT.proto [--proto-thr 0.95]` sums the trunk features, raw and L2-normalised, over each window's interior
+  voxels whose own probability is >= thr.
+- `predict --proto P.proto [--proto-mean unit|raw]` replaces the output channel by 255 (1 + cos) / 2, CT-masked like any
+  probability.
+- `ufsm ink-proto label OUT --teacher .. --cos .. --ct ..` computes the per-chunk (`--chunk`, default 128) min-max of the cosine times
+  the teacher, masks CT < `--air` (default 50) and writes a score (1 + 254 s, 0 = masked) or a prob254 label (254 where s > `--thr`,
+  0 where not, 255 masked).
+- `ufsm ink-proto merge | show` handles the prototype files.
+- Kernels are in src/nn_proto.cu. tests/test_ink_proto.c checks the label chunk against a hand case and an independent loop, and
+  the kernels against host references.
+- predict refuses --tta, --channels, --heads, latent nets, --gpus, --feather and --seamless for the seed.
+
+**Seeds (no new clicks).** The 12 TRAIN 512^3 blocks per scroll with the most train ink and no val / hold voxels
+(/vesuvius/ufsm/inkproto/mkseed.sh), at teacher p >= 0.95.
+
+| | 1667 | P4 |
+|---|---|---|
+| seed voxels | 322 k | 1.32 M |
+| norm of the mean unit seed vector | 0.989 | 0.993 |
+
+The seed features are nearly collinear. The two scrolls' prototypes have cosine 0.989.
+
+**HOLD** (the tracker's 64 tiles per scroll; rung 2.2 = level 1 of the 1.129 um scans; w576 h32; `ink-audit --hold-only`; local CT
+copy /vesuvius/ufsm/inkperf/ctl/volcomp):
+
+| store | 1667 AUC | 1667 f1_128 | P4 AUC | P4 f1_128 |
+|---|---|---|---|---|
+| teacher R11P-12000 | .874 | .583 | .848 | .700 |
+| cosine alone | .793 | .669 | .823 | .723 |
+| score, chunk 128, air 50 | .831 | .561 | .837 | .681 |
+| score, no air mask | .830 | .562 | .839 | .682 |
+| score, chunk 64 | .843 | .558 | .828 | .681 |
+| score, chunk 256 | .855 | .561 | .846 | .680 |
+
+- **Paired** (FUSE, score − teacher ± region-jackknife SE): **1667 −0.043 ± 0.024** (63 regions), **P4 −0.011 ± 0.026** (64).
+- The binary label (s > 0.5, f1_128) is also below the teacher's, by −0.022 on 1667 and −0.020 on P4.
+- Labelled share: 7.9 % ink on 1667 and 10.4 % on P4. The air mask (CT < 50) drops 63 % / 43 % of the tiles' voxels.
+
+**Why it does not help here.** The prototype lies in the feature space of the teacher itself. The head is linear on those features,
+so the cosine only re-weights the teacher's own evidence. The per-chunk min-max then stretches the noise in chunks with little ink.
+The paper's gain comes from an independent representation (DINO trained on 10 scrolls).
+
+**Decision.** No student A/B. Repeat only with a feature extractor of our own that is independent of the teacher (a successful SSL
+or J1 trunk). The commands stay opt-in for that.
+
+## Global winding assignment: L1 count integration (count-field --cf-robust); no box gain over L2, the box gain is the ref snap itself (2026-11-27, branch globwind-20261127, globwind)
+
+Lead: solve the winding numbers jointly, under the topology constraint (one turn per revolution), instead of locally. What already exists:
+count-field integrates rho n into one single-valued U, so the turn per revolution holds by construction; its closing error measures
+the loop residues. fit --uw-repair is a PUMA L1 integer solve over phase pieces (l1pot) with geo / w4 / fibre votes. levelsolve
+(11-18) showed that piece integers cannot add turns the phase skips (PH1 oracle 0.222 -> 0.238). So the open lever is how the count
+reference is integrated. L2 smears a merge's missing turns over everything beyond it; L1 (the Ghiglia-Romero L1 unwrapping) cuts them
+inside the merge and carries the count around it.
+
+`count-field --cf-robust K [--cf-robust-delta 0.02]` runs K IRLS passes per level on the count edges. Each edge weight becomes
+w0 min(1, delta / |r|) for the edge residual r (turns per solve cell). With a small delta this is convex L1. It works on both the CPU
+and the GPU CG: on C19, with the unroll's ref recipe, |delta| p99 is 0.0011 turn and the snap integers agree on 0.99998 of cells.
+Default off; the off path is unchanged. A redescending Cauchy weight was unstable (at delta 0.01 it broke the defect-free lenses) and
+was dropped.
+
+**Synthetic** (test_countfield robust_lens: spiral, true phase, a bounded density defect lens at r 16..28 cells, theta 0.2..1.4; the
+table gives the share of sector cells beyond the lens > 0.5 turn off):
+
+| defect | L2 | --cf-robust 8 |
+|---|---|---|
+| 3 sheets merged (sp x 4) | 1.000 | 0.000 |
+| merged, sp x 2 | 0.000 | 0.000 |
+| extra sheets (sp x 0.5) | 1.000 | 0.000 |
+| one missed sheet (2-sheet lens, sp x 2) | 0.000 | 0.000 |
+
+Huber delta 0.25 or 0.05 does not reach L1: the lens deficit spreads over many edges, each below delta.
+
+**wbench boxes** (20 boxes PH1-3, HOLD, C2-C24; fixed fields; CPU fits, production flags; base = plain fit; snap = `--ref-model CF
+--ref-snap 1` with CF the box's own L2 count-field ref; rob02 = the same with `--cf-robust 8 --cf-robust-delta 0.02`). ids, paired
+box bootstrap 95 % CI:
+
+| fields | arm - base | all 20 | packed C19/21/22/24 | PH1-3 | 13 controls |
+|---|---|---|---|---|---|
+| try9 (bl-t9) | snap | +0.040 [+0.009, +0.082] | +0.054 [+0.012, +0.096] | +0.094 [+0.010, +0.140] | +0.023 [-0.008, +0.079] |
+| try9 | rob02 | +0.036 [+0.009, +0.075] | +0.044 [+0.013, +0.086] | +0.084 [+0.031, +0.130] | +0.022 [-0.007, +0.076] |
+| try9 | rob02 - snap | | -0.010 [-0.036, +0.004] | -0.010 [-0.047, +0.021] | -0.001 [-0.004, +0.001] |
+| w24-2000 | rob02 | -0.183 [-0.257, -0.107] | -0.125 [-0.371, +0.040] | +0.075 [+0.014, +0.181] | -0.260 [-0.343, -0.176] |
+| w24-2000 | snap | -0.176 [-0.250, -0.100] | | | |
+
+- try9 base / snap / rob02 means: 0.788 / 0.828 / 0.824 ids, p05x 0.814 / 0.833 / 0.832. The largest gains: C14 0.54 -> 0.89, PH1
+  0.23 -> 0.37, PH3 0.13 -> 0.27, C19 0.67 -> 0.76 (snap; rob02 0.71), C22 0.77 -> 0.87. The losses are small (C4 -0.03, C10 -0.01).
+- **The box gain is the ref snap, not L1.** The unroll already snaps its slab fits to the global count-field ref, so this finding is
+  about wbench's plain fit: it scores the fitter without the count reference the production unroll uses.
+- **L1 adds nothing over L2 inside a box.** Box merges are not bounded lenses with a consistent path around them in the box. Whether
+  L1 helps at region scale is unroll's arm C (1667 comparison unroll, REFX="--cf-robust 8 --cf-robust-delta 0.02",
+  /vesuvius/ufsm/unrollrun/cmp/PHerc1667-C/qa). Not a default.
+- **w24 (step 2000) fields lose under any ref snap.** Their count targets do not integrate: on C11 the count-field closing error is
+  0.167 turn mean with 17 % of 4x4 loops > 0.25 turn, against try9's 0.069 and 1.4 %. w24's phase carries its fits; its density /
+  normal count is not usable yet. A closing-error check (count-field prints it) tells, before the snap, whether a field set's count
+  can be trusted.
+- Not built: the layered optimal-surface min-cut (research/graph.md idea 1, sheets.md idea 3). It needs per-sheet costs that separate
+  touching sheets, which is the information the nets' fields lack in packed regions (pseudolab 11-18). With today's fields a
+  minimum-spacing arc would place sheets by the constraint, not by the evidence.
+- Scripts and rows: /vesuvius/ufsm/globwind (arm.sh, h1.sh, h2.sh, res/*.tsv, gpuchk.sh).
+
 ## try9 + w24 at fit time: a phase mean helps the packed boxes; train --cond-fields for a try9-conditioned 2.4 um net (2026-11-27, branch condnet-20261127, condnet)
 
 w24 (native 2.4 um, P 640 = 1.5 mm field of view) loses wbench to try9 (9.6 um, 6.1 mm) at step 2000 (packed ids -0.122, controls -0.168).

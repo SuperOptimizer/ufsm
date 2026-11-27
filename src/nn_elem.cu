@@ -668,6 +668,49 @@ extern "C" void nn_ink_air(const uint8_t *pap, size_t n, int z0, int H, int W, i
     const uint8_t t0 = eps > 0 ? (uint8_t)lrintf(127.5f * eps) : 0;   /* (= ink_tgs_k on v = 0: rn(0 x a + 127.5 eps)) */
     ink_air_k<<<nblk(n, 256), 256>>>(pap, n, z0, H, W, S, t0, t, m); KCHECK();
 }
+/* train --ink-neg-guard R / --ink-neg-gate T: unlabelled-is-unknown for the ink head's labelled negatives (DESIGN 2026-11-27). A known
+   label negative (prob254 < 127; the --ink-air lattice reads 255 and is left alone) of the slab leaves the mask when (guard, R > 0) a
+   label positive (127..254) lies in the (2R + 1)^3 cube around it in the window (the trace's outline and lateral offset), or (gate, lthr
+   finite) the head's current ink logit exceeds lthr (an untraced letter: the "no ink" label there is a missing trace, not a measurement).
+   ink: the window's plane (D x H x W), the slab = voxels [vb, vb + n) of it; lg, m: the slab's. cnt (nullable): + known negatives, guard
+   drops, gate drops. */
+__global__ void ink_neg_k(const uint8_t *ink, size_t vb, size_t n, int D, int H, int W, int R, const __half *lg, float lthr, uint8_t *m, unsigned long long *cnt) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    int neg = 0, dg = 0, dt = 0;
+    if (i < n && m[i] && ink[vb + i] < 127) {
+        neg = 1;
+        const size_t hw = (size_t)H * W, g = vb + i; const int z = (int)(g / hw), y = (int)(g % hw / W), x = (int)(g % W);
+        for (int a = max(z - R, 0); R > 0 && !dg && a <= min(z + R, D - 1); a++)
+            for (int b = max(y - R, 0); !dg && b <= min(y + R, H - 1); b++) {
+                const uint8_t *row = ink + (size_t)a * hw + (size_t)b * W;
+                for (int c = max(x - R, 0); c <= min(x + R, W - 1); c++) { const uint8_t v = row[c]; if (v >= 127 && v != 255) { dg = 1; break; } }
+            }
+        if (!dg && lg && __half2float(lg[i]) > lthr) dt = 1;
+        if (dg || dt) m[i] = 0;
+    }
+    if (cnt) {
+        const unsigned bn = __ballot_sync(0xffffffffu, neg), bg = __ballot_sync(0xffffffffu, dg), bt = __ballot_sync(0xffffffffu, dt);
+        if ((threadIdx.x & 31) == 0) { if (bn) atomicAdd(&cnt[0], (unsigned long long)__popc(bn)); if (bg) atomicAdd(&cnt[1], (unsigned long long)__popc(bg)); if (bt) atomicAdd(&cnt[2], (unsigned long long)__popc(bt)); }
+    }
+}
+static unsigned long long *g_inkneg_cnt[64];   /* mgpu: per-device (indexed by the calling thread's device) */
+extern "C" void nn_ink_neg(const uint8_t *ink, size_t vb, size_t n, int D, int H, int W, int R, const void *lg, float thr, uint8_t *m, int count) {
+    if (!n || (R < 1 && !(thr > 0 && thr < 1))) return;
+    int dev = 0; cudaGetDevice(&dev); if (dev < 0 || dev >= 64) dev = 0;
+    if (count && !g_inkneg_cnt[dev]) { CK(cudaMalloc(&g_inkneg_cnt[dev], 3 * sizeof(unsigned long long))); CK(cudaMemset(g_inkneg_cnt[dev], 0, 3 * sizeof(unsigned long long))); }
+    const int gate = lg && thr > 0 && thr < 1;
+    const float lthr = gate ? logf(thr / (1.f - thr)) : 0.f;
+    ink_neg_k<<<nblk(n, 256), 256>>>(ink, vb, n, D, H, W, R > 0 ? R : 0, gate ? (const __half *)lg : nullptr, lthr, m, count ? g_inkneg_cnt[dev] : nullptr); KCHECK();
+}
+extern "C" void nn_ink_neg_counts(unsigned long long out[3]) {   /* every device's, since the last call (then reset); zeros before the first use */
+    out[0] = out[1] = out[2] = 0; int cur = 0; cudaGetDevice(&cur);
+    for (int dev = 0; dev < 64; dev++) {
+        if (!g_inkneg_cnt[dev]) continue;
+        unsigned long long c[3]; cudaSetDevice(dev);
+        CK(cudaMemcpy(c, g_inkneg_cnt[dev], sizeof c, cudaMemcpyDeviceToHost)); CK(cudaMemset(g_inkneg_cnt[dev], 0, sizeof c)); out[0] += c[0]; out[1] += c[1]; out[2] += c[2];
+    }
+    cudaSetDevice(cur);
+}
 /* --cond: the winding mod 14 turns in 1/18-turn steps (band.h band_winding, 0..251, 255 unknown) -> 4 target planes, cos / sin of
    2 pi q / 14 and of 2 pi q / 2 (q = v / 18 turns), each 127.5 + 127.5 x; mask = known */
 __global__ void cond_tg_k(const uint8_t *wv, size_t n, uint8_t *t, uint8_t *m) {
