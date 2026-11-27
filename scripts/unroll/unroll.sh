@@ -55,6 +55,7 @@
 # DRY=1: print the plan (commands) without running anything. Runs from a copy of these scripts in $O/bin (edits never touch a run).
 # Env: RECTOSP (1; 0 = no m7 recto spacing), RECTOSRC, RECTOSPX, U (ufsm), UR, TH (20), FIELDGPUS ("0 1"), FITGPUS ("0 1"), FITLANES (auto), INKGPU (1), INKCMD, REFCMD, CK, INKCK, INKNAME, MINMEM, PERWRAP,
 #   INKPX (extra ink predict args, e.g. "--channel ink" for a v2 universal checkpoint as INKCK),
+#   INKSEAM (the predict ink pass: 2 = --seamless 2, the default since 11-27; 4 / 8; 0 = one --feather INKF pass),
 #   CTROOT / CTKEY (replace the table's CT root / key), ZCACHE_GB (auto) / ZCACHE_ADMIT (0.6): the decoded-CT cache of the render stages,
 #   TAG (output dir suffix), ITH / PTH (ink / fields predict threads), FACES, SPAR (4 per-wrap jobs), CLEAN (1: fields + slab fits deleted once the wraps exist; the mf plane kept), MFLAG (1: merge-flag mask) / MFTHR (179), STRIPARGS / ZR / BOX (override scrolls.tsv).
 set -u
@@ -233,7 +234,7 @@ mstart() {
   elif [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK FEMA FPX FGRID INKCK INKCMD LATINK_CK R3W R3GATE R3PWGATE FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK FEMA FPX FGRID INKCK INKSEAM INKCMD LATINK_CK R3W R3GATE R3PWGATE FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -567,8 +568,10 @@ ink() {
   cal=$(echo $box | awk -F, '{ zc = $1 + int($4 / 2); z0 = zc - 1024; if (z0 < $1) z0 = $1; nz = 2048; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
   local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $(lg $INKGPU) --axis $O/axis.json $(occlv)"
   inkcal || return 1
-  # one feathered pass (inklib.sh): window auto (576/32 on 16 GB, 1088/32 from ~46 GB free), each border blended over 32 voxels; resumable
-  X $O/logs/ink.log $U predict $INKCK $R $K $INK $P ${INKPX:-} --box $box --window ${INKW:-auto} --halo ${INKH:-32} --feather ${INKF:-32} --full-grid 1 --resume 1 --levels 4 \
+  # --seamless 2 by default (lead 11-27, DESIGN "R11P HOLD rows": PHerc1203 window-seam jump 4.76 plain -> 0.13 / 0.11 at offsets 0 / 256,
+  # 1.3x a w832 / h160 pass, which only reaches 1.24): two tile grids sin^2-blended; INKSEAM=0 = the old single feathered pass (INKF voxels)
+  local seam; [ "${INKSEAM:-2}" = 0 ] && seam="--feather ${INKF:-32}" || seam="--seamless ${INKSEAM:-2}"
+  X $O/logs/ink.log $U predict $INKCK $R $K $INK $P ${INKPX:-} --box $box --window ${INKW:-auto} --halo ${INKH:-32} $seam --full-grid 1 --resume 1 --levels 4 \
     --gn-frozen $O/ink/gn.bin || return 1
 }
 
