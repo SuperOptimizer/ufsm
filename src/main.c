@@ -347,6 +347,7 @@ static int usage(void) {
         "  ufsm fiber-trace <root> <key-prefix> <out.fib> --box Z,Y,X,NZ,NY,NX [--scaledown 3]   streamlines through a published fibre prediction (presence, nx, ny) -> UFIB\n"
         "  ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY)   H / V fibre mask labels (prob254) on the CT grid\n"
         "  ufsm fiber-onfly <fibres.afv|.fib> --ct ROOT KEY [--ref H V KEY]   the fibre planes on the fly (sources \"fibre\" targets): ms / window, diffs\n"
+        "  ufsm field-disagree OUT FIELDS1 FIELDS2 .. [--gt ORACLE] [--labelled ROOT KEY --lab-um U] [--region 512 --frame-um U]   where models' fit fields disagree (position, normal wrap count, winding mod 4): volume + ranked labelling regions\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean] [--paste F [--box z,y,x,nz,ny,nx]]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
@@ -4928,6 +4929,7 @@ int cmd_annot_export(int argc, char **argv);   /* src/annot_export.c */
 int cmd_gt_anchors(int argc, char **argv);   /* src/anchors.c */
 int cmd_annot_regions(int argc, char **argv);
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
+int cmd_field_disagree(int argc, char **argv);   /* src/fielddis.c */
 int cmd_flatten(int argc, char **argv);         /* src/flatten.c */
 int cmd_faces(int argc, char **argv);           /* src/faces_cli.c */
 int cmd_flatten_warp(int argc, char **argv);
@@ -5017,6 +5019,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "gt-anchors")) return cmd_gt_anchors(argc, argv);
     if (!strcmp(cmd, "annot-regions")) return cmd_annot_regions(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
+    if (!strcmp(cmd, "field-disagree")) return cmd_field_disagree(argc, argv);
     if (!strcmp(cmd, "flatten")) return cmd_flatten(argc, argv);
     if (!strcmp(cmd, "faces")) return cmd_faces(argc, argv);
     if (!strcmp(cmd, "flatten-warp")) return cmd_flatten_warp(argc, argv);
