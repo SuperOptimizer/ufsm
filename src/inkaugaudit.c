@@ -276,12 +276,12 @@ int cmd_ink_augaudit(int argc, char **argv) {
         /* tiles: centred on a pseudo-random unassigned point, keeping the points >= D + 3 sigma + 2 voxels inside */
         const double m = D + 3 * hps + 2; int ntc = 0; uint64_t rs = amix((uint64_t)ncrop + 17);
         while (ntc < mtile) {
-            int un = 0; for (int i = p0; i < np; i++) un += pts[i].tile < 0;
+            int un = 0; for (int i = p0; i < np; i++) un += pts[i].tile == -1;   /* (-2: tried, in a rejected tile or a centre) */
             if (!un) break;
-            int pick = (int)(amix(rs++) % (uint64_t)un), c0 = -1; for (int i = p0; i < np; i++) if (pts[i].tile < 0 && !pick--) { c0 = i; break; }
+            int pick = (int)(amix(rs++) % (uint64_t)un), c0 = -1; for (int i = p0; i < np; i++) if (pts[i].tile == -1 && !pick--) { c0 = i; break; }
             int64_t o[3]; for (int k = 0; k < 3; k++) { int64_t v = (int64_t)floor(pts[c0].q[k]) - P / 2; if (v > grp[gi].shape[k] - P) v = grp[gi].shape[k] - P; if (v < 0) v = 0; o[k] = v; }
             int n1 = 0, n0 = 0;
-            for (int i = p0; i < np; i++) { if (pts[i].tile >= 0) continue; int in = 1; for (int k = 0; k < 3; k++) { const double u = pts[i].q[k] - o[k]; in &= u >= m && u <= P - 1 - m; }
+            for (int i = p0; i < np; i++) { if (pts[i].tile != -1) continue; int in = 1; for (int k = 0; k < 3; k++) { const double u = pts[i].q[k] - o[k]; in &= u >= m && u <= P - 1 - m; }
                 if (in) { pts[i].tile = nt; if (pts[i].ink) n1++; else n0++; } }
             pts[c0].tile = pts[c0].tile < 0 ? -2 : pts[c0].tile;   /* (a centre outside its own tile's margin: never picked again) */
             if (nt == capt) { capt *= 2; tiles = realloc(tiles, (size_t)capt * sizeof *tiles); }
