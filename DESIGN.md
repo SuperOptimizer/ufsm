@@ -61,6 +61,7 @@ Mapped onto our losses:
    net's prediction instead of the live one. That costs a second forward too, so we defer it until the plain gate shows a gain.
 7. **Guards.** The holdouts (0841, 1447, the HOLD boxes) see no correction (validation runs ungated). Per cycle, the gate must not lower
    HOLD AUC; that is the confirmation-bias check from ink-labels.md #6.
+
 ## try9 + w24 at fit time: a phase mean helps the packed boxes; train --cond-fields for a try9-conditioned 2.4 um net (2026-11-27, branch condnet-20261127, condnet)
 
 w24 (native 2.4 um, P 640 = 1.5 mm field of view) loses wbench to try9 (9.6 um, 6.1 mm) at step 2000 (packed ids -0.122, controls -0.168).
