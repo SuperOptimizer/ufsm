@@ -6,6 +6,53 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Wrap-count (topology) loss `--topo-lambda` and the phase-near component filter (2026-11-27, branch topoloss-20261127, topoloss)
+
+**Why.** w24 puts confident extra sheets into packed 1667 boxes: at phase-near conf > 0.6, C10 pred → GT is 19.8 um vs 4.8 for try9, with
+3-4x try9's sheet voxels on C10 / C12. The per-voxel phase BCE pays only the few voxels of a slip, but a slip costs a whole winding id.
+
+**The loss** (`nn_topo_slab`, src/nn_loss.cu; opt-in, off = no kernel runs):
+- A sheet is a phase-0 crossing, so the sheet count between two points along the normal equals the turns the phase makes between them.
+- Rays start at every `--topo-stride` K-th voxel per axis (default 4). The lattice is shifted per training window, so every voxel serves as a
+  centre over K^3 windows.
+- Each ray follows the label's phase normal (central code differences, as pgrad) for up to `--topo-len` N unit steps each way (default 16:
+  ±38 um at 2.4 um, about one packed gap). It keeps a ray only if it has ≥ N steps inside the slab, all labelled and in the mask.
+  - Holdout / clipped voxels end a ray. Head-slab seams end it too.
+  - Scroll normals lie mostly in the slab plane, so the 32-plane slabs rarely cut rays.
+- Per ray: Tg = Σ |wrapped label step| / 252 and Tp = Σ |angle(b conj a)| / 2π over the same steps. Tp is the phase's total variation:
+  - an extra sheet adds about +1 turn;
+  - a phase dithering across 0 or folding back also adds rotation;
+  - a missed sheet (the phase standing still over a label turn) gives about −1.
+- Loss: huber(Tp − Tg, δ 1 turn), weighted by the centre's mask weight (packed ×8), mean over the rays, × λ × the source's phase weight.
+- It is angle-only: blurring the phasor buys nothing. The gradient is tangential, 1 / |a|, with |a|^2 floored at 0.05.
+- It is applied like pgrad: the stats pass sums the ray weights only, the gradient pass accumulates fp32 into 2 slab planes, then
+  `nn_pgrad_apply` scales by λ / Σw.
+  - hgs is off with it on, as with pgrad. Float atomics make it not bit-deterministic.
+- The latent stream and the fused gradient pass stay on.
+- Refused: --rv 1, --single, --split z, the fused guided side head.
+- Log: `topo L (count errors E, dT T turn)`, where E is the weight share of rays off by more than half a turn.
+
+**Tests.**
+
+| check | result |
+|---|---|
+| test_topo: device sums vs host reference (fp32 and fp16 logits) | Σw exact; loss / dT equal to 5 digits |
+| weight-only call; lattice offsets 0..7 at K 2 vs K 1 | exact |
+| 40 gradients vs central differences of the host loss | worst rel. error 0.0000 |
+| apply into fp16 gradients | worst rel. 3e-4, accumulator zeroed |
+| semantics: clean / extra turn / missed turn | count errors 0 / 0.17 / > 0.1, mean dT +0.0001 / +0.18 / < 0 |
+| test_topo_train (fixture, --det, latent w24 layout + plain) | λ 0 logs = no flag; λ 1 logs topo on 100 % of windows; --rv 1 refused |
+| branch vs master binary, the w24 latent layout, flag off | logged loss terms identical |
+
+**phase-near `--min-comp N[,N..]`.** The survey's first pick (topo.md #6) is a no-retraining post-filter. This option drops predicted sheet
+components (26-connected) smaller than N voxels before the distances. `--conf` takes a list too, giving one row per pair from one GT read.
+test_phase_near covers it: a spurious blob is counted, then dropped exactly. Numbers on C10 / C12 / C19 / C2: pending (the CPU pair rule
+for the GT exceeded 1 h per box; it reruns on a card).
+
+**A/B** (card-0 slot n2; /vesuvius/ufsm/topoloss/ab): the arms resume w24 snap/4000 → 5000 with w24's command and seed, UFSM_LAT_FUSE=0:
+A control, B `--topo-lambda 1`, C / D densvar's density arms, E hardspot's hard-spot sampling. Scoring: phase-near on C10 / C12 / C19 / C2
+and wb24's wbench ids. Pending.
+
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
 
 - Why: under -std=c23, phasecmp.c called floor / ceil / llround without <math.h> (fixed in b32c16ca). mcc took them as int f()
