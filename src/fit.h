@@ -1,7 +1,8 @@
 /* Winding fitter (ufsm fit): a smooth "unwrapped radius in turns" U(x) fitted to dense fit fields (winding phase, sign-free
    normal n n^T, sheet spacing, material weight), so that the winding coordinate W = U - dir theta / 2 pi has its integer level
    sets on the recto faces. theta = atan2(y - cy(z), x - cx(z)) around the umbilicus; dir = +1 when the radius grows with the
-   unwrapped theta along a sheet (PHercParis4). Every loss reads cos / sin (2 pi W) and grad W, both smooth away from the axis, so
+   unwrapped theta along a sheet (PHercParis4). The native (z, y, x) are the scan's zarr axes and the wraps / tifxyz outputs copy them
+   axis for axis (x.tif = native x + origin), so the same theta and dir hold in tifxyz coordinates (tests/test_dir_convention.c). Every loss reads cos / sin (2 pi W) and grad W, both smooth away from the axis, so
    the branch cut of theta only shows in floor(W). U = r / pitch(z) + offset(z) + delta(x): pitch and offset on z knots (linear),
    delta on a dense trilinear lattice refined coarse to fine. Coordinates are native voxels relative to the field box origin. */
 #pragma once

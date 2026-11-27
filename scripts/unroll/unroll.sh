@@ -449,7 +449,9 @@ refcz() { echo ${REFCZ:-512}; }
 # (measured against published surfaces), else count-field's own vote. Its ring vote can be empty (PHerc1667: sheets far from circles),
 # and then it fell back to +1 silently: the 11-12 1667 unroll had the wrong hand (sheet identity vs the published unwrap 0.48; the ref
 # with --dir -1: 0.73, DESIGN 2026-11-14). An empty vote is logged to progress.log.
-# spiral_dir.tsv: scroll, dir (+1 / -1; anything else = unknown), source (GT | published | estimator | unknown), evidence. Without an
+# spiral_dir.tsv: scroll, dir (+1 / -1; anything else = unknown), source (GT | published | estimator | unknown), evidence. dir is read
+# in the scan's own voxel frame (zarr z / y / x = tifxyz z / y / x): theta = atan2(y - cy, x - cx), +1 = a sheet's radius grows with
+# theta, -1 = it shrinks (src/fit.h; seghand.py; pinned by tests/test_dir_convention.c). Without an
 # entry count-field decides itself and REFUSES when it has no evidence (no ring vote): set SPIRALDIR, add the scroll, or REFX="--dir-default-ok 1".
 spiraldir() { [ -n "${SPIRALDIR:-}" ] && { echo $SPIRALDIR; return; }; awk -F'\t' -v s=$S '$1 == s && ($2 == "1" || $2 == "+1" || $2 == "-1") { print $2 }' $H/spiral_dir.tsv 2> /dev/null | head -1; }
 ref() {

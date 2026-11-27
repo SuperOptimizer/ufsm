@@ -117,6 +117,7 @@ ufsm_exe(test_fields_phase SUITE tests/test_fields_phase.c OBJS fieldsphase fit 
          LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit SUITE tests/test_fit.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit_dir SUITE tests/test_fit_dir.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
+ufsm_exe(test_dir_convention SUITE tests/test_dir_convention.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_uwfill SUITE tests/test_uwfill.c OBJS fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit_emb SUITE tests/test_fit_emb.c OBJS fit_emb embz z3w fit fit_ct l1pot coreline json zarr3 store NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_fit_join SUITE tests/test_fit_join.c OBJS fitjoin afv phasegate fit fit_emb embz z3w fit_ct l1pot coreline json zarr3 store NN

@@ -214,3 +214,46 @@ int cmd_wrap_rays(int argc, char **argv) {
     if (cf) fit_free(cf);
     return 0;
 }
+
+/* ufsm wrap-w <fit-model-dir> <tifxyz>... [--zr z0,z1]: the fit model's winding coordinate W on wrap meshes in the model's own frame (no
+   map): per mesh the median W, its spread (p10 / p90), and the least-squares slope of W against the model's unwrapped theta along each grid
+   row (turns per turn). The spread is the check (2026-11-26, PHerc1203 hand question): a wrap that is a W level set of this model has
+   W = k within a small spread (the -p wraps vs their ref-cf: p10 / p90 k -0.16 .. k +0.17), so it winds the model's dir in the mesh's frame
+   by construction (tests/test_dir_convention.c). The row slope is noisy on crushed scrolls (folds; W unwrapped at half-turn jumps), so
+   read it only as a hint. */
+int cmd_wrap_w(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm wrap-w <fit-model-dir> <tifxyz>... [--zr z0,z1]\n"); return 2; }
+    fit_model *m = fit_load(argv[2]); if (!m) { fprintf(stderr, "wrap-w: cannot load %s\n", argv[2]); return 1; }
+    double z0 = -1e30, z1 = 1e30; const char *zr = wr_opt(argc, argv, "--zr", nullptr); if (zr && sscanf(zr, "%lf,%lf", &z0, &z1) != 2) { fprintf(stderr, "wrap-w: --zr z0,z1\n"); return 2; }
+    const int na = (int)(m->D * m->h) + 1;
+    for (int a = 3; a < argc; a++) {
+        if (!strcmp(argv[a], opt_n("--zr"))) { a++; continue; }
+        char p[2100]; int w[3], h[3]; float *X[3]; const char *nm[3] = {"x", "y", "z"}; int bad = 0;
+        for (int c = 0; c < 3; c++) { snprintf(p, sizeof p, "%s/%s.tif", argv[a], nm[c]); if (!(X[c] = img_read_f32(p, &w[c], &h[c]))) bad = 1; }
+        if (bad) { fprintf(stderr, "wrap-w: cannot read %s\n", argv[a]); return 1; }
+        const int gw = w[0], gh = h[0]; size_t n = 0, cap = (size_t)gw * gh; double *Ws = malloc(sizeof(double) * cap), sl = 0; int nsl = 0, pos = 0;
+        double *tt = malloc(sizeof(double) * gw), *ww = malloc(sizeof(double) * gw);
+        for (int r = 0; r < gh; r++) {
+            int k = 0; double prev = 0, off = 0;
+            for (int c = 0; c < gw; c++) {
+                const size_t i = (size_t)r * gw + c; if (X[2][i] < 0 || X[2][i] < z0 || X[2][i] > z1) continue;
+                const double z = X[2][i] - (double)m->origin[0], y = X[1][i] - (double)m->origin[1], x = X[0][i] - (double)m->origin[2];
+                const double W = fit_W(m, z, y, x), th = atan2(y - wr_axis(m->cy, na, z), x - wr_axis(m->cx, na, z));
+                if (k) { double d = th - prev; if (d > M_PI) off -= 2 * M_PI; else if (d < -M_PI) off += 2 * M_PI; }
+                prev = th; tt[k] = (th + off) / (2 * M_PI); ww[k] = W; k++; Ws[n++] = W;
+            }
+            if (k < 20) continue;
+            /* W is continuous across the theta cut only up to a turn: unwrap it too */
+            for (int j = 1; j < k; j++) { while (ww[j] - ww[j - 1] > 0.5) ww[j] -= 1; while (ww[j] - ww[j - 1] < -0.5) ww[j] += 1; }
+            double st = 0, sw = 0, stt = 0, stw = 0; for (int j = 0; j < k; j++) { st += tt[j]; sw += ww[j]; stt += tt[j] * tt[j]; stw += tt[j] * ww[j]; }
+            const double den = k * stt - st * st; if (fabs(den) < 1e-9 || stt / k - (st / k) * (st / k) < 0.01) continue;
+            const double s = (k * stw - st * sw) / den; sl += s; nsl++; pos += s > 0;
+        }
+        double med = NAN, p10 = NAN, p90 = NAN;
+        if (n) { qsort(Ws, n, sizeof *Ws, wr_cmp_d);
+            med = Ws[n / 2]; p10 = Ws[n / 10]; p90 = Ws[n * 9 / 10]; }
+        printf("%s\tW median %.3f p10 %.3f p90 %.3f\tdW/dturn mean %+.3f over %d rows (%d > 0)\n", argv[a], med, p10, p90, nsl ? sl / nsl : NAN, nsl, pos);
+        for (int c = 0; c < 3; c++) free(X[c]); free(Ws); free(tt); free(ww);
+    }
+    fit_free(m); return 0;
+}

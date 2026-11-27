@@ -138,6 +138,7 @@ test_ink_gate                                  |              |     2 | ./$B/tes
 test_ink_atlas                                 |              |     1 | ./$B/test_ink_atlas
 test_countfield                                | gpu          |     6 | ./$B/test_countfield
 test_fit_dir                                   |              |     2 | ./$B/test_fit_dir
+test_dir_convention                            | smoke        |     1 | ./$B/test_dir_convention
 test_uwfill                                    |              |     1 | ./$B/test_uwfill
 test_vwt_sample                                |              |     1 | ./$B/test_vwt_sample
 test_spiralfit                                 | gpu          |    32 | ./$B/test_spiralfit
