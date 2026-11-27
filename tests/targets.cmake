@@ -343,6 +343,7 @@ ufsm_exe(test_typed_zarr SUITE tests/test_typed_zarr.c OBJS z3w zarr3 store json
 ufsm_exe(bench_chunk_map tests/bench_chunk_map.c OBJS z3w zarr3 store json LIBS LDLIBS)
 ufsm_exe(test_tile_list SUITE tests/test_tile_list.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_ink_blend_block SUITE tests/test_ink_blend_block.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
+ufsm_exe(test_ink_proto SUITE tests/test_ink_proto.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_chunk_map SUITE tests/test_chunk_map.c OBJS z3w zarr3 store json LIBS LDLIBS)
 ufsm_exe(test_wrapxsec SUITE tests/test_wrapxsec.c OBJS wrapxsec optcheck z3w zarr3 store json tfx imgops jpegpar tiffw tiff surfcomp LIBS LDLIBS m)
 ufsm_exe(test_wraprays SUITE tests/test_wraprays.c OBJS CORE NN LP LIBS LDLIBS CUDA m)

@@ -255,6 +255,7 @@ test_chunk_map                                 | smoke        |     2 | ./$B/tes
 test_wrapxsec                                  | smoke        |     2 | ./$B/test_wrapxsec
 test_wraprays                                  | smoke        |     2 | ./$B/test_wraprays
 test_ink_blend_block                           |              |     5 | ./$B/test_ink_blend_block
+test_ink_proto                                 | gpu          |     3 | ./$B/test_ink_proto
 test_tile_list                                 |              |     1 | ./$B/test_tile_list
 test_http_reader                               |              |    29 | python3 tests/test_http_reader.py
 test_checkpoint_runtime                        | smoke        |     1 | ./$B/test_checkpoint_runtime
