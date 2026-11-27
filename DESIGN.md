@@ -23,20 +23,30 @@ of another w4_d x um are left out with a DEFAULTED line. The output's w4_d is in
 | fz-phn: w24 phase + normals | -0.015 [-0.072, +0.030] | -0.015 [-0.056, +0.014] | -0.056 [-0.122, +0.019] | -0.028 [-0.044, -0.009] |
 | **fz-phb: phase = complex mean of both (resultant), the rest try9** | **+0.025 [+0.001, +0.065]** | **+0.015 [+0.003, +0.038]** | +0.007 [-0.042, +0.068] | -0.003 [-0.015, +0.012] |
 | fz-w24c: w24, winding mod 4 + spacing from try9 | -0.015 [-0.071, +0.030] | -0.015 [-0.056, +0.014] | -0.055 [-0.122, +0.020] | -0.027 [-0.044, -0.009] |
+| **fz-phbm: phase mean with --conf mean (the mean input confidence as the length), the rest try9: the recipe** | **+0.032 [+0.003, +0.078]** | **+0.023 [+0.005, +0.050]** | +0.020 [-0.006, +0.069] | -0.001 [-0.010, +0.013] |
+| fz-phbw: phase mean, weights try9 1 : w24 2 | +0.035 [+0.009, +0.064] | | -0.009 [-0.071, +0.064] (14 of 16) | |
 
 - fz-phb box by box:
   - C14 0.543 -> 0.924 and C22 0.781 -> 0.866;
   - C4 0.912 -> 0.695;
   - the other boxes within +-0.02.
-  The mean lowers the confidence where the two nets disagree, so the fitter leans on its other terms there.
+  The resultant mean lowers the confidence where the two nets disagree. On C4 w24's phase is wrong (w24-phase-only 0.727), the confidence
+  cancels and the fitter loses the phase term there.
+- **Recipe (fz-phbm):** `ufsm field-blend OUT T9 W24 --weights 1,0 --plane-w phase=1,1 --conf mean`. --conf mean keeps try9's
+  confidence: C4 holds (0.905), C14 0.543 -> 0.916, C22 0.781 -> 0.882, C24 0.924 -> 0.944; no box loses more than 0.015 (C3).
+- **Snap** (`field-blend --snap R`, fb_phase_snap, test_fblend test_snap; lead: "try9 counts the sheets, w24 places them"): in[0]'s phase
+  turned to in[1]'s where the two sheets lie within R um (|dphi| / 2 pi x in[0]'s spacing), else in[0]'s; in[0]'s confidence kept. It
+  cannot add a wrap. phase-near (unrollperf, pn1 / pn2) showed why that matters: w24 places GT sheets slightly closer (GT -> pred p50
+  13.1 vs 16.8 um on C10) but adds 3-4x the phase wraps, confidently (conf > 0.6 on C10: pred -> GT p50 19.8 um vs try9's 4.8).
+  The R sweep (4.8 / 9.6 / 14.4 um) on wbench and phase-near: below when scored.
 - w24's phase alone is broken on the Paris 4 PH1-3 boxes (ids 0.10-0.13, try9 0.12-0.21). It also fails C10 and C12 (0.29 / 0.53). Swapping
   the phase therefore loses the controls.
 - Rows: /vesuvius/ufsm/wbench/res/fz-*.tsv. Kit: /vesuvius/ufsm/condnet/fuse.sh and wbfuse.sh.
 
 **try9-conditioned net** (`train --cond-fields 1 [--cond-drop 0.3]`, `predict --cond-fields DIR[,DIR..] | none`).
 - Input: another model's fit-field sets on the scan, a source's `"cond": {"fields": [DIR, ..]}`. They enter as a second 32-channel MX input
-  block of a latent net (unet_cfg.cond_ch = 11, cin 32 -> 64, header key "cond_ch").
-- The 11 channels (sample_cond.h):
+  block of a latent net (unet_cfg.cond_ch = 12, cin 32 -> 64, header key "cond_ch").
+- The 12 channels (sample_cond.h):
   - pc, ps;
   - w, sp, dq;
   - the three winding mod 4 differences as dq-weighted (cos, sin) per output axis, permuted and sine-negated under the window's cube symmetry.
@@ -45,6 +55,9 @@ of another w4_d x um are left out with a DEFAULTED line. The output's w4_d is in
   tensor.
 - Missing data: a dropped window (probability --cond-drop), an echo / replay and cells outside the sets all read 0.
 - Warm start: init-from a net without the block zero-initialises the stem's new columns (copy_conv_in), so the donor's function is kept.
+- Presence (channel 11, lead: absence marked, not read as zero fields): the trilinear weight of the field cells that exist. A set's
+  cond_tiles.txt (the predict's tile list) limits it to its tiles, so unpredicted cells read presence 0, while a set's air is present
+  with zero planes. Dropped windows (--cond-drop, default 0.5: try9's fields are in-sample on part of 1667) are absent everywhere.
 - Predict: fills channels 32-63 of its 16-bit input (nn_cond_h16); there is no --tta.
 - Tests:
   - test_gpu_input cond_check: the trainer chain equals predict's byte for byte, plus a host reference;
@@ -62,7 +75,9 @@ of another w4_d x um are left out with a DEFAULTED line. The output's w4_d is in
 
 - Cost: at ~19 Mvox/s for try9 fit fields (the wbench --boxes rate, 5060 Ti) that is 6-10 h of card time.
 - Disk: ~18 GB at 19.2 um cells with q8 phase.
-- The predicts wait for the lead's go.
+- Scope (lead / user 11-27, validation only): try9 fields for PHerc1667 only (67.5 Gvox, ~1 h of card 1, cpred1.sh), then a
+  1667-only fine-tune from w24 snap/4000, cond vs base, ~1 h (800 steps) per arm (ft.sh), scored on the 1667 wbench boxes and
+  phase-near. 0814 / 0139 / Paris4 only if that is positive.
 
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
 
