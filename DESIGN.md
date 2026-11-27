@@ -421,6 +421,22 @@ at w320).
   border voxels see zero-padded context. That fits `--seamless 2` taking the jump to 0.11 (unroll's ab640c).
 - The fix is a larger halo or seamless, not frozen statistics.
 - w1024 at level 0 does not fit a 16 GB card (an 18.25 GB slab buffer; predict stops with an OOM error, rc 1).
+- **Halo vs seamless (11-27, gn/seam832.sh, gn/hold832h.sh, master 41f1176c, card 1).** The PHerc1203 block above, interior 512;
+  ink-seam jump at the window seams (offset 0) and at the half-offset lattice (offset 256):
+
+  | arm | predict s | jump off0 | jump off256 |
+  |---|---|---|---|
+  | w576 h32 | 18 | 4.76 | −0.06 |
+  | w704 h96 | 32 | 2.77 | −0.03 |
+  | w832 h160 | 52 | 1.24 | −0.02 |
+  | w576 h32 `--seamless 2` | 68 | 0.13 | 0.11 |
+
+  HOLD at rung 1.1, w832 h160 − w768 h32, paired: 1667 .903 vs .896 = +0.006 ± 0.010, P4 .895 vs .891 = +0.003 ± 0.006
+  (predict 136 vs 105 s). The CT for this HOLD check is a local copy re-staged for it (r11/ctl/stage3.sh, 39 GB).
+- **Verdict:** a larger halo is AUC-neutral and cuts the seam ~4x, but `--seamless 2` is ~10x lower again at 1.3x the time.
+  Seamless 2 stays the seam fix; no predict default changed.
+- A first run of this A/B on an old branch build (before perf's blend-region fix f7478578) showed seamless 2 at off256 7.64, i.e.
+  pass b's own seams. That was the stale binary, not a current bug.
 
 ## PHerc1203 status: every read so far shows no text; card 0 stops reading this band (2026-11-26, unroll)
 
