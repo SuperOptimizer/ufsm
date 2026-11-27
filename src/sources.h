@@ -153,6 +153,9 @@ typedef struct {
                                                   the same group (ufsm downsample --mode phase, key = that level's um) instead of pooling per read */
     uint8_t *focus; int64_t focus_grid[3]; float focus_w;   /* optional "focus": {"map": RAW, "w": K} (ufsm phase-packing --map: per coarse occupancy cell 0 none, else
                                                               1 + 254 x packed share): the position draw takes a cell 1 + K x share times as often */
+    uint8_t *hard; int64_t hard_grid[3]; int hard_lev; double hard_um; float hard_frac;   /* optional "hard": {"map": RAW, "frac": F} (ufsm hard-map: per cell of
+                                                              2^lev level-0 voxels of a scan of "um" (RAW.json) 0 easy, 1..255 hard weight): that share of the source's position
+                                                              draws takes a cell from the hard cells (villa's hard_fraction; hardspot 2026-11-27) */
     int64_t zb_below; float zb_k;   /* optional "zboost": {"below": N, "k": K}: occupancy cells with z index < N (cells of the occupancy grid, see the log line) are drawn K times as often */
     z3 *wind;    /* optional, with a stored phase: the winding mod 14 turns on the same grid (ufsm phase-raster --winding; band.h
                     band_winding), {"band": {..., "phase": {...}, "winding": {"root": ..., "key": ...}}}: the --cond targets / condition */
@@ -178,6 +181,8 @@ typedef struct {
     int nemb, emb_level; char *emb_grp[8], *emb_name;   /* optional "emb": {"groups": [DIR, ...] (<= 8), "name": "pca64", "level": L}: unit-vector feature
                                targets (dinovol-embed / emb-pca zarr groups in global cells of this scan; the embedding voxel = a level-L voxel) for
                                train --distill (sample_cfg.emb_ch); where several groups cover a cell the first with a vector wins */
+    int ncond; char *cond_dir[16];   /* optional "cond": {"fields": [DIR, ...] (<= 16)}: fit-field sets (predict --fit-zarr: fields.json + zarr planes; another
+                               model's, e.g. try9's) on this scan, the conditioning input of train --cond-fields (src/sample_cond.h); the first set holding a cell wins */
     unsigned long long aux_dflt;   /* sample.c aux_read: DEFAULTED printed once per (target channel, level): bit ch * MAXLEV + l (atomic builtins) */
     unsigned long long mil_n[7];   /* sample.c --ink-mil windows of this source: [0] with rays, [1..6] without (level, crushed, torn, delam, curved,
                                       no ray table) (atomic builtins; the DEFAULTED summary) */

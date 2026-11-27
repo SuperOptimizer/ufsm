@@ -47,6 +47,8 @@ typedef struct {
                                 0.58-0.85 (9.6 um) and 0.43-0.69 (19.2 um) of the interior */
     float vox_cap;           /* --vox-cap K: a source's geometry-head loss scaled by min(1, K x its mean known-phase share / the weighted mean share): the loss is a per-window
                                 mean, so a source whose windows hold few labels got its voxels up to x8 (0500P2-gt) */
+    float hard_frac;         /* --hard-frac F (hardspot 2026-11-27): > 0 overrides every "hard" source's frac (the share of its position draws from its hard cells), < 0 turns
+                                them off, 0 keeps the json's */
     float focus_w;           /* --focus-w W: overrides every "focus" source's w (packed-sheet draw weight, off at 0 / without a map) */
     int stick;               /* --stick-src N: a rejected draw is retried from the SAME source up to N times (the rejections took 35-46 % of 1299 / 0139-u2ink draws) */
     int snap;                /* align training windows to the CT chunk grid (3x fewer chunks decoded per window) */
@@ -198,6 +200,9 @@ typedef struct {
                                 the native input crop (P / 4)^3], both under one symmetry and tone LUT. 1, task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
                                 batch.x / x16 and batch.m are absent (the trainer degrades the window on the device); training windows lie inside a
                                 source "boxes" entry when the source lists boxes, validation windows inside its holdout box; level = the source's min_level */
+    int cnd_div; float cnd_drop;   /* train --cond-fields: batch.cnd, the sources' "cond" fit fields (sample_cond.h, COND_K planes) on the grid of cnd_div^3
+                                window voxels per cell through the window's symmetry and warp; a window keeps none (all 0) with probability cnd_drop (one draw
+                                per window, only when cnd_div > 0), on crushed / torn / re-bent windows and outside the sets. 0: off */
     float emb_pap;           /* train --distill-papyrus F: targets only on head cells >= F papyrus (sources "papyrus" / "iso"; sample_emb.h); 0 off */
     int emb_ch, emb_div;     /* train --distill: batch.emb, the sources' "emb" feature targets (emb_ch channels, sources.h) on the grid of emb_div^3 window
                                 voxels per cell (the head's level), pulled at each cell centre through the window's symmetry and warp (trilinear,
@@ -261,6 +266,7 @@ typedef struct {
     void *lvr; int lvmax;    /* B x lvmax lv_chunk_ref (nn_latvol.h): the streams' offsets in its lvc part and first cells */
     int *nlvr; size_t *lvn;  /* B: the streams and bytes of each direct window */
     const void **lvz;        /* B: the latvol array (z3 *) of each direct window (its codec: z3_latvol) */
+    int8_t *cnd;             /* cfg.cnd_div: B x COND_K x (Pz / cnd_div) x (P / cnd_div)^2 conditioning planes (sample_cond.h) */
     int8_t *emb;             /* cfg.emb_ch: B x emb_ch x (Pz / emb_div) x (P / emb_div)^2 feature targets (int8 x 127 unit vectors, channel planes; a cell
                                 with all channels 0 has none) */
 } batch;
@@ -332,6 +338,8 @@ uint64_t sampler_aug_count(const sampler *sp, int which);   /* windows that rece
 /* draws dropped by reason: [0] the coarse CT probe (min_fg, before the CT read), [1] the CT read's min_fg, [2] empty targets
    (empty_keep), [3] overlapping a holdout box (training; not counted in rejected) */
 void sampler_reject_reasons(const sampler *sp, uint64_t why[4]);
+void sampler_hard_stats(const sampler *sp, int si, uint64_t out[3]);   /* source si: windows kept from a hard-cell draw, all its kept windows, kept windows on a hard cell
+                                                                          (by either draw: the unboosted rate is (out[2] - out[0]) / (out[1] - out[0])) */
 void sampler_prof_print(const sampler *sp);   /* env UFSM_SAMPLER_PROF=1: per-stage cpu ms per patch */
 /* UFSM_SAMPLER_PROF: windows built and their mean wall ms from the first draw attempt, by source class (0 labelled, 1 ct_only) */
 void sampler_class_stats(const sampler *sp, uint64_t n[2], double ms[2]);

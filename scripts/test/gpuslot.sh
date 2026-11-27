@@ -5,7 +5,8 @@
 #
 #   gpuslot.sh add REF [REGEX]      queue REF (a commit of this clone) for the next slot: its touched fast-tier tests (run_suite -c against
 #                                   its merge base with origin/master), or only the tests matching REGEX. Prints the ticket.
-#   gpuslot.sh prep [-b N]          build every queued commit not built yet (ROOT/<sha>: release + verify, lowprio, -j N, default 4)
+#   gpuslot.sh rm TICKET...         drop queued requests (a stale / superseded head), logged in results.txt
+#   gpuslot.sh prep [-b N]        build every queued commit not built yet (ROOT/<sha>: release + verify, lowprio, -j N, default 4)
 #   gpuslot.sh drain [-g GPU] [-m MIN] [-x S] [-w MIN2]
 #                                   the slot: first takes gpu<GPU>.excl SHARED, waiting up to MIN2 minutes (default 10) for a job that
 #                                   holds it exclusively, and keeps it for the slot, so no exclusive job (an unroll, a trainer) starts on
@@ -125,6 +126,17 @@ status)
   echo "queue ($Q):"; [ -s "$Q" ] && while IFS= read -r l; do [ -z "$l" ] && continue; qparse "$l"
     printf '  %s %-28s %s %-9s %4s h  %s\n' "$T" "$REF" "${SHA:0:12}" "$(built "$SHA" && echo built || { [ -f "$ROOT/${SHA:0:12}/build.failed" ] && echo FAILED || echo "not built"; })" "$(tage "$T")" "${RX:-touched}"; done < "$Q"
   echo "last results ($RES):"; tail -n 8 "$RES" 2> /dev/null; true
+  ;;
+rm)   # gpuslot.sh rm TICKET... : drop queued requests (stale / superseded heads; lead 11-27), under the queue lock, logged in results.txt
+  [ $# -ge 1 ] || { echo "usage: gpuslot.sh rm TICKET..."; exit 2; }
+  qlock; [ -s "$Q" ] || { echo "gpuslot: queue empty"; exit 0; }
+  : > "$Q.rm"; nrm=0
+  while IFS= read -r l; do [ -z "$l" ] && continue; qparse "$l"; keep=1
+    for t in "$@"; do [ "$T" = "$t" ] && keep=0; done
+    if [ $keep = 1 ]; then printf '%s\n' "$l" >> "$Q.rm"; else nrm=$((nrm + 1))
+      printf '%s %s %-28s removed by %s\n' "$(date '+%m-%d %H:%M')" "$T" "$REF" "${USER:-?}" | tee -a "$RES"; fi
+  done < "$Q"
+  mv -f "$Q.rm" "$Q"; [ $nrm = $# ] || { echo "gpuslot: removed $nrm of $# (unknown tickets ignored)"; exit 1; }
   ;;
 *) sed -n '2,21p' "$0"; exit 2;;
 esac

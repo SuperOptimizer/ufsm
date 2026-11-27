@@ -252,6 +252,11 @@ void nn_skip_bwd_check(void);
 void nn_skip_wg_begin(void);
 void nn_skip_wg_end(void);
 void nn_input_latc(const void *ct16, shape5 xs, const void *rec, const float *bas, const float *gain, int C, float step, void *y);
+/* train / predict --cond-fields (unet_cfg.cond_ch): channels 32 .. 63 of a 64-channel latent input (xs: the cell grid) from K int8 conditioning planes
+   cd [n][K][gd][gh][gw] (v / 127; coarse cells of 2^3 latent cells, trilinear x2, fp16-rounded; cd nullptr: zeros). nn_cond_mx into the MX
+   input (after nn_input_latc wrote block 0), nn_cond_h16 into a 16-bit [n][64][d][h][w] window (predict: then nn_h16_to_mx gives the same bits) */
+void nn_cond_mx(void *y, shape5 xs, const void *cd, int K, int gd, int gh, int gw);
+void nn_cond_h16(void *y, shape5 xs, const void *cd, int K, int gd, int gh, int gw);
 /* train --lat-direct-p: rows of window n's cells [cz0, cz0 + ncz) of nn_input_latc's input with the C coefficient channels from stored latvol
    cells (int8 [ncz][h][w][stride], nn_latvol_decode's layout, raw-domain step step_raw) z-scored with the window's mean / isd (predict's
    nn_lat_input_qs), the radial channels as nn_input_latc's */

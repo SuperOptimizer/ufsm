@@ -1,6 +1,7 @@
 /* ufsm CLI. */
 #include "afv.h"
 #include "mergeflag.h"
+#include "hardmap.h"
 int cmd_denselab_render(int argc, char **argv);   /* src/denselab.c */
 int cmd_ink_rayface(int argc, char **argv);       /* src/denselab.c */
 int cmd_ink_wrapscore(int argc, char **argv);     /* src/wrapscore.c */
@@ -143,6 +144,7 @@ int cmd_sheet_cut(int argc, char **argv);   /* src/sheetcut.c */
 int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
+int cmd_ink_strat(int argc, char **argv);   /* src/inkstrat.c */
 int cmd_ink_runs(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach_up(int argc, char **argv);   /* src/inksplat.c */
@@ -184,6 +186,7 @@ static int usage(void) {
         "  ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24]   window-seam jump of a uint8 predict (border vs interior |dv|)\n"
         "  ufsm ingest-zip <labels.zip> <zarr-name> <out-dir> --um U  label zarr from the HF archive -> volcomp pyramid\n"
         "  ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--T 3] <mesh.sfc|tifxyz>...  meshes -> label pyramid\n"
+        "  ufsm occ-tiles <sources.json> <out-prefix> [--level 2] [--tile 512] [--margin 64]   per source the tiles near its labelled cells (predict --tile-list)\n"
         "  ufsm mesh-tiles OUT.txt --level L --tile T [--dilate D] [--shape Z,Y,X] <tifxyz|.sfc>...   the tiles meshes touch (predict --tile-list)\n"
         "  ufsm ingest-kaggle <hf-root> <out-dir> [--n N]          Kaggle cubes -> volcomp images + labels\n"
         "  ufsm ingest-mesh <root> <tifxyz-key> <out.sfc>           tifxyz -> surfcomp\n"
@@ -234,6 +237,7 @@ static int usage(void) {
         "  ufsm ink-audit SEGS.json --ct ROOT KEY --ct-um U [--pred ROOT KEY] [--holdouts H]   onfly ink labels per split: positives, face offsets, band CT, AUC per band shift\n"
         "  ufsm ink-vscore --gt ROOT KEY --pred ROOT KEY --box z,y,x,nz,ny,nx   voxelwise AUC / F1 of a 3-D ink prediction vs a 3-D reference (ink-splat)\n"
         "  ufsm ink-score --surface TIFXYZ --labels L [--mask M] --map NAME=MAP.tif ..   F1 / AUC of 2D ink maps vs a segment's published labels\n"
+        "  ufsm ink-strat --rows FILE[:TAG,CROP,AUC] .. [--leaks TSV] [--ref TAG]   per-scroll / per-recipe ink scores, worst scroll, paired deltas\n"
         "  ufsm ink-runs LABELS.tif [--mask M] [--px-um U] [--row TAG]   ink stroke width quartiles (min of the row / column run per ink px)\n"
         "  ufsm ink-teach --segs SEGS --teacher NAME=MAP%%s .. --out DIR   2D teacher maps -> calibrated, gated soft ink label windows (on-the-fly ink)\n"
         "  ufsm ink-teach-up SEGS-TEACH.json OUT [--up 2]   ink-teach windows at label_scale / up (p bilinear in the mask, mask nearest)\n"
@@ -316,6 +320,7 @@ static int usage(void) {
         "  ufsm ink-wrapscore WRAPS SEGS.json OUT --ct-key K --maps n=DIR,..   held-out ink AUC of rendered maps on an unroll's wraps (pairwrap in C, cached samples)\n"
         "  ufsm ink-rayface SOURCES.json [--source N] [--gpu D] [--verify N]   the onfly ink sources' MIL face-drop bits precomputed (no CT read per window)\n"
         "  ufsm merge-flag <fields-dir> [--out DIR] [--thr 179]               the merged-sheet score per field cell (plane mf: phase vs density count, confidence)\n"
+        "  ufsm hard-map --out RAW --um U --shape Z,Y,X [--mf ZARR] [--boxes TSV]  the sampler's hard-spot map (a source's \"hard\": merges, id changes)\n"
         "  ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR] [--out DIR]       per-wrap uncertain share from mf, <wrap>_mf.tif masks on the vertex grid\n"
         "  ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ..] [--nb FIT].. [--exclude ..]   strict stretches of a box fit -> label tifxyz + q.tif\n"
         "  ufsm ct-fields <ct-root> <key> <fields-dir> --ct-um U   CT planes ct / cs of a fit-field directory (fit --w-ct / --w-cspacing)\n"
@@ -351,7 +356,7 @@ static int usage(void) {
         "  ufsm fiber-trace <root> <key-prefix> <out.fib> --box Z,Y,X,NZ,NY,NX [--scaledown 3]   streamlines through a published fibre prediction (presence, nx, ny) -> UFIB\n"
         "  ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY)   H / V fibre mask labels (prob254) on the CT grid\n"
         "  ufsm fiber-onfly <fibres.afv|.fib> --ct ROOT KEY [--ref H V KEY]   the fibre planes on the fly (sources \"fibre\" targets): ms / window, diffs\n"
-        "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean] [--paste F [--box z,y,x,nz,ny,nx]]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
+        "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean] [--paste F [--box z,y,x,nz,ny,nx]] [--plane-w GROUP=a,b,..:..]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
         "  ufsm z3-diff <root-a> <key-a> <root-b> <key-b> [--box ..]   two uint8 arrays: differing voxels, |a-b| histogram, flips across 128\n"
@@ -3670,6 +3675,41 @@ static int cmd_surfsnap(int argc, char **argv) {
     return nw ? 0 : 1;
 }
 
+/* ufsm occ-tiles <sources.json> <out-prefix> [--level 2] [--tile 512] [--margin 64] (2026-11-27, condnet): per source the predict --tile-list
+   (OUT-PREFIX.<name>.txt, "iz iy ix" tiles of --tile level-L voxels from 0) of every tile within --margin level-L voxels of a labelled cell of
+   the sampler's occupancy index (the cells windows are drawn around): which tiles a stored conditioning field (try9 fit fields for train
+   --cond-fields) must cover. Prints the tiles and their level-L voxels per source. */
+static int cmd_occ_tiles(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm occ-tiles <sources.json> <out-prefix> [--level 2] [--tile 512] [--margin 64]\n"); return 2; }
+    const int L = opt_atoi("--level", opt(argc, argv, "--level", "2")), T = opt_atoi("--tile", opt(argc, argv, "--tile", "512")), M = opt_atoi("--margin", opt(argc, argv, "--margin", "64"));
+    if (L < 0 || T < 1 || M < 0) { fprintf(stderr, "occ-tiles: --level >= 0, --tile >= 1, --margin >= 0\n"); return 2; }
+    sources *S = sources_load(argv[2]); if (!S) return 1;
+    int rc = 0; double all = 0;
+    for (int i = 0; i < S->n; i++) {
+        source *s = &S->src[i]; occ_index o = source_occupancy(s);
+        if (!o.n) { fprintf(stderr, "occ-tiles: %s: no occupancy index, skipped\n", s->name); continue; }
+        const double f = ldexp(1.0, o.lev - L);   /* level-L voxels per occupancy cell */
+        int64_t nt[3]; for (int d = 0; d < 3; d++) nt[d] = (int64_t)ceil(o.shape[d] * f / T) + 1;
+        const size_t ntot = (size_t)nt[0] * nt[1] * nt[2]; uint8_t *mk = calloc(ntot, 1); if (!mk) { rc = 1; break; }
+        for (size_t k = 0; k < o.n; k++) {
+            const uint32_t id = o.idx[k]; const int64_t c[3] = {(int64_t)(id / (o.shape[1] * o.shape[2])), (int64_t)((id / o.shape[2]) % o.shape[1]), (int64_t)(id % o.shape[2])};
+            int64_t lo[3], hi[3];
+            for (int d = 0; d < 3; d++) {
+                const double a = c[d] * f - M, b = (c[d] + 1) * f + M - 1;
+                lo[d] = a < 0 ? 0 : (int64_t)floor(a / T); hi[d] = (int64_t)floor(b / T); if (hi[d] >= nt[d]) hi[d] = nt[d] - 1;
+            }
+            for (int64_t z = lo[0]; z <= hi[0]; z++) for (int64_t y = lo[1]; y <= hi[1]; y++) for (int64_t x = lo[2]; x <= hi[2]; x++) mk[((size_t)z * nt[1] + y) * nt[2] + x] = 1;
+        }
+        char fn[2048]; snprintf(fn, sizeof fn, "%s.%s.txt", argv[3], s->name); FILE *fo = fopen(fn, "w");
+        if (!fo) { fprintf(stderr, "occ-tiles: cannot write %s\n", fn); free(mk); rc = 1; break; }
+        size_t n = 0; for (size_t q = 0; q < ntot; q++) if (mk[q]) { fprintf(fo, "%zu %zu %zu\n", q / ((size_t)nt[1] * nt[2]), q / (size_t)nt[2] % (size_t)nt[1], q % (size_t)nt[2]); n++; }
+        fclose(fo); free(mk);
+        const double gv = (double)n * T * T * T / 1e9; all += gv;
+        printf("occ-tiles: %s: %zu labelled cells (level %d) -> %zu tiles of %d^3 at level %d (margin %d): %.1f Gvox -> %s\n", s->name, o.n, o.lev, n, T, L, M, gv, fn);
+    }
+    printf("occ-tiles: %.1f Gvox at level %d over all sources (shared scans counted per source)\n", all, L);
+    sources_free(S); return rc;
+}
 /* ufsm field-blend OUT IN1 IN2 ... [--weights a,b,...] [--tile SZ,SY,SX --grids z,y,x:z,y,x:...] [--conf resultant|mean|medoid] [--threads N]:
    fit-field sets of several models on one grid blended into OUT (src/fblend.h: the phase as the confidence-weighted complex mean,
    its length the new confidence). --tile: the inputs are overlapping predicts of one model on tile interiors of SZ x SY x SX level
@@ -3677,9 +3717,13 @@ static int cmd_surfsnap(int argc, char **argv) {
    per-cell weights sin^2 of the cell's place in its interior (fb_tile_w). --conf mean: the mean input confidence as the length;
    --conf medoid: the phase of the input closest to the others, unchanged (a median of 3+ models).
    --paste F [--box z,y,x,nz,ny,nx]: IN2.. are sub-box predicts pasted over IN1 with F-cell feathered faces (src/fblend.h); --box
-   writes only that part of IN1 (shard-aligned), for scripts/spiralqa/field_paste_link.sh to overlay on IN1's shards. */
+   writes only that part of IN1 (shard-aligned), for scripts/spiralqa/field_paste_link.sh to overlay on IN1's shards.
+   --plane-w GROUP=w1,w2,..[:GROUP=..] (field fusion): per plane group (phase normal sp w w4 r) its own input weights; weight 0 (there or
+   in --weights) leaves the input out of the plane. E.g. try9 + w24: --weights 1,0 --plane-w phase=0,1 (src/fblend.h).
+   --snap R (um): IN1's phase turned to IN2's where their sheets lie within R (in IN1's spacing), else IN1's: IN2 places IN1's sheets,
+   never adds one (fb_phase_snap). E.g. try9 + w24: --weights 1,0 --snap 9.6. */
 static int cmd_field_blend(int argc, char **argv) {
-    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant", *paste = nullptr, *box = nullptr; int nt = ufsm_threads(0, 8);
+    const char *in[32]; float w[32]; int n = 0; const char *ws = nullptr, *out = nullptr, *tile = nullptr, *grids = nullptr, *conf = "resultant", *paste = nullptr, *box = nullptr, *pws = nullptr, *snap = nullptr; int nt = ufsm_threads(0, 8);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], opt_n("--weights")) && i + 1 < argc) { ws = argv[++i]; continue; }
         if (!strcmp(argv[i], opt_n("--threads")) && i + 1 < argc) { nt = atoi(argv[++i]); continue; }
@@ -3688,6 +3732,8 @@ static int cmd_field_blend(int argc, char **argv) {
         if (!strcmp(argv[i], opt_n("--conf")) && i + 1 < argc) { conf = argv[++i]; continue; }
         if (!strcmp(argv[i], opt_n("--paste")) && i + 1 < argc) { paste = argv[++i]; continue; }
         if (!strcmp(argv[i], opt_n("--box")) && i + 1 < argc) { box = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--plane-w")) && i + 1 < argc) { pws = argv[++i]; continue; }
+        if (!strcmp(argv[i], opt_n("--snap")) && i + 1 < argc) { snap = argv[++i]; continue; }
         if (!strncmp(argv[i], "--", 2)) { fprintf(stderr, "field-blend: unknown option %s\n", argv[i]); return 2; }
         if (!out) out = argv[i]; else if (n < 32) in[n++] = argv[i]; else { fprintf(stderr, "field-blend: at most 32 inputs\n"); return 2; }
     }
@@ -3708,6 +3754,24 @@ static int cmd_field_blend(int argc, char **argv) {
         free(t);
         if (k != n) { fprintf(stderr, "field-blend: %d grids for %d inputs\n", k, n); return 2; }
         o.tile = 1;
+    }
+    if (pws) {   /* GROUP=w1,w2,..:GROUP=.. */
+        char *t = strdup(pws), *sv = nullptr;
+        for (char *q = strtok_r(t, ":", &sv); q; q = strtok_r(nullptr, ":", &sv)) {
+            char *eq = strchr(q, '='); if (eq) *eq = 0;
+            const int g = eq ? fb_group_id(q) : -1;
+            if (g < 0) { fprintf(stderr, "field-blend: --plane-w GROUP=w1,w2,..[:GROUP=..], GROUP phase|normal|sp|w|w4|r (got %s)\n", q); free(t); return 2; }
+            int k = 0; char *sv2 = nullptr;
+            for (char *v = strtok_r(eq + 1, ",", &sv2); v; v = strtok_r(nullptr, ",", &sv2)) { if (k < 32) o.pw[g][k] = (float)atof(v); k++; }
+            if (k != n) { fprintf(stderr, "field-blend: --plane-w %s: %d weights for %d inputs\n", q, k, n); free(t); return 2; }
+            o.pw_on[g] = 1;
+        }
+        free(t);
+    }
+    if (snap) {   /* --snap R: both inputs' phase is read (phase weights 1,1 unless given) */
+        o.snap_um = atof(snap); if (!(o.snap_um > 0) || n != 2) { fprintf(stderr, "field-blend: --snap R (um > 0) with exactly two inputs\n"); return 2; }
+        if (!o.pw_on[FB_G_PHASE]) { o.pw_on[FB_G_PHASE] = 1; o.pw[FB_G_PHASE][0] = o.pw[FB_G_PHASE][1] = 1; }
+        if (!(o.pw[FB_G_PHASE][0] > 0 && o.pw[FB_G_PHASE][1] > 0)) { fprintf(stderr, "field-blend --snap: both inputs need a phase weight > 0\n"); return 2; }
     }
     if (paste) { o.paste = 1; o.feather = atof(paste); if (!(o.feather >= 1) || tile || ws) { fprintf(stderr, "field-blend: --paste F (cells >= 1), without --tile / --weights\n"); return 2; } }
     if (box) {
@@ -5002,6 +5066,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "ingest-zip")) return cmd_ingest_zip(argc, argv);
     if (!strcmp(cmd, "raster")) return cmd_raster(argc, argv);
     if (!strcmp(cmd, "mesh-tiles")) return cmd_mesh_tiles(argc, argv);
+    if (!strcmp(cmd, "occ-tiles")) return cmd_occ_tiles(argc, argv);
     if (!strcmp(cmd, "train")) return cmd_train(argc, argv);
     if (!strcmp(cmd, "predict")) return cmd_predict(argc, argv);
     if (!strcmp(cmd, "eval")) return cmd_eval(argc, argv);
@@ -5096,6 +5161,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-ext")) return cmd_ink_ext(argc, argv);
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
+    if (!strcmp(cmd, "ink-strat")) return cmd_ink_strat(argc, argv);
     if (!strcmp(cmd, "ink-runs")) return cmd_ink_runs(argc, argv);
     if (!strcmp(cmd, "ink-teach")) return cmd_ink_teach(argc, argv);
     if (!strcmp(cmd, "ink-teach-up")) return cmd_ink_teach_up(argc, argv);
@@ -5166,6 +5232,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
     if (!strcmp(cmd, "merge-flag")) return cmd_merge_flag(argc, argv);
+    if (!strcmp(cmd, "hard-map")) return cmd_hard_map(argc, argv);
     if (!strcmp(cmd, "denselab-render")) return cmd_denselab_render(argc, argv);
     if (!strcmp(cmd, "ink-rayface")) return cmd_ink_rayface(argc, argv);
     if (!strcmp(cmd, "ink-wrapscore")) return cmd_ink_wrapscore(argc, argv);
