@@ -2690,6 +2690,14 @@ static int g_skip_planes;   /* optional planes fit_fields_load leaves out: bit 0
 void fit_fields_skip_planes(int mask) { g_skip_planes = mask; }
 static double g_mfw;   /* mgpu: process (fit_fields_mf_weight: set once by count-field before its loads) */
 void fit_fields_mf_weight(double k) { g_mfw = k; }
+static double g_dvw, g_dvref;   /* mgpu: process (fit_fields_dv_weight: set once by count-field before its loads) */
+void fit_fields_dv_weight(double k, double sref) { g_dvw = k; g_dvref = sref; }
+/* w x min(1, e^(-K (s - sref))), s = dv x 18 / 255 - 12 the cell's mean learned log-variance; a cell with w > 0 keeps w >= 1 (its other
+   planes stay in use: only the density evidence's weight, count-field's c = w / 255 x ..., changes); dv 0 (no material) leaves w */
+static void dv_weight_rows(uint8_t *w, const uint8_t *dv, size_t n, double K, double sref) {
+    float lut[256]; for (int v = 0; v < 256; v++) { const double s = v * 18.0 / 255.0 - 12.0, f = exp(-K * (s - sref)); lut[v] = (float)(f < 1 ? f : 1); }
+    for (size_t i = 0; i < n; i++) if (w[i] && dv[i]) { const long q = lroundf(w[i] * lut[dv[i]]); w[i] = (uint8_t)(q < 1 ? 1 : q > 255 ? 255 : q); }
+}
 static struct { int on, oy, ox, H, W; const uint8_t *wbox; } g_crop;   /* fit_fields_crop (src/fit.h) */
 void fit_fields_crop(int on, int oy, int ox, int H, int W, const uint8_t *wbox) { g_crop.on = on && H > 0 && W > 0; g_crop.oy = oy; g_crop.ox = ox; g_crop.H = H; g_crop.W = W; g_crop.wbox = wbox; }
 /* fit_fields_recycle(1): a fit_fields_load_ex with a prev that shares no rows takes prev's planes (when they hold at least the new
@@ -2918,6 +2926,14 @@ int fit_fields_load_ex(const char *dir, int fz0, int fz1, int pool, fit_fields_b
             if (!zm || !mf || z3_read(zm, o3, n3, mf, fit_nthreads(16))) { fprintf(stderr, "fit: cannot read the mf plane of %s (merge-flag first)\n", dir); if (zm) z3_close(zm); free(mf); return -1; }
             z3_close(zm);
             mf_weight_rows(blk[0], blk[1], blk[9], mf, (size_t)nz * plane, g_mfw, 0, nullptr, nullptr); free(mf);
+        }
+        if (g_dvw > 0 && blk[9]) {   /* fit_fields_dv_weight: w x the density precision (predict --fit-dv's plane dv) */
+            if (!zarr) { fprintf(stderr, "fit: the dv weighting needs zarr fields (%s)\n", dir); return -1; }
+            z3 *zd = z3_open(store_open(dir), "dv", nullptr); uint8_t *dv = zd ? malloc((size_t)nz * plane) : nullptr;
+            const int64_t o3[3] = {z0 + zoff[0], zoff[1], zoff[2]}, n3[3] = {nz, H, W};
+            if (!zd || !dv || z3_read(zd, o3, n3, dv, fit_nthreads(16))) { fprintf(stderr, "fit: cannot read the dv plane of %s (predict --fit-dv 1)\n", dir); if (zd) z3_close(zd); free(dv); return -1; }
+            z3_close(zd);
+            dv_weight_rows(blk[9], dv, (size_t)nz * plane, g_dvw, g_dvref); free(dv);
         }
         if (pool == 1) {
             for (int g = 0; also && g < nz; g += also_pool) {   /* the pooled box's rows of this block */

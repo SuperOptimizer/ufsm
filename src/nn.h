@@ -614,6 +614,14 @@ void nn_loss_async(const float *logits, const uint8_t *t, const uint8_t *m, cons
 /* Offset-tolerant positives on channel 0 (radius r <= 2 voxels, 0 = off; see nn.cu): code is a uint8 [n][S] work buffer. */
 void nn_set_loss_tol(int r);
 void nn_set_loss_unit_ch7(int c);   /* 7-channel losses (task unwrap normal n n^T + density): channel c's mask weight counts as 0 / 1 (the packed weight off); -1 off */
+void nn_set_loss_dgap(int c, int thr);   /* train --density-min-gap-um (thread-local): the next nn_loss_stats_acc_e / nn_loss_grad_only_s drop channel c's voxels with target code >= thr; thr 0 off */
+/* train --density-nll (src/nn_dvar.cu): the density head's learned log-variance zs (fp16 logit = s) against the residual sigmoid(zd) - t / 255,
+   mask m > 0 less target codes >= thr (thr 0: none). stats: acc[4] += supervised, sum NLL, sum e^(-(1 - beta) s), sum s. grad: the s
+   gradient in place over zs (16-bit, the loss producers' scale), af (fp16 per voxel, nullptr: none) the mean's factor a / mean(a);
+   scale: the density plane's 16-bit gradient times af */
+void nn_dvar_stats(const void *zd, const void *zs, const uint8_t *t, const uint8_t *m, size_t n, int thr, float beta, double *acc);
+void nn_dvar_grad(const void *zd, void *zs, const uint8_t *t, const uint8_t *m, size_t n, int thr, float beta, float lam, const double *acc, void *af);
+void nn_dvar_scale(void *g, const void *af, size_t n);
 void nn_set_recall(float w);
 int nn_get_loss_grad_h16(void);   /* the loss kernels' gradient format (nn_set_loss_grad_h16) */
 void nn_pool_targets(const uint8_t *t, const uint8_t *m, int B, int C, int D, int H, int W, int f, uint8_t *to, uint8_t *mo);   /* deep supervision: max-pool masked targets, any-pool the mask (C <= 16) */   /* recto channel: + w (1 - (sum s p + 1) / (sum p + 1)), gradient only (the logged dice excludes it) */
@@ -754,6 +762,8 @@ int nn_ws_sealed(void);   /* the current device's workspaces sealed by a memory 
 void *nn_ws(int id, size_t bytes);       /* the current device's workspace id of >= bytes (grown if needed; nullptr: no memory, or over a soft limit after the seal) */
 int nn_ws_reserve(int id, size_t bytes); /* grow it to >= bytes now (before the first step); -1 if the device is full */
 void nn_ws_limit(int id, size_t bytes);  /* after the seal, larger requests return nullptr (callers with a fallback); 0: none */
+void nn_ws_keep_free(size_t bytes);     /* the current device: the optional prenorm copies (fp4 / s2 fp8; same-bits fallbacks) grow only while that much stays free
+                                            (predict, 2026-11-27: the greedy copy left 0 MB of w24's WIN 1280 for the rest); 0: no floor */
 void nn_ws_seal(int on);                 /* on: later growth on this device is reported as outside the plan */
 size_t nn_ws_bytes(int id);              /* its bytes on the current device (id -1: all) */
 const char *nn_ws_name(int id);
