@@ -6,6 +6,9 @@
 #include "bandgpu.h"
 #include "codes_pool.h"
 #include "volcomp.h"
+#include "zarr3.h"
+/* (weak: binaries without meshcodes.o, the tests: the meshes' codes then go through the host path) */
+[[gnu::weak]] int mesh_codes_stamp_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *dst, int ddev, const int dn[3], const int dof[3]);
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -104,7 +107,21 @@ static int g_pool2_tag;   /* (the pooled codes views' ctx, codes_pool2_open: til
    chunks (all-zero ones dropped, as the stored path drops const-0 chunks), then the same band_pair_gpu_codes. Before (w24 2026-11-26) such
    tiles fell to the CPU pair rule: at the 2.4 um rung (rmax 160) no P 896 window in 12 minutes on the desk. Same returns as tile_gpu. */
 static thread_local struct { uint8_t *b; size_t cap; } t_drb;
+/* band_pair_gpu_fill's fill: the meshes' codes of the clipped box stamped on the device into the tile at the box's offset */
+typedef struct { z3 *codes; const int64_t *ro, *rn; int lo[3]; } dfill_ctx;
+static int dfill(void *vp, uint8_t *dcodes, int dev, const int n[3]) {
+    const dfill_ctx *F = vp; return mesh_codes_stamp_dev(F->codes, F->ro, F->rn, dcodes, dev, n, F->lo);
+}
 static int tile_gpu_derived(z3 *codes, const int64_t co[3], const int64_t cn[3], const int64_t ro[3], const int64_t rn[3], int h, const int64_t tn[3], float rmax, uint8_t *out) {
+    /* the meshes' codes stamped straight into the device tile (w24 2026-11-27): the stamp + host chunking + upload were ~230 of a 388^3
+       tile's ~294 ms, the pair rule ~60. Any other derived codes, or a stamp off this GPU (-2), take the host path below */
+    if (mesh_codes_stamp_dev && band_pair_gpu_fill) {
+        const dfill_ctx F = {codes, ro, rn, {(int)(ro[0] - co[0]), (int)(ro[1] - co[1]), (int)(ro[2] - co[2])}};
+        const int n[3] = {(int)cn[0], (int)cn[1], (int)cn[2]}, cro[3] = {h, h, h}, crn[3] = {(int)tn[0], (int)tn[1], (int)tn[2]};
+        const int r = band_pair_gpu_fill(dfill, (void *)&F, n, rmax, cro, crn, out);
+        if (r == 0 || r == 2) return r;
+        if (r != -2) return r;   /* (-1: a CUDA failure, the caller's CPU path) */
+    }
     const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
     if (rnn > t_drb.cap) { free(t_drb.b); t_drb.cap = 0; if (!(t_drb.b = malloc(rnn))) return -1; t_drb.cap = rnn; }
     uint8_t *rb = t_drb.b;

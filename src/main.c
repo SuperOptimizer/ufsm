@@ -176,6 +176,7 @@ static int usage(void) {
         "  ufsm z3-fetch ROOT KEY --cache DIR --box z,y,x,dz,dy,dx [--scale F] [--margin 128] [--threads 16]   the box's chunks into a z3 chunk cache (no decode)\n"
         "  ufsm surf-resample SRC-SURFS SRC-MAPS DST-SURFS OUT [--suffix _reader3.tif] [--max-dist 4] [--scale 1]   a map on one surface set resampled onto another (3-D)\n"
         "  ufsm ink-blend <out> --um U --tile S,S,S --grids z,y,x:... <in1> <in2> ...   overlapping uint8 predicts (predict --grid-origin) blended with sin^2 tile weights\n"
+        "  ufsm phase-cmp A.json B.json [--boxes 24] [--P 256]   per source: the share of B's known on-the-fly phase voxels A leaves unknown (e.g. rmax 80 vs 160)\n"
         "  ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24]   window-seam jump of a uint8 predict (border vs interior |dv|)\n"
         "  ufsm ingest-zip <labels.zip> <zarr-name> <out-dir> --um U  label zarr from the HF archive -> volcomp pyramid\n"
         "  ufsm raster <out-dir> --shape Z,Y,X --um U [--level L] [--T 3] <mesh.sfc|tifxyz>...  meshes -> label pyramid\n"
@@ -5039,6 +5040,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-raster")) return cmd_fiber_raster(argc, argv);
     if (!strcmp(cmd, "fiber-onfly")) return cmd_fiber_onfly(argc, argv);
     if (!strcmp(cmd, "codes-onfly")) return cmd_codes_onfly(argc, argv);
+    if (!strcmp(cmd, "phase-cmp")) { int cmd_phase_cmp(int, char **); return cmd_phase_cmp(argc, argv); }
     if (!strcmp(cmd, "holdout-cover")) { int cmd_holdout_cover(int, char **); return cmd_holdout_cover(argc, argv); }
     if (!strcmp(cmd, "count-field")) return cmd_count_field(argc, argv);
     if (!strcmp(cmd, "hires-phase")) return cmd_hires_phase(argc, argv);

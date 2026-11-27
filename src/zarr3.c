@@ -232,6 +232,7 @@ z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*c
 z3 *z3_base_of(const z3 *z) { return z ? z->base : nullptr; }
 z3 *z3_derived_cover_at(const z3 *z, int k) { return z && z->derive && k >= 0 && k < z->ncover ? z->cover[k] : nullptr; }
 void *z3_derived_ctx(const z3 *z) { return z && z->derive ? z->dctx : nullptr; }
+z3_derive_fn z3_derived_fn(const z3 *z) { return z ? z->derive : nullptr; }
 void z3_derived_borrow(z3 *z) { if (z && z->derive) z->bborrow = 1; }
 int z3_derived_extent(z3 *z, int (*fn)(void *ctx, const int64_t grid[3], const int chunk[3], uint8_t *bits), void *ctx) {
     if (!z || !z->derive || !fn) return -1;

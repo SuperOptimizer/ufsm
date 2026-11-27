@@ -4426,6 +4426,9 @@ int cmd_train(int argc, char **argv) {
               if (os.reads) fprintf(stderr, "sampler-only: onfly phase: %llu reads, %llu tiles (%llu GPU-decoded, %llu skipped), %.1f M tile voxels; per read: %.0f ms queued for a tile buffer, %.0f ms in the pair rule (%.0f ms a tile, %.0f Mvox/s of tile), %.0f ms in CPU codes reads\n",
                                     (unsigned long long)os.reads, (unsigned long long)os.tiles, (unsigned long long)os.gpu_tiles, (unsigned long long)os.skipped, os.vox_tile / 1e6, 1e3 * os.s_wait / os.reads, 1e3 * os.s_pair / os.reads,
                                     os.tiles ? 1e3 * os.s_pair / os.tiles : 0., os.s_pair > 0 ? os.vox_tile / 1e6 / os.s_pair : 0., 1e3 * os.s_read / os.reads); }
+            { uint64_t gr = 0, cr = 0, gf = 0; double gs = 0, cs = 0; mesh_codes_stats(&gr, &cr, &gf, &gs, &cs);   /* (the meshes' stamp: part of the pair rule's time above, w24) */
+              if (gr + cr) fprintf(stderr, "sampler-only: mesh codes: %llu reads on the GPU (%.1f s), %llu on the CPU (%.1f s), %llu device failures\n",
+                                   (unsigned long long)gr, gs, (unsigned long long)cr, cs, (unsigned long long)gf); }
             sampler_prof_print(sq);
             store_io_report(stderr); fprintf(stderr, "z3: %llu chunks decoded straight into the window\n", (unsigned long long)z3_sink_chunks());
             { FILE *io = fopen("/proc/self/io", "r"); char ln[128]; while (io && fgets(ln, sizeof ln, io)) if (!strncmp(ln, "rchar", 5) || !strncmp(ln, "read_bytes", 10)) fprintf(stderr, "proc io: %s", ln); if (io) fclose(io); }

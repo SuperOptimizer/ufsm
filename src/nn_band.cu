@@ -475,6 +475,39 @@ extern "C" int band_pair_gpu_codes_pool(const bg_lchunk *ch, int nch, const uint
     pthread_mutex_lock(&g_mu); g_ctx[k].busy = 0; pthread_cond_signal(&g_cv); pthread_mutex_unlock(&g_mu);
     return rc;
 }
+/* the pair rule on tile codes the caller writes on the device itself (fill: into the zeroed n-box G.codes on device dev; 0 ok, 2 nothing
+   to compute: out untouched, else its code returned), then the crop down into out (w24 2026-11-27: the meshes' codes stamped straight into
+   the tile, mesh_codes_stamp_dev, instead of stamp -> host -> raw chunks -> device) */
+extern "C" int band_pair_gpu_fill(int (*fill)(void *ctx, uint8_t *dcodes, int dev, const int n[3]), void *ctx, const int n[3], float rmax,
+                                  const int crop_o[3], const int crop_n[3], uint8_t *out) {
+    if (rmax <= 0) return -1;
+    int k = -1;
+    pthread_mutex_lock(&g_mu);
+    for (;;) { for (int i = 0; i < g_slots; i++) { const int q = (g_rr + i) % g_slots; if (!g_ctx[q].busy) { k = q; break; } } if (k >= 0) break; pthread_cond_wait(&g_cv, &g_mu); }
+    g_ctx[k].busy = 1; g_rr = (k + 1) % g_slots; pthread_mutex_unlock(&g_mu);
+    bg_ctx &G = g_ctx[k]; int rc = 0;
+    do {
+        if (cudaSetDevice(G.dev) != cudaSuccess) { rc = -1; break; }
+        const long nz = n[0], ny = n[1], nx = n[2], N = nz * ny * nx, Lmax = nz > ny ? nz : ny, nlines = (nz * nx > ny * nx ? nz * nx : ny * nx), lc = bg_lines(N, Lmax, nlines);
+        if (bg_alloc(G, N, Lmax, lc)) { rc = -1; break; }
+        if (cudaMemsetAsync(G.codes, 0, (size_t)N, G.st) != cudaSuccess || cudaStreamSynchronize(G.st) != cudaSuccess) { rc = -1; break; }
+        if ((rc = fill(ctx, G.codes, G.dev, n))) break;   /* (the fill's own stream, synchronised before it returns) */
+        cudaEvent_t ev[6]; const int tim = g_timing; if (tim) { for (int q = 0; q < 6; q++) cudaEventCreate(&ev[q]); cudaEventRecord(ev[0], G.st); cudaEventRecord(ev[1], G.st); }
+        if (bg_fields(G, n, rmax, tim ? ev : nullptr)) { rc = -1; break; }
+        cudaMemcpy3DParms P = {};
+        P.srcPtr = make_cudaPitchedPtr(G.phase, (size_t)nx, (size_t)nx, (size_t)ny); P.srcPos = make_cudaPos((size_t)crop_o[2], (size_t)crop_o[1], (size_t)crop_o[0]);
+        P.dstPtr = make_cudaPitchedPtr(out, (size_t)crop_n[2], (size_t)crop_n[2], (size_t)crop_n[1]); P.extent = make_cudaExtent((size_t)crop_n[2], (size_t)crop_n[1], (size_t)crop_n[0]); P.kind = cudaMemcpyDeviceToHost;
+        if (cudaMemcpy3DAsync(&P, G.st) != cudaSuccess) { rc = -1; break; }
+        if (tim) cudaEventRecord(ev[5], G.st);
+        if (cudaStreamSynchronize(G.st) != cudaSuccess) { rc = -1; break; }
+        if (tim) { float tt[5]; for (int q = 0; q < 5; q++) cudaEventElapsedTime(&tt[q], ev[q], ev[q + 1]);
+            fprintf(stderr, "band gpu fill: %ldx%ldx%ld: parity 0 %.1f ms, parity 1 %.1f, pair %.1f, crop D2H %.1f\n", nz, ny, nx, tt[1], tt[2], tt[3], tt[4]);
+            for (int q = 0; q < 6; q++) cudaEventDestroy(ev[q]); }
+    } while (0);
+    if (rc < 0) cudaGetLastError();
+    pthread_mutex_lock(&g_mu); G.busy = 0; pthread_cond_signal(&g_cv); pthread_mutex_unlock(&g_mu);
+    return rc;
+}
 extern "C" int band_pair_gpu_codes(const bg_lchunk *ch, int nch, const uint8_t *blob, size_t blob_n, const int n[3], const int lo[3], const int hi[3],
                                    float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out) {
     return band_pair_gpu_codes_pool(ch, nch, blob, blob_n, n, lo, hi, 0, rmax, crop_o, crop_n, out);

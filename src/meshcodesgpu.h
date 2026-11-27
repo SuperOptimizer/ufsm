@@ -18,6 +18,10 @@ typedef struct { uint32_t voff; int32_t nr, nc; float zlo, zhi; } mcg_tile;
    (the caller runs the CPU stamp). xyz: level-0 x, y, z per vertex; sc = 2^-level. */
 __attribute__((weak)) int mesh_codes_gpu_stamp(const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
                                                const int64_t o[3], const int64_t n[3], uint8_t *out);
+/* the same stamp written on the device into the box at dof (z, y, x) of a dn[0] x dn[1] x dn[2] array dst on device ddev (which must be
+   the stamp's device: else -2), nothing copied down: the pair rule's tile codes (band_onfly.c, w24 2026-11-27). 0 ok, 2 no tile */
+__attribute__((weak)) int mesh_codes_gpu_stamp_into(const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
+                                                    const int64_t o[3], const int64_t n[3], uint8_t *dst, int ddev, const int dn[3], const int dof[3]);
 __attribute__((weak)) void mesh_codes_gpu_device(int dev);
 #ifdef __cplusplus
 }

@@ -59,6 +59,15 @@ __global__ void k_mc_final(const u64 *key, size_t nvox, uint8_t *out) {
     }
 }
 
+/* k_mc_final into a box inside a larger device array (the pair rule's tile codes): slab voxel i (box rows z0.., n1 x n2) -> dst at the
+   box origin dof in a d1 x d2 plane array (mesh_codes_gpu_stamp_into) */
+__global__ void k_mc_final_into(const u64 *key, size_t nvox, long long n1, long long n2, long long z0, uint8_t *dst, long long d1, long long d2, int3 dof) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < nvox; i += (size_t)gridDim.x * blockDim.x) {
+        const long long z = (long long)(i / (size_t)(n1 * n2)) + z0, y = (long long)((i / (size_t)n2) % (size_t)n1), x = (long long)(i % (size_t)n2);
+        const u64 w = key[i]; dst[((size_t)(z + dof.x) * d1 + (y + dof.y)) * d2 + (x + dof.z)] = w == ~0ull ? 0 : (w >> 63) ? 255 : (uint8_t)w;
+    }
+}
+
 static int g_dev = 0;
 enum { MB_T, MB_XYZ, MB_VAL, MB_VALID, MB_KEY, MB_OUT, MB_N };
 typedef struct { int dev; cudaStream_t st; struct { void *p; size_t cap; } b[MB_N]; } mgctx;
@@ -71,9 +80,11 @@ static int mg_grow(mgctx *x, int i, size_t n) {
     x->b[i].cap = c; return 0;
 }
 extern "C" void mesh_codes_gpu_device(int dev) { g_dev = dev; }
-extern "C" int mesh_codes_gpu_stamp(const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
-                                    const int64_t o[3], const int64_t n[3], uint8_t *out) {
+/* out (host) or, with dst (device, on device ddev), straight into the box at dof of a dn array there (no copy down; w24 2026-11-27) */
+static int mg_stamp(const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
+                    const int64_t o[3], const int64_t n[3], uint8_t *out, uint8_t *dst, int ddev, const int dn[3], const int dof[3]) {
     if (nt <= 0 || nt >= (1 << 22) || !nv) return 2;
+    if (dst && ddev != g_dev) return -2;
     mgctx *x = t_mg;
     if (!x) { x = t_mg = (mgctx *)calloc(1, sizeof *x); if (!x) return -1; x->dev = -1; }
     if (x->dev != g_dev) { MG_CK(cudaSetDevice(g_dev)); if (x->st) cudaStreamDestroy(x->st); MG_CK(cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking)); x->dev = g_dev; }
@@ -83,9 +94,9 @@ extern "C" int mesh_codes_gpu_stamp(const mcg_tile *t, int nt, const float *xyz,
     const size_t plane = (size_t)n[1] * n[2]; long long S = (long long)((kmb << 20) / 8 / (plane ? plane : 1)); if (S < 1) S = 1;
     if (S > n[0]) S = n[0];
     if (mg_grow(x, MB_T, (size_t)nt * sizeof *t) || mg_grow(x, MB_XYZ, nv * 12) || mg_grow(x, MB_VAL, nv * 4) || mg_grow(x, MB_VALID, nv) ||
-        mg_grow(x, MB_KEY, (size_t)S * plane * 8) || mg_grow(x, MB_OUT, (size_t)S * plane)) { fprintf(stderr, "mesh codes gpu: out of device memory\n"); return -1; }
+        mg_grow(x, MB_KEY, (size_t)S * plane * 8) || (!dst && mg_grow(x, MB_OUT, (size_t)S * plane))) { fprintf(stderr, "mesh codes gpu: out of device memory\n"); return -1; }
     mcg_tile *dt = (mcg_tile *)x->b[MB_T].p; float *dxyz = (float *)x->b[MB_XYZ].p, *dval = (float *)x->b[MB_VAL].p; uint8_t *dvalid = (uint8_t *)x->b[MB_VALID].p;
-    u64 *dkey = (u64 *)x->b[MB_KEY].p; uint8_t *dout = (uint8_t *)x->b[MB_OUT].p;
+    u64 *dkey = (u64 *)x->b[MB_KEY].p; uint8_t *dout = dst ? nullptr : (uint8_t *)x->b[MB_OUT].p;
     MG_CK(cudaMemcpyAsync(dt, t, (size_t)nt * sizeof *t, cudaMemcpyHostToDevice, x->st));
     MG_CK(cudaMemcpyAsync(dxyz, xyz, nv * 12, cudaMemcpyHostToDevice, x->st));
     MG_CK(cudaMemcpyAsync(dval, val, nv * 4, cudaMemcpyHostToDevice, x->st));
@@ -98,10 +109,19 @@ extern "C" int mesh_codes_gpu_stamp(const mcg_tile *t, int nt, const float *xyz,
         k_mc_stamp<<<nt, 256, 0, x->st>>>(dt, dxyz, dval, dvalid, B, dkey, 0);
         k_mc_stamp<<<nt, 256, 0, x->st>>>(dt, dxyz, dval, dvalid, B, dkey, 1);
         const unsigned nb = (unsigned)((nvox + 255) / 256 < 65535 ? (nvox + 255) / 256 : 65535);
-        k_mc_final<<<nb, 256, 0, x->st>>>(dkey, nvox, dout);
+        if (dst) k_mc_final_into<<<nb, 256, 0, x->st>>>(dkey, nvox, n[1], n[2], z0, dst, dn[1], dn[2], make_int3(dof[0], dof[1], dof[2]));
+        else k_mc_final<<<nb, 256, 0, x->st>>>(dkey, nvox, dout);
         MG_CK(cudaGetLastError());
-        MG_CK(cudaMemcpyAsync(out + (size_t)z0 * plane, dout, nvox, cudaMemcpyDeviceToHost, x->st));
+        if (!dst) MG_CK(cudaMemcpyAsync(out + (size_t)z0 * plane, dout, nvox, cudaMemcpyDeviceToHost, x->st));
     }
     MG_CK(cudaStreamSynchronize(x->st));
     return 0;
+}
+extern "C" int mesh_codes_gpu_stamp(const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
+                                    const int64_t o[3], const int64_t n[3], uint8_t *out) {
+    return mg_stamp(t, nt, xyz, val, valid, nv, sc, o, n, out, nullptr, 0, nullptr, nullptr);
+}
+extern "C" int mesh_codes_gpu_stamp_into(const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
+                                         const int64_t o[3], const int64_t n[3], uint8_t *dst, int ddev, const int dn[3], const int dof[3]) {
+    return mg_stamp(t, nt, xyz, val, valid, nv, sc, o, n, nullptr, dst, ddev, dn, dof);
 }

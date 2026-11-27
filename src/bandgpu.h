@@ -18,6 +18,10 @@ typedef struct bg_lchunk { int32_t o[3]; uint32_t mode, value, tab_off, raw_off,
 /* the pair rule on a box of n voxels whose codes are decoded on the device from the chunks (voxels outside lo .. hi, the codes' shape
    within the box, and outside every chunk are 0); the phase of the crop box (crop_o, crop_n within the box) into out (crop_n bytes,
    C order); rmax <= 0: the decoded codes of the crop instead (tests). 0 ok; 1 a chunk did not decode on the GPU (decode on the CPU: the reference's status); -1 a CUDA failure. */
+/* the pair rule on tile codes the caller's fill writes on the device (into the zeroed n-box dcodes on device dev; 0 ok, 2 nothing to compute,
+   returned as is), the crop down into out. 0 ok, -1 a CUDA failure (the caller's host path) */
+__attribute__((weak)) int band_pair_gpu_fill(int (*fill)(void *ctx, uint8_t *dcodes, int dev, const int n[3]), void *ctx, const int n[3], float rmax,
+                                             const int crop_o[3], const int crop_n[3], uint8_t *out);
 __attribute__((weak)) int band_pair_gpu_codes(const bg_lchunk *ch, int nch, const uint8_t *blob, size_t blob_n, const int n[3], const int lo[3], const int hi[3],
                                               float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out);
 /* the same with the box's codes pooled `pool` (0..3) times on the device first (codes_pool.h cp_pool8, == codes_pool2_box): the chunks,

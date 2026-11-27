@@ -45,6 +45,7 @@ z3 *z3_open_derived(z3 *base, int fill, z3_derive_fn derive, void *ctx, void (*c
 z3 *z3_base_of(const z3 *z);   /* a derived array's base, else nullptr */
 z3 *z3_derived_cover_at(const z3 *z, int k);   /* a derived array's k-th cover (z3_derived_cover), else nullptr */
 void *z3_derived_ctx(const z3 *z);   /* a derived array's ctx, else nullptr */
+z3_derive_fn z3_derived_fn(const z3 *z);   /* a derived array's derive function (which kind of derived array it is), else nullptr */
 void z3_derived_borrow(z3 *z);   /* z3_close(z) then leaves its base open (a derived view of an array its owner keeps) */
 #define Z3_MAX_COVER 64   /* = the 64 sets an onfly phase "sets" spec takes */
 /* more arrays (same shape, up to Z3_MAX_COVER) whose chunks the derived values also reach (e.g. a fusion of several sets): z3_chunk_map / z3_box_any /
