@@ -9,6 +9,10 @@ extern "C" int nn_get_loss_tol(void) { return g_tol; }
 static int g_unit_ch7 = -1;   /* nn_set_loss_unit_ch7: in 7-channel losses (task unwrap: n n^T 6 + density) this channel's mask weight counts as 0 / 1 */
 extern "C" void nn_set_loss_unit_ch7(int c) { g_unit_ch7 = c; }
 #define UNITC(C) ((C) == 7 ? g_unit_ch7 : -1)
+/* nn_set_loss_dgap (train --density-min-gap-um): the next nn_loss_stats_acc_e / nn_loss_grad_only_s calls drop channel c's voxels whose
+   target code is >= thr (the density code of the minimum labelled gap: no density supervision across tighter gaps); thr 0 / c -1 off */
+static thread_local int g_dgap_c = -1, g_dgap_t = 0;
+extern "C" void nn_set_loss_dgap(int c, int thr) { g_dgap_c = thr > 0 ? c : -1; g_dgap_t = thr > 0 ? thr : 0; }
 extern "C" void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);
 thread_local int g_logits_h16 = 0;   /* the logits the losses read are fp16 (unet_logits_h16: lean training with the logit gradient beside them) */
 extern "C" void nn_set_logits_h16(int on) { g_logits_h16 = on; }
@@ -20,8 +24,8 @@ __device__ __forceinline__ float tgt_entropy(unsigned t) {
     const float p = t * (1.f / 255.f); return -(p * logf(p) + (1.f - p) * logf(1.f - p));
 }
 template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
-                                                   int tol, uint8_t *code, int D, int H, int W, int unit_c = -1, double *ent = nullptr) {
-    int nc = blockIdx.x, slab = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c;
+                                                   int tol, uint8_t *code, int D, int H, int W, int unit_c = -1, double *ent = nullptr, int gap_c = -1, int gap_t = 0) {
+    int nc = blockIdx.x, slab = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c, gap = nc % C == gap_c;
     float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;   /* per-thread fp32 partials, fp64 block reduction; a5: ent's sum mw H(p) */
     if (w[nc]) {
         const LT *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
@@ -36,7 +40,7 @@ template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t 
             for (int k = 0; k < LS_V; k++) {
                 const size_t i = i0 + (size_t)k * blockDim.x;
                 mb[k] = i < hi ? mp[i] : 0u; if (unit && mb[k]) mb[k] = 1u; tb[k] = 0u; xl[k] = 0.f;
-                if (mb[k]) { xl[k] = lgv(l, i); tb[k] = tp[i]; }
+                if (mb[k]) { xl[k] = lgv(l, i); tb[k] = tp[i]; if (gap && (int)tb[k] >= gap_t) { mb[k] = 0u; tb[k] = 0u; xl[k] = 0.f; } }
             }
 #pragma unroll
             for (int k = 0; k < LS_V; k++) {
@@ -268,8 +272,8 @@ extern "C" void nn_loss_stats_acc(const void *logits, const uint8_t *t, const ui
 /* nn_loss_stats_acc + the targets' entropy: ent[n c] += sum mw H(t / 255) over the slab (ent: s.n s.c doubles, zeroed by the caller) */
 extern "C" void nn_loss_stats_acc_e(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds, double *ent) {
     const size_t S = shape_spatial(s); const int NC = s.n * s.c, slabs = NC >= 16 ? KSLAB : 512 / NC;
-    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent);
-    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent);
+    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent, g_dgap_c, g_dgap_t);
+    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent, g_dgap_c, g_dgap_t);
     KCHECK();
 }
 /* the entropy alone (a group whose statistics another kernel sums: the fused normal / density group), C channels of S voxels, one mask */
@@ -354,12 +358,12 @@ extern "C" void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const 
     const float *fin = scratch + (size_t)5 * s.n * s.c;
     if (g_logits_h16) {
         const f16 *l16 = (const f16 *)logits;
-        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
-        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
-    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
-    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
+        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), nullptr, g_dgap_c, g_dgap_t);
+        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP, g_dgap_c, g_dgap_t);
+        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP, g_dgap_c, g_dgap_t);
+    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), nullptr, g_dgap_c, g_dgap_t);
+    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP, g_dgap_c, g_dgap_t);
+    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP, g_dgap_c, g_dgap_t);
     KCHECK();
 }
 extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch) {
