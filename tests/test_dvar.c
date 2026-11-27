@@ -70,7 +70,7 @@ int main(void) {
         printf("dvar grad: %zu nonzero gradients match the host (max rel %.2g) and the central difference (max rel %.2g); mean factors match\n", nz, emax, ecd);
     }
     nn_dvar_scale(dgd, daf, n); nn_sync(); nn_d2h(gd2, dgd, n * 2);
-    {   size_t bad = 0; for (size_t i = 0; i < n; i++) { const double ref = (double)h2f(gd[i]) * h2f(af[i]); bad += fabs(h2f(gd2[i]) - ref) > fabs(ref) * 1e-3 + 1e-9; }
+    {   size_t bad = 0; for (size_t i = 0; i < n; i++) { const double ref = (double)h2f(gd[i]) * h2f(af[i]); bad += fabs(h2f(gd2[i]) - ref) > fabs(ref) * 1e-3 + 6e-8; }   /* (+ one fp16 subnormal step, 2^-24: small products round there) */
         CHECK(bad == 0, "dvar scale: %zu voxels off", bad); }
     nn_free(dzd); nn_free(dzs); nn_free(daf); nn_free(dgd); nn_free(dt); nn_free(dm); nn_free(dacc);
 

@@ -6,6 +6,44 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Density uncertainty and the min-gap rule from upstream villa: opt-in train / predict / count-field paths (2026-11-27, branch densvar-20261127, densvar)
+
+This ports idea 2 of the villa scan (/vesuvius/ufsm/research/villa.md; upstream `winding_targets.density_loss`, `density_supervision_mask`).
+All of it is opt-in. With the flags off every path runs the same calls as before.
+
+- **`train --density-nll L`** (task unwrap2, head slabs): one more output channel, the density's learned log-variance s.
+  - Its logit is s, clamped to [-12, 6], with no gradient outside the clamp.
+  - The loss is the beta-NLL 0.5 (e^-s r^2 + s) x e^(beta s) (the last factor detached), with r = sigmoid(z_density) - t / 255 in the
+    density code space. The mean NLL over the supervised voxels is multiplied by L x the source's density weight.
+  - `--density-nll-beta` (0.5, upstream's value).
+  - `--density-nll-mean 1`: the density BCE gradient is also scaled per voxel by a / mean(a), a = e^-(1-beta) s (the beta-NLL attenuation,
+    renormalised over the window). The default 0 leaves the mean's BCE unchanged.
+  - The kernels are in src/nn_dvar.cu. The log line gets `dvnll` and the mean s; runtime json `density_nll` gives the channel.
+- **Checkpoint layout.** In a `--fib-head` net (w24) the channel takes the first pad slot (23), so the net keeps 32 outputs and w24
+  checkpoints load unchanged. Without pads it is appended last. It is not in the fine-stem list, so the stem's parameters keep their shape.
+- **`train --density-min-gap-um G`.** No density supervision (BCE and NLL) on voxels whose labelled spacing is under G um.
+  - Upstream's `density_min_gap_wv` is 4 voxels at 9.6 um = 38.4 um. In our code it drops the density targets whose code is >= the code
+    of spacing G at the window's voxel size: `nn_set_loss_dgap`, a thread-local hook in the slab stats / grad loss kernels for channel 6.
+  - It is the alternative to `--packed-weight 8`, so the A/B arm adds `--density-packed 0`; the normal planes keep the packed weight.
+- **Restrictions.** Both training flags need the unfused head chain: the fused latent kernel has no variance or gap terms. With them
+  g_lat_fuse is off and the trainer says so; the arithmetic is the same, only slower. No `--split`, `--single` or `--count-lambda`.
+- **`predict --fit-dv 1`** writes the fit-field plane `dv` = (mean s over the cell's material + 12) x 255 / 18.
+  - It uses the plane path, not the fused fit kernel (whose other planes are byte-identical, per test_fit_lat).
+  - No `--tta` and no `--fit-ct` with it.
+- **`count-field --dv-w K --dv-ref S`.** Every field load scales w by min(1, e^-K(s - S)), keeping w >= 1 on material, as `--mf-w` does.
+  In count-field the magnitude of w enters only the density evidence's weight (cf_pool c = w / 255 x ramps).
+- **test_dvar** (gpu) covers:
+  - the NLL sums against the host;
+  - the s gradient against the host formula and a central difference;
+  - the mean factors and their scaling;
+  - the gap hook: planes 0..5 bit-identical, plane 6 equal to the masked 1-plane loss, the off setting bit-identical to unset;
+  - the dv plane against the host pooled mean.
+
+Validation (pending):
+- Shared card-0 slot n2 with topoloss: arms from w24 snap/4000 to 5000, UFSM_LAT_FUSE=0: (A) control, (B) topo, (C) `--density-nll 1`,
+  (D) `--density-min-gap-um 38.4 --density-packed 0`.
+- Then wbench ids / ids0 / p05x of C and D against A, and count-field `--dv-w` on C's fields (seed models into the wbench fit).
+
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
 
 - Why: under -std=c23, phasecmp.c called floor / ceil / llround without <math.h> (fixed in b32c16ca). mcc took them as int f()
