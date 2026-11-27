@@ -122,6 +122,7 @@ test_pairacc                                   |              |     1 | ./$B/tes
 test_wbench_stats                              |              |     2 | bash tests/test_wbench_stats.sh $B/ufsm
 test_gnwstats                                  |              |     2 | bash tests/test_gnwstats.sh $B/ufsm
 test_ckid                                      |              |     1 | bash tests/test_ckid.sh
+test_implicit_decl                             |              |     6 | bash tests/test_implicit_decl.sh
 test_run_suite                                 |              |    17 | bash tests/test_run_suite.sh
 test_gpuq                                      | flaky        |    14 | bash tests/test_gpuq.sh
 test_robust                                    | gpu          |     1 | ./$B/test_robust
