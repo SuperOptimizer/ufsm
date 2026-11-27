@@ -59,6 +59,77 @@ alone, because the mirror's L2 is already q2.
 Files: /vesuvius/ufsm/inkeval/{shellmeas.sh, shellmeas.out, shellab.sh, shellab.out, shab/rows.tsv}.
 
 ## 1667 comparison unrolls: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
+## Upstream villa's ray-slab winding net vs our counts on the wbench boxes: KILLED; count-field --method ray loses 0.55 GT ids (2026-11-27, rayslab)
+
+Question (lead): port villa's ray-slab winding-count net (`neural_tracing/winding_models`)? It is aimed at packed-sheet undercounting.
+The design is in /vesuvius/ufsm/rayslab/design.md:
+- the input is one 128² x 384 slab at ~9.6 um, along the sheet normal;
+- the encoder halves only the transverse axes, and 6 axial blocks attend along the ray (L 384) and across the plane;
+- the phase is cumsum(softplus), so it cannot decrease along the ray;
+- the loss is shift-invariant;
+- training uses 0139, 1667 and Paris 4.
+
+The published metrics (`scrollprize/winding_model_9um`) are in-sample only (validation_mode train_batch): a count error of 0.22-0.34
+windings per 3.7 mm column. A port is ~3 weeks, so S0 was a one-day kill test first.
+
+**S0, a measurement only.** The published checkpoint ran in inference only, in a PyTorch env outside ufsm, on the CPU (6 threads), with
+bf16 autocast as in villa's own inference. Nothing upstream entered ufsm.
+- **Harness:** /vesuvius/ufsm/rayslab/s0 (prep.sh, rs0.py, summ.py; rows in res/).
+- **Segments** are fit-compare's turn-count segments: 0.5 mm radial segments in z planes, the reference being the label oracle's phase
+  unwrapped along the segment. They are reimplemented in rs0.py and checked against fit-compare on 500P2-1 / try9 at stride 4:
+
+| | segments | phase off | phase off, packed | density off |
+|---|---|---|---|---|
+| rs0.py | 462 | 0.242 | 0.667 | 0.314 |
+| fit-compare | 461 | 0.243 | 0.690 | 0.312 |
+
+- **Slabs** are drawn on segments, two thirds of them packed (mean label spacing < 100 um). The ray is the radial direction, and the
+  slab frame is villa's own (slab_frame). Every 0.5 mm window along the central column that passes the fit-compare tests is scored.
+- **Villa's count** = phase(end) - phase(start) on the 4 centre columns.
+- **Our counts** use the same windows: try9 (`bl-t9`, cooled 33333) and u1 (`u1-fd615-ho`), each by phase and by density.
+- **Out of sample** = 0500P2 and 0814, which villa never trained on. They are held-out boxes for our nets.
+
+**Results.** Share of windows off by >= 1/2 turn, with 95 % CIs from a bootstrap resampled by slab. The paired difference is villa
+minus the best of our four counts on the same windows.
+
+| group | class | windows (slabs) | villa | try9 phase | try9 density | u1 phase | u1 density | villa - best ours | median error: villa / try9 density / u1 density |
+|---|---|---|---|---|---|---|---|---|---|
+| OOS 0500P2-1 | packed | 73 (67) | 0.77 | 0.67 | **0.48** | 0.52 | 0.52 | **+0.29 [+0.14, +0.42]** | -0.87 / +0.48 / +0.50 |
+| OOS 0500P2-1 | other | 51 (45) | 0.39 | 0.25 | 0.33 | 0.27 | 0.47 | +0.14 [-0.02, +0.31] | -0.35 / +0.35 / +0.38 |
+| OOS 0814 (8 boxes) | other | 135 (104) | 0.57 | - | - | 0.38 | 0.91 | +0.19 [+0.10, +0.28] | +0.77 / - / +1.91 |
+| in-sample P4 PH1-3 | packed | 236 (69) | 0.46 | 0.91 | 0.45 | 0.93 | **0.36** | +0.09 [+0.00, +0.19] | -0.25 / -0.30 / +0.08 |
+| in-sample P4 PH1-3 | other | 147 (52) | 0.44 | 0.70 | 0.39 | 0.68 | 0.63 | +0.05 [-0.11, +0.20] | +0.16 / +0.29 / +0.57 |
+| in-sample P4 HOLD | packed | 23 (13) | 0.26 | 0.78 | 0.39 | 0.70 | 0.48 | -0.13 [-0.39, +0.15] | +0.14 / +0.05 / +0.37 |
+
+**Kill rule** (pre-registered): villa must be >= 10 points better than our counts on out-of-sample packed segments. It is 29 points
+**worse** than try9's density on 0500P2. It undercounts packed sheets there, with a median of -0.87 turn per 0.5 mm, which is exactly
+the failure it was meant to fix. 0814 has only 2 packed windows (the boxes' packed share is 0-5.5 %, and all 0814 boxes are
+label-noise), so the out-of-sample packed evidence is 0500P2 alone. The kill stands anyway: villa is also worse on 0814's unpacked
+windows (+0.19, CI above 0).
+
+On Paris 4, where it trained, villa only matches our density counts:
+- on PH1-3 packed, 0.46 against try9 density 0.45 and u1 density 0.36;
+- it is far better than either net's phase count (0.91-0.93);
+- on HOLD it is 0.26 against 0.39, with the CI spanning 0 (n 23).
+
+So the architecture's gain over a local density head is not visible even in-sample. **The port (S1-S4) is not started.**
+
+**Caveats.**
+- Villa's input is our volcomp CT: q 8 at level 0 for 0814 / 0500P2 (9.362 um, 113 keV scans), and level 2 for Paris 4.
+- The ray is radial, not the sheet normal it trained along (+-3 deg).
+- Its output depends on the slab's orientation. On 4 packed 0500P2 segments, flipping H / W moved the count by 0.04-0.18 turn, and
+  swapping H and W moved it by up to 0.27. Rays at tens of degrees from the normal would add more. Neither effect is a 29-point one.
+
+**Side check: count-field --method ray vs ls**, the per-ray counting the design would have fed. This used the unroll's ref recipe
+(`--R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 --model-only 1 --iters 1200 --dir -1`) on try9's kept wbench fields of
+the 54 clean 1667 boxes. Each box was solved alone, then GT-scored with gtboxes.sh on the CPU. Script:
+/vesuvius/ufsm/rayslab/s0/cfray2.sh; rows in cf2/score.txt. The whole-band r3 fields of the 11-18 1667 run no longer hold their
+arrays, hence the per-box solves.
+- Voxel-weighted ids right: **ls 0.874, ray 0.329**.
+- ray is worse on all 54 boxes.
+- `--method ray` stays a tool, not a candidate.
+
+: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
 
 Question (lead, for the user): what do the new ideas change in a real unroll, scored on GT? Same region and downstream steps for each
 arm, only the named input differs.
@@ -945,6 +1016,55 @@ Per-z distance from the reference, mm (median / p90 / max; CPU, 6 threads, 1-3 m
   - The merges 26fd525 (jitpin), 7989bd1 (csetdev), 086574d (f4pdev), ce9ba2f (mvexit) and 92ce831 (mvpin).
   - Their PTX differs from the pin in 117 of the 132 units (every lp_*, most nn_*).
   - 285d308 itself has been in the pin since before 01873d0 (an ancestor). Only the note asking for its review is outside.
+
+## Semi-automatic labels for the disagreement worklist: sheet continuity only agrees with try9 (negative; 2026-11-27, branch disagree2-20261127, disagree)
+
+User plan (lead): label the 474 worklist regions from evidence other than the two disagreeing models, validate on GT first, and gate at accuracy >= 0.9.
+
+**Evidence available on 1667.**
+- Hand segments / wraps: none in the worklist regions. They are the GT, and the worklist excludes GT tiles.
+- ATLAS: has no 1667 patches (atlas kept/: 0306B, 0800, others).
+- Fit ref-snap count: not built.
+- That leaves sheet continuity.
+
+**`ufsm field-label OUT A B [--gt ORACLE]`** (src/fielddis.c), on A's cells:
+- Agreeing cells (|dphi| <= 0.1) give a consensus phase.
+- For a disagreement cell (|dphi| > 0.25), the consensus is sampled on its tangent plane: A's normal, radii 2-8 cells, 12 angles. Their circular mean E picks the model nearer arg E (error <= 0.2, margin >= 0.1, >= 8 samples, R >= 0.3); otherwise it abstains.
+- conf = R x margin / 0.5 x the sample share.
+- `field-label-raster` writes the labels of many boxes as one 9.6 um phase raster over listed regions (255 = unknown, i.e. the mask), for a sources "phase" target.
+- test_fielddis covers both, including a B-correct case with the grids swapped.
+
+**GT check** (the 20 wbench boxes, try9 = A, w24 snap 2000 = B; GT hidden from the labeller; a label is correct if within 0.25 turn of GT):
+
+| conf cut | disagreement cells labelled | accuracy | always try9 on the same cells | agree-cell labels: accuracy |
+|---|---|---|---|---|
+| 0.0 | 10.9 % | 0.893 | 0.894 | 0.952 (all) |
+| 0.2 | 7.0 % | 0.909 | 0.908 | 0.952 |
+| 0.3 | 2.9 % | 0.916 | 0.915 | 0.967 |
+| 0.4 | 1.0 % | 0.920 | 0.919 | 0.974 |
+
+Pooled over the 9.29 M disagreement cells: always try9 is right on 0.855, either model on 0.956.
+
+**Result.** Continuity adds nothing over trusting try9:
+- It picks try9 976k times and w24 40k times, and the w24 picks are right 59 %.
+- Of the 939k cells where try9 is wrong and w24 right, it picks w24 on 1.3 %.
+- The neighbouring agreeing cells carry try9's phase, so the tangent-plane estimate reproduces try9.
+- Wider rings (radius 4-16, 16 angles) label ~50 % of the cells, at accuracy 0.79-0.88, again ≈ always try9.
+
+The formal gate passes at cut 0.2 (0.909 on 7 % of the cells), but those labels would be try9's own phase, i.e. pseudo-labels with no new information. So the worklist was not labelled; that is the lead's call.
+
+The agree-cell labels (0.952, 0.98 at weight >= 0.5) are plain committee pseudo-labels. They label where the models already agree, not the disagreement regions.
+
+**Fibre continuity** (lead follow-up; `field-label --fibres H.fib,V.fib --fib-um 2.399`): each fibre polyline's agreeing cells (at least 3) vote for the disagreement cells on it, since a sheet's phase is constant along a fibre. Input: our 1667 traces, fibtrace/p1667 arm A, ungated (arm B is gated by a winding fit, which is not independent). They cover two of the GT boxes:
+
+| box | disagreement cells labelled | accuracy | always try9 (all) | w24 picked where it is right and try9 wrong |
+|---|---|---|---|---|
+| C12 | 0.7 % | 0.611 | 0.890 | 275 of 45.6k |
+| C2 | 1.0 % | 0.441 | 0.756 | 628 of 114k |
+
+This is worse than trusting try9, and the coverage is ~1 %. The traced fibres do not hold one sheet's phase across the disagreement (cf. the tracer ties that hurt count-field, -0.03). Stopped there (lead: <= 1 h).
+
+What would add information on 1667: human traces in the worklist regions (sparse, with a partial-label loss), or evidence the nets do not share, e.g. a fitter ref-snap count. Rows: /vesuvius/ufsm/disagree/labgt/base (labgt.sh, labsumm.awk).
 
 ## Model disagreement as a labelling query: `ufsm field-disagree`, checked against the GT; a labelling worklist (2026-11-27, branch disagree-20261127, disagree)
 
