@@ -59,6 +59,61 @@ The paper's gain comes from an independent representation (DINO trained on 10 sc
 **Decision.** No student A/B. Repeat only with a feature extractor of our own that is independent of the teacher (a successful SSL
 or J1 trunk). The commands stay opt-in for that.
 
+## Global winding assignment: L1 count integration (count-field --cf-robust); no box gain over L2, the box gain is the ref snap itself (2026-11-27, branch globwind-20261127, globwind)
+
+Lead: solve the winding numbers jointly, under the topology constraint (one turn per revolution), instead of locally. What already exists:
+count-field integrates rho n into one single-valued U, so the turn per revolution holds by construction; its closing error measures
+the loop residues. fit --uw-repair is a PUMA L1 integer solve over phase pieces (l1pot) with geo / w4 / fibre votes. levelsolve
+(11-18) showed that piece integers cannot add turns the phase skips (PH1 oracle 0.222 -> 0.238). So the open lever is how the count
+reference is integrated. L2 smears a merge's missing turns over everything beyond it; L1 (the Ghiglia-Romero L1 unwrapping) cuts them
+inside the merge and carries the count around it.
+
+`count-field --cf-robust K [--cf-robust-delta 0.02]` runs K IRLS passes per level on the count edges. Each edge weight becomes
+w0 min(1, delta / |r|) for the edge residual r (turns per solve cell). With a small delta this is convex L1. It works on both the CPU
+and the GPU CG: on C19, with the unroll's ref recipe, |delta| p99 is 0.0011 turn and the snap integers agree on 0.99998 of cells.
+Default off; the off path is unchanged. A redescending Cauchy weight was unstable (at delta 0.01 it broke the defect-free lenses) and
+was dropped.
+
+**Synthetic** (test_countfield robust_lens: spiral, true phase, a bounded density defect lens at r 16..28 cells, theta 0.2..1.4; the
+table gives the share of sector cells beyond the lens > 0.5 turn off):
+
+| defect | L2 | --cf-robust 8 |
+|---|---|---|
+| 3 sheets merged (sp x 4) | 1.000 | 0.000 |
+| merged, sp x 2 | 0.000 | 0.000 |
+| extra sheets (sp x 0.5) | 1.000 | 0.000 |
+| one missed sheet (2-sheet lens, sp x 2) | 0.000 | 0.000 |
+
+Huber delta 0.25 or 0.05 does not reach L1: the lens deficit spreads over many edges, each below delta.
+
+**wbench boxes** (20 boxes PH1-3, HOLD, C2-C24; fixed fields; CPU fits, production flags; base = plain fit; snap = `--ref-model CF
+--ref-snap 1` with CF the box's own L2 count-field ref; rob02 = the same with `--cf-robust 8 --cf-robust-delta 0.02`). ids, paired
+box bootstrap 95 % CI:
+
+| fields | arm - base | all 20 | packed C19/21/22/24 | PH1-3 | 13 controls |
+|---|---|---|---|---|---|
+| try9 (bl-t9) | snap | +0.040 [+0.009, +0.082] | +0.054 [+0.012, +0.096] | +0.094 [+0.010, +0.140] | +0.023 [-0.008, +0.079] |
+| try9 | rob02 | +0.036 [+0.009, +0.075] | +0.044 [+0.013, +0.086] | +0.084 [+0.031, +0.130] | +0.022 [-0.007, +0.076] |
+| try9 | rob02 - snap | | -0.010 [-0.036, +0.004] | -0.010 [-0.047, +0.021] | -0.001 [-0.004, +0.001] |
+| w24-2000 | rob02 | -0.183 [-0.257, -0.107] | -0.125 [-0.371, +0.040] | +0.075 [+0.014, +0.181] | -0.260 [-0.343, -0.176] |
+| w24-2000 | snap | -0.176 [-0.250, -0.100] | | | |
+
+- try9 base / snap / rob02 means: 0.788 / 0.828 / 0.824 ids, p05x 0.814 / 0.833 / 0.832. The largest gains: C14 0.54 -> 0.89, PH1
+  0.23 -> 0.37, PH3 0.13 -> 0.27, C19 0.67 -> 0.76 (snap; rob02 0.71), C22 0.77 -> 0.87. The losses are small (C4 -0.03, C10 -0.01).
+- **The box gain is the ref snap, not L1.** The unroll already snaps its slab fits to the global count-field ref, so this finding is
+  about wbench's plain fit: it scores the fitter without the count reference the production unroll uses.
+- **L1 adds nothing over L2 inside a box.** Box merges are not bounded lenses with a consistent path around them in the box. Whether
+  L1 helps at region scale is unroll's arm C (1667 comparison unroll, REFX="--cf-robust 8 --cf-robust-delta 0.02",
+  /vesuvius/ufsm/unrollrun/cmp/PHerc1667-C/qa). Not a default.
+- **w24 (step 2000) fields lose under any ref snap.** Their count targets do not integrate: on C11 the count-field closing error is
+  0.167 turn mean with 17 % of 4x4 loops > 0.25 turn, against try9's 0.069 and 1.4 %. w24's phase carries its fits; its density /
+  normal count is not usable yet. A closing-error check (count-field prints it) tells, before the snap, whether a field set's count
+  can be trusted.
+- Not built: the layered optimal-surface min-cut (research/graph.md idea 1, sheets.md idea 3). It needs per-sheet costs that separate
+  touching sheets, which is the information the nets' fields lack in packed regions (pseudolab 11-18). With today's fields a
+  minimum-spacing arc would place sheets by the constraint, not by the evidence.
+- Scripts and rows: /vesuvius/ufsm/globwind (arm.sh, h1.sh, h2.sh, res/*.tsv, gpuchk.sh).
+
 ## try9 + w24 at fit time: a phase mean helps the packed boxes; train --cond-fields for a try9-conditioned 2.4 um net (2026-11-27, branch condnet-20261127, condnet)
 
 w24 (native 2.4 um, P 640 = 1.5 mm field of view) loses wbench to try9 (9.6 um, 6.1 mm) at step 2000 (packed ids -0.122, controls -0.168).
