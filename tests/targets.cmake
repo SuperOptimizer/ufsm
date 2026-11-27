@@ -54,7 +54,7 @@ ufsm_exe(scrollaug_anim tests/scrollaug_anim.c OBJS scannorm edt band sheet ct_a
 ufsm_exe(store_bench src/storebench.c OBJS store zarr3 json LIBS LDLIBS DEFS STORE_BENCH_MAIN)
 ufsm_exe(surface_dedup tools/surface_dedup.c OBJS tiff LIBS m z)
 ufsm_exe(test_afv SUITE tests/test_afv.c OBJS afv json LIBS LDLIBS)
-ufsm_exe(test_atlas SUITE tests/test_atlas.c OBJS atlas parquet json optcheck imgops jpegpar tiffw tiff LIBS LDLIBS m)
+ufsm_exe(test_atlas SUITE tests/test_atlas.c OBJS atlas parquet zarr3 z3w store json optcheck imgops jpegpar tiffw tiff LIBS LDLIBS m)
 ufsm_exe(test_annot SUITE tests/test_annot.c OBJS annot z3w zarr3 store json tfx imgops jpegpar tiffw tiff surfcomp LIBS LDLIBS)
 ufsm_exe(test_attn SUITE tests/test_attn.c OBJS NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_xnet_oom SUITE tests/test_xnet_oom.c OBJS NN LP LIBS LDLIBS CUDA)

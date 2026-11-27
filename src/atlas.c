@@ -13,6 +13,9 @@
 #include "json.h"
 #include "optcheck.h"
 #include "parquet.h"
+#include "store.h"
+#include "zarr3.h"
+#include <inttypes.h>
 #include "sysinfo.h"
 #include "tiffw.h"
 #include <ctype.h>
@@ -272,12 +275,13 @@ int cmd_atlas_import(int argc, char **argv) {
      do not split a sheet). big = the largest sheet's share of the on-sheet nodes; sheets5 = sheets holding >= 5 % of them.
    - --holdouts (repeatable): boxes {"ct", "l0": [z, y, x, nz, ny, nx]} whose CT basename equals the patch's scan; the patch's bbox
      plus 16 voxels intersecting one is listed (column hold), whatever --ref says.
-   Columns: id scroll nodes matched cover p50 p90 le2 le4 onsheet amb edges switches sw_rate sheets5 big set gate hold.
+   Columns: id scroll nodes matched cover p50 p90 le2 le4 onsheet amb edges switches sw_rate sheets5 big set gate hold adj (on-sheet nodes whose nearest other-sheet vertex of their set lies past --on, within --radius: an adjacent sheet).
+   --label-index 1: each reference mesh is its own sheet (label = its index): a patch set against itself gives amb = overlap with another patch, adj = a traced adjacent sheet.
    gate: cover >= gate-cover and p50 <= gate-d and le4 >= gate-le and big >= gate-big and sw_rate <= gate-sw; "nocover" below the cover. */
 
 typedef struct { float p[3], n[3]; float lab; int set; } au_v;
 typedef struct { uint64_t key; uint32_t i; } au_k;
-typedef struct { char id[256], scroll[128], scan[512]; double lo[3], hi[3]; } au_patch;
+typedef struct { char id[256], scroll[128], scan[512]; double lo[3], hi[3], um; } au_patch;
 typedef struct { char ct[512]; char name[64]; int64_t b[6]; } au_box;
 
 static uint64_t au_key(int64_t x, int64_t y, int64_t z) { return (uint64_t)(z & 0x1fffff) << 42 | (uint64_t)(y & 0x1fffff) << 21 | (uint64_t)(x & 0x1fffff); }
@@ -294,13 +298,15 @@ static int au_occ_at(const au_ref *r, const float p[3]) {
     const size_t i = ((size_t)c[2] * r->oc[1] + c[1]) * r->oc[0] + c[0]; return r->occ[i >> 3] >> (i & 7) & 1;
 }
 
+static int au_label_index = 0;   /* --label-index 1: every reference mesh is its own sheet (label = its index; a patch set as its own reference) */
 static int au_add_mesh(au_ref *r, const char *P, const char *value, int set, const double lo[3], const double hi[3], size_t *nmesh) {
     char p[2400]; int w = 0, h = 0, w2, h2; float *X[3] = {nullptr, nullptr, nullptr}, *Q = nullptr;
     static const char *const nm[3] = {"x.tif", "y.tif", "z.tif"};
     for (int a = 0; a < 3; a++) { snprintf(p, sizeof p, "%s/%s", P, nm[a]); X[a] = tfx_axis_read(p, a ? &w2 : &w, a ? &h2 : &h, img_read_f32); if (!X[a] || (a && (w2 != w || h2 != h))) goto bad; }
     double lab = NAN;
     if (value) { snprintf(p, sizeof p, "%s/%s", P, value); if (!access(p, F_OK)) { Q = img_read_f32(p, &w2, &h2); if (!Q || w2 != w || h2 != h) goto bad; } }
-    if (!Q) {   /* the winding id from the name's last run of digits */
+    if (au_label_index) lab = (double)*nmesh;
+    else if (!Q) {   /* the winding id from the name's last run of digits */
         const char *b = strrchr(P, '/'); b = b ? b + 1 : P; const char *d = nullptr;
         for (const char *q = b; *q; q++) if (isdigit((unsigned char)*q) && (q == b || !isdigit((unsigned char)q[-1]))) d = q;
         if (!d || value) { fprintf(stderr, "atlas-audit: %s: no %s and no winding id in the name\n", P, value ? value : "label"); goto bad; }
@@ -399,7 +405,37 @@ static int64_t au_near(const au_ref *r, const float q[3], double *dpl, double *d
 }
 
 typedef struct { const au_ref *ref; const au_patch *P; size_t np; const char *dir; const au_box *box; size_t nbox; int sub, tile; double on;
-                 double gc, gd, gle, gbig, gsw; size_t *next; pthread_mutex_t *mu; FILE *out; size_t *pass, *nocover, *fail, *held; } au_job;
+                 double gc, gd, gle, gbig, gsw; size_t *next; pthread_mutex_t *mu; FILE *out; size_t *pass, *nocover, *fail, *held;
+                 double gamb; const struct au_axis *ax; int qsign; const char *qout; char **allow; size_t nallow; size_t *dropped, *written; } au_job;
+/* the umbilicus (control_points [{z, y, x}] or a bare array, level-0 voxels), linear in z, clamped: sources.c axis_load / axis_at's rule
+   (kept here so atlas.o does not pull the sampler's sources.o) */
+typedef struct au_axis { int n; double *z, *y, *x; } au_axis;
+static int au_zcmp(const void *a, const void *b) { const double x = ((const double *)a)[0], y = ((const double *)b)[0]; return (x > y) - (x < y); }
+static int au_axis_load(au_axis *a, const char *path) {
+    memset(a, 0, sizeof *a);
+    FILE *f = fopen(path, "rb"); if (!f) return -1;
+    fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *t = n > 0 ? malloc((size_t)n + 1) : nullptr;
+    if (!t || fread(t, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(t); return -1; }
+    fclose(f); t[n] = 0;
+    json *j = json_parse(t, (size_t)n); free(t);
+    const json *cp = json_get(j, "control_points"); if (!cp) cp = j && j->type == J_ARR ? j : nullptr;
+    if (!cp || !cp->n) { json_free(j); return -1; }
+    double (*p)[3] = malloc(cp->n * sizeof *p);
+    for (size_t i = 0; i < cp->n; i++) { const json *e = json_at(cp, i); p[i][0] = json_num(json_get(e, "z"), 0); p[i][1] = json_num(json_get(e, "y"), 0); p[i][2] = json_num(json_get(e, "x"), 0); }
+    qsort(p, cp->n, sizeof *p, au_zcmp);
+    a->n = (int)cp->n; a->z = malloc(cp->n * 8); a->y = malloc(cp->n * 8); a->x = malloc(cp->n * 8);
+    for (size_t i = 0; i < cp->n; i++) { a->z[i] = p[i][0]; a->y[i] = p[i][1]; a->x[i] = p[i][2]; }
+    free(p); json_free(j); return 0;
+}
+static void au_axis_at(const au_axis *a, double z, double *y, double *x) {
+    if (z <= a->z[0] || a->n == 1) { *y = a->y[0]; *x = a->x[0]; return; }
+    if (z >= a->z[a->n - 1]) { *y = a->y[a->n - 1]; *x = a->x[a->n - 1]; return; }
+    int lo = 0, hi = a->n - 1; while (hi - lo > 1) { const int m = (lo + hi) / 2; if (a->z[m] <= z) lo = m; else hi = m; }
+    const double t = a->z[hi] > a->z[lo] ? (z - a->z[lo]) / (a->z[hi] - a->z[lo]) : 0;
+    *y = a->y[lo] + t * (a->y[hi] - a->y[lo]); *x = a->x[lo] + t * (a->x[hi] - a->x[lo]);
+}
+static int au_scmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
 static int uf_find(int *p, int a) { while (p[a] != a) { p[a] = p[p[a]]; a = p[a]; } return a; }
 
@@ -433,7 +469,8 @@ static void au_patch_one(au_job *J, const au_patch *P) {
     for (int a = 0; a < 3; a++) free(X[a]);
 }
 static void au_stats(au_job *J, const au_patch *P, const char *rid, float *X[3], int w, int h, const char *hold) {
-    size_t nodes = 0, matched = 0, onsheet = 0, amb = 0, le2 = 0, le4 = 0, edges = 0, sw = 0, sheets5 = 0; double p50 = NAN, p90 = NAN, big = NAN; int dset = -1;
+    double qK = NAN; float *theta_u = J->qout ? malloc(sizeof(float) * ((size_t)w * h + 1)) : nullptr;
+    size_t adj = 0, nodes = 0, matched = 0, onsheet = 0, amb = 0, le2 = 0, le4 = 0, edges = 0, sw = 0, sheets5 = 0; double p50 = NAN, p90 = NAN, big = NAN; int dset = -1;
     if (J->ref) {
         const int S = J->sub, gw = (w + S - 1) / S, gh = (h + S - 1) / S; const size_t G = (size_t)gw * gh;
         float *dpl = malloc(G * 4), *lab = malloc(G * 4); int *set = malloc(G * sizeof(int)), *uf = malloc(G * sizeof(int));
@@ -446,7 +483,7 @@ static void au_stats(au_job *J, const au_patch *P, const char *rid, float *X[3],
             const float q[3] = {X[0][i], X[1][i], X[2][i]}; double d1, d2; const int64_t bi = au_near(J->ref, q, &d1, &d2);
             if (bi < 0) continue;
             matched++; ds[nd++] = (float)d1; le2 += d1 <= 2; le4 += d1 <= 4;
-            if (d1 <= J->on) { onsheet++; set[g] = J->ref->v[bi].set; lab[g] = J->ref->v[bi].lab; dpl[g] = (float)d1; amb += d2 <= J->on; }
+            if (d1 <= J->on) { onsheet++; set[g] = J->ref->v[bi].set; lab[g] = J->ref->v[bi].lab; dpl[g] = (float)d1; amb += d2 <= J->on; adj += d2 > J->on && isfinite(d2); }
         }
         if (nd) { qsort(ds, nd, 4, au_fcmp); p50 = ds[nd / 2]; p90 = ds[(size_t)(0.9 * (nd - 1))]; }
         for (int gy = 0; gy < gh; gy++) for (int gx = 0; gx < gw; gx++) {
@@ -488,15 +525,45 @@ static void au_stats(au_job *J, const au_patch *P, const char *rid, float *X[3],
             }
             free(csum);
         }
+        if (J->qout && J->ax && dset >= 0 && S == 1) {   /* the patch's winding offset: K = median over its main set's on-sheet nodes of label - sign theta_u / 2 pi */
+            double sc = 0, cc = 0;
+            for (size_t i = 0; i < G; i++) if (X[2][i] >= 0) { double cy, cx; au_axis_at(J->ax, X[2][i], &cy, &cx); const double t = atan2(X[1][i] - cy, X[0][i] - cx); sc += sin(t); cc += cos(t); }
+            const double tc = atan2(sc, cc); size_t nk = 0;
+            for (size_t i = 0; i < G; i++) {
+                double cy, cx, t = 0; if (X[2][i] >= 0) { au_axis_at(J->ax, X[2][i], &cy, &cx); t = atan2(X[1][i] - cy, X[0][i] - cx) - tc; t -= 2 * M_PI * floor((t + M_PI) / (2 * M_PI)); t += tc; }
+                theta_u[i] = (float)t;
+                if (set[i] == dset) ds[nk++] = (float)(lab[i] - J->qsign * t / (2 * M_PI));
+            }
+            if (nk) { qsort(ds, nk, 4, au_fcmp); qK = ds[nk / 2]; }
+        }
         free(root); free(cl); free(cs); free(cn); free(dpl); free(lab); free(set); free(uf); free(ds);
     }
     const double cover = nodes ? (double)matched / nodes : 0, swr = edges ? (double)sw / edges : NAN;
-    const char *gate = !J->ref ? "-" : cover < J->gc ? "nocover"
-                     : (p50 <= J->gd && (double)le4 / (matched ? matched : 1) >= J->gle && big >= J->gbig && swr <= J->gsw) ? "pass" : "fail";
+    int allowed = 1;
+    if (J->allow) { const char *key = P->id; allowed = bsearch(&key, J->allow, J->nallow, sizeof *J->allow, au_scmp) != nullptr; }
+    const char *gate = !J->ref ? "-" : *hold ? "held" : !allowed ? "dropped" : cover < J->gc ? "nocover"
+                     : (p50 <= J->gd && (double)le4 / (matched ? matched : 1) >= J->gle && big >= J->gbig && swr <= J->gsw
+                        && (onsheet ? (double)amb / onsheet : 1) <= J->gamb) ? "pass" : "fail";
+    int wrote = 0;
+    if (J->qout && !strcmp(gate, "pass") && isfinite(qK) && theta_u) {   /* the kept patch with its q.tif (turns, the reference's gauge) for `meshes` onfly sources */
+        const size_t n = (size_t)w * h; float *Q = malloc(n * 4); char d[2600], qp[2700];
+        if (Q) {
+            for (size_t i = 0; i < n; i++) Q[i] = X[2][i] >= 0 ? (float)(qK + J->qsign * theta_u[i] / (2 * M_PI)) : NAN;
+            snprintf(d, sizeof d, "%s/%s.tifxyz", J->qout, P->id); snprintf(qp, sizeof qp, "%s/q.tif", d);
+            char extra[1200]; snprintf(extra, sizeof extra, "\"scroll\": \"%s\", \"scan\": \"%s\", \"atlas_id\": \"%s\", \"dataset\": \"ATLAS-15k\", \"license\": \"CC BY-NC 4.0\", \"q_K\": %.4f", P->scroll, P->scan, P->id, qK);
+            wrote = !tifxyz_write_ex(d, w, h, X[0], X[1], X[2], 2.0, P->um, -1, "ufsm atlas-audit --write-q (ATLAS-15k patch, q = K + sign theta / 2 pi in the reference gauge)", extra)
+                    && !tiffw_write(qp, w, h, 3, Q, 1);
+            if (!wrote) fprintf(stderr, "atlas-audit: cannot write %s\n", d);
+            free(Q);
+        }
+    }
+    free(theta_u);
     pthread_mutex_lock(J->mu);
-    fprintf(J->out, "%s\t%s\t%zu\t%zu\t%.4f\t%.3f\t%.3f\t%.4f\t%.4f\t%zu\t%zu\t%zu\t%zu\t%.5f\t%zu\t%.4f\t%d\t%s\t%s\n", rid, P->scroll, nodes, matched, cover,
-            p50, p90, matched ? (double)le2 / matched : 0, matched ? (double)le4 / matched : 0, onsheet, amb, edges, sw, swr, sheets5, big, dset, gate, *hold ? hold : "-");
+    fprintf(J->out, "%s\t%s\t%zu\t%zu\t%.4f\t%.3f\t%.3f\t%.4f\t%.4f\t%zu\t%zu\t%zu\t%zu\t%.5f\t%zu\t%.4f\t%d\t%s\t%s\t%zu\n", rid, P->scroll, nodes, matched, cover,
+            p50, p90, matched ? (double)le2 / matched : 0, matched ? (double)le4 / matched : 0, onsheet, amb, edges, sw, swr, sheets5, big, dset, gate, *hold ? hold : "-", adj);
     if (!strcmp(gate, "pass")) (*J->pass)++; else if (!strcmp(gate, "nocover")) (*J->nocover)++; else if (!strcmp(gate, "fail")) (*J->fail)++;
+    else if (!strcmp(gate, "dropped")) (*J->dropped)++;
+    *J->written += wrote;
     if (*hold) (*J->held)++;
     pthread_mutex_unlock(J->mu);
 }
@@ -530,6 +597,7 @@ int cmd_atlas_audit(int argc, char **argv) {
     const char *index = argv[2], *only = at_opt(argc, argv, "--scroll", nullptr), *value = at_opt(argc, argv, "--value", nullptr), *outp = at_opt(argc, argv, "--out", nullptr);
     const double R = atof(at_opt(argc, argv, "--radius", "20")), on = atof(at_opt(argc, argv, "--on", "4"));
     int nt = atoi(at_opt(argc, argv, "--threads", "0")); if (nt <= 0) nt = ufsm_ncpu(); if (nt > 64) nt = 64;
+    au_label_index = atoi(at_opt(argc, argv, "--label-index", "0"));
     const int sub = atoi(at_opt(argc, argv, "--sub", "1")), tile = atoi(at_opt(argc, argv, "--tile", "0"));
     if (!(R > 0) || !(on > 0) || sub < 1) { fprintf(stderr, "atlas-audit: --radius, --on > 0, --sub >= 1\n"); return 2; }
     char dir[2048]; snprintf(dir, sizeof dir, "%s", index); char *sl = strrchr(dir, '/'); if (sl) *sl = 0; else snprintf(dir, sizeof dir, ".");
@@ -543,6 +611,7 @@ int cmd_atlas_audit(int argc, char **argv) {
         if (nt2 < 16) continue;
         if (only && strcmp(tok[1], only)) continue;
         snprintf(Q.id, sizeof Q.id, "%s", tok[0]); snprintf(Q.scroll, sizeof Q.scroll, "%s", tok[1]); snprintf(Q.scan, sizeof Q.scan, "%s", tok[2]);
+        Q.um = atof(tok[3]);
         for (int k = 0; k < 3; k++) { Q.lo[k] = atof(tok[10 + k]); Q.hi[k] = atof(tok[13 + k]); lo[k] = fmin(lo[k], Q.lo[k]); hi[k] = fmax(hi[k], Q.hi[k]); }
         au_patch *q = realloc(P, sizeof *q * (np + 1)); if (!q) { fclose(f); return 1; } P = q; P[np++] = Q;
     }
@@ -580,17 +649,150 @@ int cmd_atlas_audit(int argc, char **argv) {
     for (int a = 3; a + 1 < argc; a++) if (!strcmp(argv[a], opt_n("--ref"))) { if (au_load_set(&ref, argv[a + 1], value, ref.nsets, lo2, hi2)) return 1; ref.nsets++; haveref = 1; }
     if (haveref) { if (ref.nv > 0xffffffffu) { fprintf(stderr, "atlas-audit: too many reference vertices\n"); return 1; } au_index(&ref); }
     FILE *out = outp ? fopen(outp, "w") : stdout; if (!out) { fprintf(stderr, "atlas-audit: cannot write %s\n", outp); return 1; }
-    fprintf(out, "id\tscroll\tnodes\tmatched\tcover\tp50\tp90\tle2\tle4\tonsheet\tamb\tedges\tswitches\tsw_rate\tsheets5\tbig\tset\tgate\thold\n");
-    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; size_t next = 0, pass = 0, nocover = 0, failn = 0, held = 0;
+    fprintf(out, "id\tscroll\tnodes\tmatched\tcover\tp50\tp90\tle2\tle4\tonsheet\tamb\tedges\tswitches\tsw_rate\tsheets5\tbig\tset\tgate\thold\tadj\n");
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; size_t next = 0, pass = 0, nocover = 0, failn = 0, held = 0, dropped = 0, written = 0;
+    const char *qout = at_opt(argc, argv, "--write-q", nullptr), *axf = at_opt(argc, argv, "--axis", nullptr), *allowf = at_opt(argc, argv, "--allow", nullptr);
+    au_axis ax = {0};
+    if (qout) {
+        if (!axf || au_axis_load(&ax, axf)) { fprintf(stderr, "atlas-audit: --write-q needs --axis (the scroll's umbilicus json; %s)\n", axf ? "unreadable" : "missing"); return 2; }
+        if (sub != 1 || tile) { fprintf(stderr, "atlas-audit: --write-q needs --sub 1 and no --tile\n"); return 2; }
+        if (mkdir(qout, 0775) && errno != EEXIST) { fprintf(stderr, "atlas-audit: cannot create %s\n", qout); return 1; }
+    }
+    char **allow = nullptr; size_t nallow = 0;
+    if (allowf) {   /* --allow FILE: patch ids (first column) that may pass at all (other gates applied beforehand, e.g. the CT alignment) */
+        FILE *af = fopen(allowf, "r"); if (!af) { fprintf(stderr, "atlas-audit: cannot read %s\n", allowf); return 1; }
+        char ln[1024]; while (fgets(ln, sizeof ln, af)) { char *t = strtok(ln, "\t\n "); if (!t || !*t) continue; char **q = realloc(allow, sizeof *allow * (nallow + 1)); if (!q) return 1; allow = q; allow[nallow++] = strdup(t); }
+        fclose(af); qsort(allow, nallow, sizeof *allow, au_scmp);
+    }
     au_job J = {haveref ? &ref : nullptr, P, np, dir, box, nbox, sub, tile, on, atof(at_opt(argc, argv, "--gate-cover", "0.3")), atof(at_opt(argc, argv, "--gate-d", "2")),
                 atof(at_opt(argc, argv, "--gate-le", "0.7")), atof(at_opt(argc, argv, "--gate-big", "0.95")), atof(at_opt(argc, argv, "--gate-sw", "0.002")),
-                &next, &mu, out, &pass, &nocover, &failn, &held};
+                &next, &mu, out, &pass, &nocover, &failn, &held, atof(at_opt(argc, argv, "--gate-amb", "1")), qout ? &ax : nullptr,
+                atoi(at_opt(argc, argv, "--q-sign", "1")) < 0 ? -1 : 1, qout, allow, nallow, &dropped, &written};
     pthread_t th[64]; const int T = (size_t)nt < np ? nt : (int)np;
     for (int t = 0; t < T; t++) pthread_create(&th[t], nullptr, au_main, &J);
     for (int t = 0; t < T; t++) pthread_join(th[t], nullptr);
     if (outp && fclose(out)) return 1;
-    fprintf(stderr, "atlas-audit: %zu patches%s%s, %zu reference vertices in %d sets: pass %zu, fail %zu, nocover %zu; %zu touch a holdout box\n", np, only ? " of " : "",
-            only ? only : "", ref.nv, ref.nsets, pass, failn, nocover, held);
+    fprintf(stderr, "atlas-audit: %zu patches%s%s, %zu reference vertices in %d sets: pass %zu, fail %zu, nocover %zu, held (holdout box) %zu, dropped (--allow) %zu%s",
+            np, only ? " of " : "", only ? only : "", ref.nv, ref.nsets, pass, failn, nocover, held, dropped, qout ? "" : "\n");
+    if (qout) fprintf(stderr, "; %zu written with q.tif -> %s\n", written, qout);
+    free(ax.z); free(ax.y); free(ax.x);
+    for (size_t k = 0; k < nallow; k++) free(allow[k]);
+    free(allow);
     free(ref.v); free(ref.k); free(ref.occ); free(P); free(box);
     return 0;
+}
+
+/* ---------------------------------------------------------------------------------------------------------------------------------
+   ufsm atlas-rvscore --rv ROOT KEY ...: a predicted recto / verso volume (predict --channel rv: 1 + 254 (1 + p_recto - p_verso) / 2, 0 = CT 0)
+   scored on the CPU (2026-11-27, atlas: the A/B score while scripts/rv/eval.sh's count fields are gone). Two modes, one or both:
+   - GT box: --box z,y,x,nz,ny,nx (voxels of the rv array) --phase ROOT KEY [--phase-div S] --ct ROOT KEY [--iso 64]: over the box's papyrus
+     (CT >= iso) whose GT phase is known (PHASE_* codes, phase voxel = S rv voxels), GT recto = phase < 126; predicted recto = rv > 128.
+     Prints recto recall, verso recall and their mean (balanced side accuracy).
+   - ATLAS patches: --patches INDEX.tsv --ids FILE --axis AXIS.json [--rv-div D] [--d 2] [--every 2]: the patches named in FILE (first
+     column; e.g. those inside an eval slab, never trained), every --every-th node: the grid normal oriented away from the axis, rv sampled at
+     the node +- d voxels along it (rv voxel = D level-0 voxels). The recto face's outer side should read recto (> 128), its inner side not.
+     Prints the node shares: outer recto, inner verso, both, and the mean outer - inner rv. Nodes outside the rv array or on CT 0 (rv 0)
+     are skipped and counted. */
+typedef struct { z3 *z; int64_t o[3], n[3]; uint8_t *buf; } rs_vol;
+static int rs_load(rs_vol *v, const char *root, const char *key, const int64_t o[3], const int64_t n[3]) {
+    store *st = store_open(root); v->z = st ? z3_open(st, key, nullptr) : nullptr;
+    if (!v->z) { fprintf(stderr, "atlas-rvscore: cannot open %s %s: %s\n", root, key, z3_error()); return -1; }
+    const z3_meta *m = z3_meta_of(v->z); int64_t oo[3], nn[3];
+    for (int k = 0; k < 3; k++) { oo[k] = o[k] < 0 ? 0 : o[k]; const int64_t e = o[k] + n[k] > m->shape[k] ? m->shape[k] : o[k] + n[k]; nn[k] = e - oo[k]; if (nn[k] <= 0) { fprintf(stderr, "atlas-rvscore: box outside %s\n", key); return -1; } v->o[k] = oo[k]; v->n[k] = nn[k]; }
+    v->buf = malloc((size_t)nn[0] * nn[1] * nn[2]);
+    if (!v->buf || z3_read(v->z, oo, nn, v->buf, ufsm_ncpu())) { fprintf(stderr, "atlas-rvscore: cannot read %s: %s\n", key, z3_error()); return -1; }
+    return 0;
+}
+static int rs_at(const rs_vol *v, int64_t z, int64_t y, int64_t x) {
+    z -= v->o[0]; y -= v->o[1]; x -= v->o[2];
+    if (z < 0 || y < 0 || x < 0 || z >= v->n[0] || y >= v->n[1] || x >= v->n[2]) return -1;
+    return v->buf[((size_t)z * v->n[1] + y) * v->n[2] + x];
+}
+static void rs_free(rs_vol *v) { free(v->buf); if (v->z) z3_close(v->z); memset(v, 0, sizeof *v); }
+
+int cmd_atlas_rvscore(int argc, char **argv) {
+    const char *rvr = nullptr, *rvk = nullptr;
+    for (int i = 2; i + 2 < argc; i++) if (!strcmp(argv[i], opt_n("--rv"))) { rvr = argv[i + 1]; rvk = argv[i + 2]; }
+    if (!rvr) { fprintf(stderr, "usage: ufsm atlas-rvscore --rv ROOT KEY [--box z,y,x,nz,ny,nx --phase ROOT KEY [--phase-div S] --ct ROOT KEY [--iso 64]]\n"
+                                "       [--patches INDEX.tsv --ids FILE --axis AXIS.json [--rv-div D] [--d 2] [--every 2]] [--tag T] [--out F]\n"); return 2; }
+    const char *tag = at_opt(argc, argv, "--tag", "-"), *boxs = at_opt(argc, argv, "--box", nullptr), *idx = at_opt(argc, argv, "--patches", nullptr);
+    int rc = 0, did = 0;
+    const char *outp = at_opt(argc, argv, "--out", nullptr); FILE *of = outp ? fopen(outp, "a") : stdout;   /* --out F: rows appended to F */
+    if (!of) { fprintf(stderr, "atlas-rvscore: cannot write %s\n", outp); return 1; }
+    if (boxs) {
+        int64_t b[6]; if (sscanf(boxs, "%" SCNd64 ",%" SCNd64 ",%" SCNd64 ",%" SCNd64 ",%" SCNd64 ",%" SCNd64, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) { fprintf(stderr, "atlas-rvscore: --box z,y,x,nz,ny,nx\n"); return 2; }
+        const char *pr = nullptr, *pk = nullptr, *cr = nullptr, *ck = nullptr;
+        for (int i = 2; i + 2 < argc; i++) { if (!strcmp(argv[i], opt_n("--phase"))) { pr = argv[i + 1]; pk = argv[i + 2]; } if (!strcmp(argv[i], opt_n("--ct"))) { cr = argv[i + 1]; ck = argv[i + 2]; } }
+        if (!pr || !cr) { fprintf(stderr, "atlas-rvscore: --box needs --phase ROOT KEY and --ct ROOT KEY\n"); return 2; }
+        const int S = atoi(at_opt(argc, argv, "--phase-div", "1")), iso = atoi(at_opt(argc, argv, "--iso", "64"));
+        if (S < 1) { fprintf(stderr, "atlas-rvscore: --phase-div >= 1\n"); return 2; }
+        rs_vol rv = {0}, ph = {0}, ct = {0};
+        const int64_t po[3] = {b[0] / S, b[1] / S, b[2] / S}, pn[3] = {(b[0] + b[3] + S - 1) / S - b[0] / S, (b[1] + b[4] + S - 1) / S - b[1] / S, (b[2] + b[5] + S - 1) / S - b[2] / S};
+        if (rs_load(&rv, rvr, rvk, b, b + 3) || rs_load(&ph, pr, pk, po, pn) || rs_load(&ct, cr, ck, b, b + 3)) { rs_free(&rv); rs_free(&ph); rs_free(&ct); return 1; }
+        uint64_t rr = 0, rn = 0, vv = 0, vn = 0, skip = 0;
+        for (int64_t z = b[0]; z < b[0] + b[3]; z++) for (int64_t y = b[1]; y < b[1] + b[4]; y++) for (int64_t x = b[2]; x < b[2] + b[5]; x++) {
+            const int c = rs_at(&ct, z, y, x), p = rs_at(&ph, z / S, y / S, x / S), r = rs_at(&rv, z, y, x);
+            if (c < iso || p < 0 || p == 255) continue;
+            if (r <= 0) { skip++; continue; }
+            if (p < 126) { rn++; rr += r > 128; } else { vn++; vv += r <= 128; }
+        }
+        const double ra = rn ? (double)rr / rn : NAN, va = vn ? (double)vv / vn : NAN;
+        fprintf(of, "atlas-rvscore\t%s\tbox\t%s\trecto_recall\t%.4f\tverso_recall\t%.4f\tbalanced\t%.4f\tvoxels\t%" PRIu64 "\tskipped\t%" PRIu64 "\n", tag, boxs, ra, va, (ra + va) / 2, rn + vn, skip);
+        if (!(rn + vn)) rc = 1;
+        rs_free(&rv); rs_free(&ph); rs_free(&ct); did = 1;
+    }
+    if (idx) {
+        const char *idsf = at_opt(argc, argv, "--ids", nullptr), *axf = at_opt(argc, argv, "--axis", nullptr);
+        const int D = atoi(at_opt(argc, argv, "--rv-div", "1")), ev = atoi(at_opt(argc, argv, "--every", "2")); const double dd = atof(at_opt(argc, argv, "--d", "2"));
+        au_axis ax; if (!idsf || !axf || au_axis_load(&ax, axf) || D < 1 || ev < 1 || !(dd > 0)) { fprintf(stderr, "atlas-rvscore: --patches needs --ids FILE and a readable --axis; --rv-div, --every >= 1, --d > 0\n"); return 2; }
+        char dir[2048]; snprintf(dir, sizeof dir, "%s", idx); char *sl = strrchr(dir, '/'); if (sl) *sl = 0; else snprintf(dir, sizeof dir, ".");
+        FILE *f = fopen(idsf, "r"); if (!f) { fprintf(stderr, "atlas-rvscore: cannot read %s\n", idsf); return 1; }
+        char **ids = nullptr; size_t ni = 0; char ln[4096];
+        while (fgets(ln, sizeof ln, f)) { char *t = strtok(ln, "\t\n "); if (!t) continue; ids = realloc(ids, sizeof *ids * (ni + 1)); ids[ni++] = strdup(t); }
+        fclose(f); qsort(ids, ni, sizeof *ids, au_scmp);
+        f = fopen(idx, "r"); if (!f) { fprintf(stderr, "atlas-rvscore: cannot read %s\n", idx); return 1; }
+        uint64_t nodes = 0, outr = 0, inv = 0, both = 0, skipped = 0; double dsum = 0; size_t np = 0;
+        while (fgets(ln, sizeof ln, f)) {
+            if (!strncmp(ln, "id\t", 3)) continue;
+            char *tok[16]; int nt = 0; for (char *s = strtok(ln, "\t\n"); s && nt < 16; s = strtok(nullptr, "\t\n")) tok[nt++] = s;
+            if (nt < 16) continue;
+            const char *key = tok[0]; if (!bsearch(&key, ids, ni, sizeof *ids, au_scmp)) continue;
+            char d[2600]; float *X[3]; int w = 0, h = 0, w2, h2; static const char *const nm[3] = {"x.tif", "y.tif", "z.tif"};
+            for (int a = 0; a < 3; a++) { snprintf(d, sizeof d, "%s/%s/%s.tifxyz/%s", dir, tok[1], tok[0], nm[a]); X[a] = img_read_f32(d, a ? &w2 : &w, a ? &h2 : &h); }
+            if (!X[0] || !X[1] || !X[2] || w2 != w || h2 != h) { fprintf(stderr, "atlas-rvscore: cannot read %s\n", tok[0]); for (int a = 0; a < 3; a++) free(X[a]); rc = 1; continue; }
+            /* the rv block over this patch's bbox + d (rv grid) */
+            int64_t o[3], n[3]; const double lo[3] = {atof(tok[12]), atof(tok[11]), atof(tok[10])}, hi[3] = {atof(tok[15]), atof(tok[14]), atof(tok[13])};   /* z y x */
+            for (int k = 0; k < 3; k++) { o[k] = (int64_t)floor((lo[k] - dd - 2) / D); n[k] = (int64_t)ceil((hi[k] + dd + 2) / D) - o[k] + 1; }
+            rs_vol rv = {0};
+            if (rs_load(&rv, rvr, rvk, o, n)) { for (int a = 0; a < 3; a++) free(X[a]); rs_free(&rv); skipped++; continue; }
+            np++;
+            for (int r = 1; r + 1 < h; r += ev) for (int c = 1; c + 1 < w; c += ev) {
+                const size_t i = (size_t)r * w + c;
+                if (X[2][i] < 0 || X[2][i - 1] < 0 || X[2][i + 1] < 0 || X[2][i - w] < 0 || X[2][i + w] < 0) continue;
+                double du[3], dv[3], nr[3];
+                for (int a = 0; a < 3; a++) { du[a] = X[a][i + 1] - X[a][i - 1]; dv[a] = X[a][i + w] - X[a][i - w]; }
+                nr[0] = du[1] * dv[2] - du[2] * dv[1]; nr[1] = du[2] * dv[0] - du[0] * dv[2]; nr[2] = du[0] * dv[1] - du[1] * dv[0];
+                const double l = sqrt(nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]); if (!(l > 0)) continue;
+                double cy, cx; au_axis_at(&ax, X[2][i], &cy, &cx);
+                if (nr[0] * (X[0][i] - cx) + nr[1] * (X[1][i] - cy) < 0) for (int a = 0; a < 3; a++) nr[a] = -nr[a];   /* outward: away from the axis */
+                int s[2];
+                for (int k = 0; k < 2; k++) {
+                    const double sg = k ? -dd : dd, px = X[0][i] + sg * nr[0] / l, py = X[1][i] + sg * nr[1] / l, pz = X[2][i] + sg * nr[2] / l;
+                    s[k] = rs_at(&rv, (int64_t)floor(pz / D + 0.5 / D), (int64_t)floor(py / D + 0.5 / D), (int64_t)floor(px / D + 0.5 / D));
+                }
+                if (s[0] <= 0 || s[1] <= 0) { skipped++; continue; }
+                nodes++; outr += s[0] > 128; inv += s[1] <= 128; both += s[0] > 128 && s[1] <= 128; dsum += s[0] - s[1];
+            }
+            rs_free(&rv); for (int a = 0; a < 3; a++) free(X[a]);
+        }
+        fclose(f);
+        fprintf(of, "atlas-rvscore\t%s\tpatches\t%zu\tnodes\t%" PRIu64 "\touter_recto\t%.4f\tinner_verso\t%.4f\tboth\t%.4f\tmean_out_minus_in\t%.2f\tskipped\t%" PRIu64 "\n", tag, np,
+               nodes, nodes ? (double)outr / nodes : NAN, nodes ? (double)inv / nodes : NAN, nodes ? (double)both / nodes : NAN, nodes ? dsum / nodes : NAN, skipped);
+        if (!nodes) rc = 1;
+        for (size_t k = 0; k < ni; k++) free(ids[k]);
+        free(ids); free(ax.z); free(ax.y); free(ax.x); did = 1;
+    }
+    if (outp) fclose(of);
+    if (!did) { fprintf(stderr, "atlas-rvscore: give --box ... and / or --patches ...\n"); return 2; }
+    return rc;
 }

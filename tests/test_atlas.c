@@ -8,6 +8,7 @@
 #include "parquet.h"
 #include "imgops.h"
 #include "tiffw.h"
+#include "z3w.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,7 @@
 
 int cmd_atlas_import(int argc, char **argv);
 int cmd_atlas_audit(int argc, char **argv);
+int cmd_atlas_rvscore(int argc, char **argv);
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); fails++; } } while (0)
@@ -206,9 +208,48 @@ static void write_patch(const char *root, const char *scroll, const char *id, do
     char d[1024]; snprintf(d, sizeof d, "%s/%s/%s.tifxyz", root, scroll, id); tifxyz_write(d, W, H, X, Y, Z, 2, 8.64, -1, "test");
 }
 
+static void write_vol(const char *dir, uint8_t (*f)(int z, int y, int x)) {
+    const int64_t sh[3] = {128, 128, 128}; z3w *w = z3w_create(dir, sh, 128, 0, 0, nullptr); uint8_t *d = malloc(128 * 128 * 128);
+    for (int z = 0; z < 128; z++) for (int y = 0; y < 128; y++) for (int x = 0; x < 128; x++) d[((size_t)z * 128 + y) * 128 + x] = f(z, y, x);
+    if (!w || z3w_write_shard(w, 0, 0, 0, d, 1)) fprintf(stderr, "FAIL: z3w %s\n", dir), fails++;
+    z3w_close(w); free(d);
+}
+static uint8_t v_ct(int z, int y, int x) { (void)z; (void)y; (void)x; return 100; }
+static uint8_t v_ph(int z, int y, int x) { (void)y; (void)x; return z < 4 ? 255 : z < 64 ? 50 : 200; }
+static uint8_t v_rvz(int z, int y, int x) { (void)y; (void)x; return z < 60 ? 200 : 50; }
+static uint8_t v_rvx(int z, int y, int x) { (void)z; (void)y; return x > 64 ? 200 : 50; }
+/* atlas-rvscore: a GT box (recto recall 56 / 60: four recto rows predicted verso) and an ATLAS patch on the plane x = 64 with the axis at x = 0 */
+static void test_rvscore(const char *tmp) {
+    char ct[600], ph[600], rz[600], rx[600]; snprintf(ct, sizeof ct, "%s/ct", tmp); snprintf(ph, sizeof ph, "%s/ph", tmp); snprintf(rz, sizeof rz, "%s/rvz", tmp); snprintf(rx, sizeof rx, "%s/rvx", tmp);
+    write_vol(ct, v_ct); write_vol(ph, v_ph); write_vol(rz, v_rvz); write_vol(rx, v_rvx);
+    char out[700]; snprintf(out, sizeof out, "%s/rvs.txt", tmp);
+    char *a1[] = {"ufsm", "atlas-rvscore", "--rv", (char *)tmp, "rvz", "--box", "0,0,0,128,128,128", "--phase", (char *)tmp, "ph", "--ct", (char *)tmp, "ct", "--tag", "box", "--out", out};
+    const int r1 = cmd_atlas_rvscore(17, a1);
+    /* the patch: nodes (y, z) = (10 + 2 c, 10 + 2 r) on x = 64 */
+    char ad[700], ix[700], ids[700], axf[700]; snprintf(ad, sizeof ad, "%s/rv/PHercR/p1.tifxyz", tmp); snprintf(ix, sizeof ix, "%s/rv/index.tsv", tmp); snprintf(ids, sizeof ids, "%s/rv/ids.txt", tmp); snprintf(axf, sizeof axf, "%s/rv/axis.json", tmp);
+    enum { W = 40, H = 40 }; static float X[W * H], Y[W * H], Z[W * H];
+    for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) { X[r * W + c] = 64; Y[r * W + c] = (float)(10 + 2 * c); Z[r * W + c] = (float)(10 + 2 * r); }
+    tifxyz_write(ad, W, H, X, Y, Z, 2, 8.64, -1, "test");
+    FILE *f = fopen(ix, "w"); fprintf(f, "id\tscroll\tscan\tum\trows\tcols\tvalid\tquads\tarea_cm2\tarea_cm2_atlas\tx0\ty0\tz0\tx1\ty1\tz1\np1\tPHercR\tR.zarr\t8.64\t40\t40\t1600\t1521\t0\t0\t64\t10\t10\t64\t88\t88\n"); fclose(f);
+    f = fopen(ids, "w"); fprintf(f, "p1\n"); fclose(f);
+    f = fopen(axf, "w"); fprintf(f, "{\"control_points\": [{\"z\": 0, \"y\": 50, \"x\": 0}, {\"z\": 200, \"y\": 50, \"x\": 0}]}\n"); fclose(f);
+    char *a2[] = {"ufsm", "atlas-rvscore", "--rv", (char *)tmp, "rvx", "--patches", ix, "--ids", ids, "--axis", axf, "--tag", "atlas", "--out", out};
+    const int r2 = cmd_atlas_rvscore(15, a2);
+    CHECK(r1 == 0 && r2 == 0, "atlas-rvscore rc %d %d", r1, r2);
+    f = fopen(out, "r"); char ln[2048]; int ok1 = 0, ok2 = 0;
+    while (f && fgets(ln, sizeof ln, f)) {
+        double rr, vr, bal, o, iv, b, dm;
+        const char *p = strstr(ln, "recto_recall\t"); if (p && sscanf(p, "recto_recall\t%lf\tverso_recall\t%lf\tbalanced\t%lf", &rr, &vr, &bal) == 3) ok1 = fabs(rr - 56.0 / 60) < 1e-3 && vr == 1 && fabs(bal - (56.0 / 60 + 1) / 2) < 1e-3;
+        p = strstr(ln, "outer_recto\t"); if (p && sscanf(p, "outer_recto\t%lf\tinner_verso\t%lf\tboth\t%lf\tmean_out_minus_in\t%lf", &o, &iv, &b, &dm) == 4) ok2 = o == 1 && iv == 1 && b == 1 && fabs(dm - 150) < 1e-6;
+    }
+    if (f) fclose(f);
+    CHECK(ok1 && ok2, "atlas-rvscore rows (%d %d), see %s", ok1, ok2, out);
+}
+
 int main(void) {
     char tmp[] = "/tmp/test_atlas_XXXXXX"; if (!mkdtemp(tmp)) { perror("mkdtemp"); return 1; }
     test_snappy();
+    test_rvscore(tmp);
     char pq[512], out[512]; snprintf(pq, sizeof pq, "%s/t.parquet", tmp); snprintf(out, sizeof out, "%s/out", tmp);
     CHECK(!write_parquet(pq), "write the test parquet");
     pq_file *f = pq_open(pq);
@@ -250,15 +291,16 @@ int main(void) {
     char gt[600], ar[600], ho[600], res[600]; snprintf(gt, sizeof gt, "%s/gt", tmp); snprintf(ar, sizeof ar, "%s/at", tmp);
     char p1[700]; snprintf(p1, sizeof p1, "%s/s0.tifxyz", gt); write_plane(p1, 100, 0, 160); snprintf(p1, sizeof p1, "%s/s1.tifxyz", gt); write_plane(p1, 114, 1, 160);
     snprintf(p1, sizeof p1, "%s/PHercV", ar); char mk[800]; snprintf(mk, sizeof mk, "mkdir -p '%s'", p1); CHECK(!system(mk), "mkdir");
-    write_patch(ar, "PHercV", "good", 100.6, 100.6, 0); write_patch(ar, "PHercV", "step", 100.4, 113.7, 0); write_patch(ar, "PHercV", "far", 160, 160, 0);
+    write_patch(ar, "PHercV", "good", 100.6, 100.6, 0); write_patch(ar, "PHercV", "step", 100.4, 113.7, 0); write_patch(ar, "PHercV", "far", 160, 160, 0); write_patch(ar, "PHercV", "boxed", 100.6, 100.6, 80);
     snprintf(idx, sizeof idx, "%s/index.tsv", ar); ix = fopen(idx, "w");
     fprintf(ix, "id\tscroll\tscan\tum\trows\tcols\tvalid\tquads\tarea_cm2\tarea_cm2_atlas\tx0\ty0\tz0\tx1\ty1\tz1\n");
     fprintf(ix, "good\tPHercV\tV.zarr\t8.64\t30\t40\t1200\t1131\t0\t0\t0\t20\t100.6\t78\t78\t100.6\n");
     fprintf(ix, "step\tPHercV\tV.zarr\t8.64\t30\t40\t1200\t1131\t0\t0\t0\t20\t100.4\t78\t78\t113.7\n");
     fprintf(ix, "far\tPHercV\tW.zarr\t8.64\t30\t40\t1200\t1131\t0\t0\t0\t20\t160\t78\t78\t160\n");
+    fprintf(ix, "boxed\tPHercV\tV.zarr\t8.64\t30\t40\t1200\t1131\t0\t0\t80\t20\t100.6\t158\t78\t100.6\n");
     fclose(ix);
     snprintf(ho, sizeof ho, "%s/ho.json", tmp); FILE *hf = fopen(ho, "w");
-    fprintf(hf, "{\"boxes\": [{\"name\": \"B1\", \"ct\": \"PHercV/V.zarr\", \"l0\": [90, 0, 0, 20, 64, 64]}, {\"name\": \"B2\", \"ct\": \"PHercV/other.zarr\", \"l0\": [0, 0, 0, 999, 999, 999]}]}\n"); fclose(hf);
+    fprintf(hf, "{\"boxes\": [{\"name\": \"B1\", \"ct\": \"PHercV/V.zarr\", \"l0\": [90, 0, 120, 20, 64, 64]}, {\"name\": \"B2\", \"ct\": \"PHercV/other.zarr\", \"l0\": [0, 0, 0, 999, 999, 999]}]}\n"); fclose(hf);
     snprintf(res, sizeof res, "%s/audit.tsv", tmp);
     char *aa[] = {"ufsm", "atlas-audit", idx, "--ref", gt, "--value", "q.tif", "--holdouts", ho, "--out", res, "--threads", "2"};
     CHECK(cmd_atlas_audit(13, aa) == 0, "atlas-audit rc");
@@ -266,12 +308,28 @@ int main(void) {
     while (rf && fgets(ln, sizeof ln, rf)) {
         char id[64], sc[64], gate[32], hold[64]; size_t nodes, matched, onsheet, amb, edges, sw, s5; double cover, p50, p90, le2, le4, swr, big; int set;
         if (sscanf(ln, "%63s %63s %zu %zu %lf %lf %lf %lf %lf %zu %zu %zu %zu %lf %zu %lf %d %31s %63s", id, sc, &nodes, &matched, &cover, &p50, &p90, &le2, &le4, &onsheet, &amb, &edges, &sw, &swr, &s5, &big, &set, gate, hold) != 19) continue;
-        if (!strcmp(id, "good")) { seen++; CHECK(!strcmp(gate, "pass") && fabs(p50 - 0.6) < 0.01 && sw == 0 && s5 == 1 && big > 0.999 && !strcmp(hold, "B1"), "good: %s", ln); }
+        if (!strcmp(id, "good")) { seen++; CHECK(!strcmp(gate, "pass") && fabs(p50 - 0.6) < 0.01 && sw == 0 && s5 == 1 && big > 0.999 && !strcmp(hold, "-"), "good: %s", ln); }
         if (!strcmp(id, "step")) { seen++; CHECK(!strcmp(gate, "fail") && sw == 30 && s5 == 2 && fabs(big - 0.5) < 0.01 && edges == 30 * 39 + 29 * 40, "step: %s", ln); }
+        if (!strcmp(id, "boxed")) { seen++; CHECK(!strcmp(gate, "held") && !strcmp(hold, "B1"), "boxed: %s", ln); }
         if (!strcmp(id, "far")) { seen++; CHECK(!strcmp(gate, "nocover") && matched == 0 && !strcmp(hold, "-"), "far: %s", ln); }
     }
     if (rf) fclose(rf);
-    CHECK(seen == 3, "audit rows: %d", seen);
+    CHECK(seen == 4, "audit rows: %d", seen);
+    /* the gate as a filter: --allow (far dropped), --write-q: the kept patch with q = K + theta / 2 pi in the GT gauge */
+    char ax[600], al[600], qd[600]; snprintf(ax, sizeof ax, "%s/axis.json", tmp); snprintf(al, sizeof al, "%s/allow.txt", tmp); snprintf(qd, sizeof qd, "%s/kept", tmp);
+    FILE *af = fopen(ax, "w"); fprintf(af, "{\"control_points\": [{\"z\": 0, \"y\": 50, \"x\": -100000}, {\"z\": 1000, \"y\": 50, \"x\": -100000}]}\n"); fclose(af);
+    af = fopen(al, "w"); fprintf(af, "good\nstep\nboxed\n"); fclose(af);
+    char *ab[] = {"ufsm", "atlas-audit", idx, "--ref", gt, "--value", "q.tif", "--holdouts", ho, "--out", res, "--threads", "2", "--allow", al, "--write-q", qd, "--axis", ax, "--gate-amb", "0.05"};
+    CHECK(cmd_atlas_audit(21, ab) == 0, "atlas-audit --write-q rc");
+    rf = fopen(res, "r"); int dropped = 0; while (rf && fgets(ln, sizeof ln, rf)) if (!strncmp(ln, "far\t", 4) && strstr(ln, "\tdropped\t")) dropped = 1; if (rf) fclose(rf);
+    CHECK(dropped, "far: not dropped by --allow");
+    snprintf(p1, sizeof p1, "%s/step.tifxyz/q.tif", qd); CHECK(access(p1, F_OK), "a failing patch was written");
+    snprintf(p1, sizeof p1, "%s/boxed.tifxyz/q.tif", qd); CHECK(access(p1, F_OK), "a held patch was written");
+    snprintf(p1, sizeof p1, "%s/good.tifxyz/q.tif", qd); int qw = 0, qh = 0; float *Qg = img_read_f32(p1, &qw, &qh);
+    snprintf(p1, sizeof p1, "%s/good.tifxyz/x.tif", qd); int xw = 0, xh = 0; float *Xg = img_read_f32(p1, &xw, &xh);
+    CHECK(Qg && Xg && qw == 40 && qh == 30 && xw == 40, "good: q.tif / x.tif");
+    if (Qg && Xg) { double e = 0; for (int i = 0; i < qw * qh; i++) e = fmax(e, fabs(Qg[i] - 0.001 * Xg[i])); CHECK(e < 0.05, "good: q off the GT gauge by %.3f turns", e); }
+    free(Qg); free(Xg);
     if (!fails) { snprintf(mk, sizeof mk, "rm -rf '%s'", tmp); if (system(mk)) fprintf(stderr, "cleanup failed\n"); }
     if (fails) { fprintf(stderr, "test_atlas: %d failures (kept %s)\n", fails, tmp); return 1; }
     printf("test_atlas: OK\n");

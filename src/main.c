@@ -287,6 +287,7 @@ static int usage(void) {
         "  ufsm wrap-align <tifxyz> --ct ROOT KEY --level L [--every 8] [--block 512] [--out PREFIX]   share of a mesh whose normal follows the CT lamination (structure tensor)\n"
         "  ufsm wrap-rays <out.tsv> --ct ROOT KEY --level L --z Z --meshes DIR [--map reg.json --cf CFDIR] [--rays 8]   CT laminae vs fitted wraps vs count-field turns along radial lines\n"
         "  ufsm atlas-import OUT FILE.parquet... [--scroll S] [--limit N] [--dump 1]   ATLAS-15k Parquet surface patches -> OUT/<scroll>/<id>.tifxyz + index.tsv\n"
+        "  ufsm atlas-rvscore --rv ROOT KEY [--box B --phase R K --ct R K] [--patches INDEX --ids F --axis A]   a predicted rv volume vs GT phase sides / ATLAS recto faces\n"
         "  ufsm atlas-audit INDEX.tsv --ref DIR [--scroll S] [--out T.tsv]   ATLAS patches vs reference sheets (GT q meshes / our wraps): distance, sheet switches\n"
         "  ufsm surf-near <query-tifxyz> <wraps-dir> [--radius 40] [--out PREFIX] [--matched DIR]   a foreign surface vs our wraps: plane distance, wraps followed\n"
         "  ufsm wrap-w <fit-model-dir> <tifxyz>... [--zr z0,z1]   a fit model's winding W on wrap meshes (level-set check: W = k flat on the model's own wraps)\n"
@@ -4929,6 +4930,7 @@ int cmd_wrap_w(int argc, char **argv);       /* src/wraprays.c */
 int cmd_surf_near(int argc, char **argv);    /* src/surfnear.c */
 int cmd_atlas_import(int argc, char **argv); /* src/atlas.c */
 int cmd_atlas_audit(int argc, char **argv);  /* src/atlas.c */
+int cmd_atlas_rvscore(int argc, char **argv); /* src/atlas.c */
 int cmd_gt_trans(int argc, char **argv);   /* src/gttrans.c */
 int cmd_fields_derive(int argc, char **argv);   /* src/fieldsderive.c */
 int cmd_annotate_serve(int argc, char **argv);   /* src/annot.c */
@@ -5020,6 +5022,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "surf-near")) return cmd_surf_near(argc, argv);
     if (!strcmp(cmd, "atlas-import")) return cmd_atlas_import(argc, argv);
     if (!strcmp(cmd, "atlas-audit")) return cmd_atlas_audit(argc, argv);
+    if (!strcmp(cmd, "atlas-rvscore")) return cmd_atlas_rvscore(argc, argv);
     if (!strcmp(cmd, "gt-trans")) return cmd_gt_trans(argc, argv);
     if (!strcmp(cmd, "fields-derive")) return cmd_fields_derive(argc, argv);
     if (!strcmp(cmd, "annotate-serve")) return cmd_annotate_serve(argc, argv);
