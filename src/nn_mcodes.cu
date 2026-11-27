@@ -84,7 +84,10 @@ extern "C" void mesh_codes_gpu_device(int dev) { g_dev = dev; }
 /* out (host) or, with dst (device, on device ddev), straight into the box at dof of a dn array there (no copy down; w24 2026-11-27) */
 static int mg_stamp(mgctx *x, size_t kmb, const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
                     const int64_t o[3], const int64_t n[3], uint8_t *out, uint8_t *dst, const int dn[3], const int dof[3]) {
-    if (x->dev != g_dev) { MG_CK(cudaSetDevice(g_dev)); if (x->st) cudaStreamDestroy(x->st); MG_CK(cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking)); x->dev = g_dev; }
+    if (x->dev != g_dev) {   /* (a context moving device: its buffers were the old device's: freed there; the pool's contexts serve any device) */
+        if (x->dev >= 0) { cudaSetDevice(x->dev); for (int i = 0; i < MB_N; i++) { if (x->b[i].p) cudaFree(x->b[i].p); x->b[i].p = nullptr; x->b[i].cap = 0; }
+                           if (x->st) cudaStreamDestroy(x->st); x->st = nullptr; }
+        MG_CK(cudaSetDevice(g_dev)); MG_CK(cudaStreamCreateWithFlags(&x->st, cudaStreamNonBlocking)); x->dev = g_dev; }
     MG_CK(cudaSetDevice(x->dev));
     /* the slab: the keys of up to kmb MB of voxels (8 bytes each), whole z planes; every slab walks all the read's tiles */
     const size_t plane = (size_t)n[1] * n[2]; long long S = (long long)((kmb << 20) / 8 / (plane ? plane : 1)); if (S < 1) S = 1;
@@ -126,7 +129,7 @@ extern "C" int mesh_codes_gpu_stamp(const mcg_tile *t, int nt, const float *xyz,
    its slab keys can be large: $UFSM_MESHCODES_INTO_MB (512) MB each. At 64 MB a 580^3 tile took ~25 slabs, each walking every mesh tile:
    the stamp was ~480 of a tile's ~620 GPU ms at rmax 160 (w24 2026-11-27) */
 enum { MG_POOL = 4 };
-static mgctx g_pool[MG_POOL]; static int g_pool_busy[MG_POOL], g_pool_init;
+static mgctx g_pool[MG_POOL]; static int g_pool_busy[MG_POOL], g_pool_init;   /* mgpu: guarded (g_pool_mu; a context rebinds to g_dev at use) */
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pool_cv = PTHREAD_COND_INITIALIZER;
 extern "C" int mesh_codes_gpu_stamp_into(const mcg_tile *t, int nt, const float *xyz, const float *val, const uint8_t *valid, size_t nv, double sc,
                                          const int64_t o[3], const int64_t n[3], uint8_t *dst, int ddev, const int dn[3], const int dof[3]) {
