@@ -13,20 +13,26 @@
    offset + k * period) and reports, per axis, the mean |v(b) - v(b - 1)| across the border plane against the same across every other
    plane of the cube (both over voxel pairs with max >= --min, i.e. not air), plus the mean signed brightness step of the border planes.
    "jump" = border - interior (the ~30 / 9.4 / 6 numbers of the Paris 4 ink notes), "ratio" = border / interior. --block K: the interior
-   planes only those at the border's phase mod K (16 = the volcomp codec block faces, whose own step is part of every 512 border). */
+   planes only those at the border's phase mod K (16 = the volcomp codec block faces, whose own step is part of every 512 border). --line R (perf 11-26): only voxel pairs within R of a perpendicular
+   seam plane of either grid (cube coordinate 0 or P/2 on another axis), border and interior alike: the lines where a pass-a seam plane
+   crosses a pass-b one, which --seamless 2s two diagonal grids leave unprotected (w228: plane means 0.2, steps visible on the lines). */
 static double ns_opt(int argc, char **argv, const char *k, double d) {
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n(k))) return opt_atof(k, argv[i + 1]);
     return d;
 }
 int cmd_ink_seam(int argc, char **argv) {
     if (argc < 3 || argv[2][0] == '-') {
-        fprintf(stderr, "usage: ufsm ink-seam ZARR --um U [--key ARRAY] [--period 512] [--offset 0] [--n 24] [--min 16] [--block 0] [--seed 1] [--threads 16]\n"); return 2; }
+        fprintf(stderr, "usage: ufsm ink-seam ZARR --um U [--key ARRAY] [--period 512] [--offset 0] [--n 24] [--min 16] [--block 0] [--line R] [--box z,y,x,nz,ny,nx] [--seed 1] [--threads 16]\n"); return 2; }
     const char *in = argv[2]; const double um = ns_opt(argc, argv, "--um", 0);
     const int P = (int)ns_opt(argc, argv, "--period", 512), off = (int)ns_opt(argc, argv, "--offset", 0), N = (int)ns_opt(argc, argv, "--n", 24),
               mn = (int)ns_opt(argc, argv, "--min", 16), nt = (int)ns_opt(argc, argv, "--threads", 16),
-              blk = (int)ns_opt(argc, argv, "--block", 0);   /* --block K: interior = only the planes at the border's phase mod K (16: the volcomp
+              blk = (int)ns_opt(argc, argv, "--block", 0), lr = (int)ns_opt(argc, argv, "--line", 0);   /* --block K: interior = only the planes at the border's phase mod K (16: the volcomp
                                                                     codec block faces of the CT and of a lossy output, ~7 on Paris 4 ink, not ~3) */
     unsigned seed = (unsigned)ns_opt(argc, argv, "--seed", 1);
+    long long bxo[3] = {0}, bxn[3] = {0}; int hb = 0;
+    for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n("--box"))) {
+        if (sscanf(argv[i + 1], "%lld,%lld,%lld,%lld,%lld,%lld", &bxo[0], &bxo[1], &bxo[2], &bxn[0], &bxn[1], &bxn[2]) != 6) { fprintf(stderr, "ink-seam: --box z,y,x,nz,ny,nx\n"); return 2; }
+        hb = 1; }
     if (um <= 0 || P < 8 || P % 2) { fprintf(stderr, "ink-seam: --um > 0 and an even --period >= 8\n"); return 2; }
     char lv[256]; z3w_level_name(um, lv, sizeof lv);
     for (int i = 3; i + 1 < argc; i++) if (!strcmp(argv[i], opt_n("--key"))) snprintf(lv, sizeof lv, "%s", argv[i + 1]);   /* any uint8 array, e.g. a CT level "0" */
@@ -45,7 +51,8 @@ int cmd_ink_seam(int argc, char **argv) {
         tries++;
         int64_t o[3], b[3];
         for (int d = 0; d < 3; d++) { int64_t k = rand() % nb[d], c = 0; for (b[d] = off; ; b[d] += P) if (b[d] - P / 2 >= 0 && b[d] + P / 2 <= m->shape[d] && c++ == k) break; o[d] = b[d] - P / 2; }
-        int ok = 1;   /* every shard the cube touches present (not air) */
+        int ok = 1;   /* every shard the cube touches present (not air); --box: the cube inside it (a predict's own box, not its margins) */
+        for (int d = 0; d < 3 && hb; d++) if (o[d] < bxo[d] || o[d] + P > bxo[d] + bxn[d]) ok = 0;
         for (int64_t za = o[0] / m->shard[0]; za <= (o[0] + P - 1) / m->shard[0] && ok; za++)
             for (int64_t ya = o[1] / m->shard[1]; ya <= (o[1] + P - 1) / m->shard[1] && ok; ya++)
                 for (int64_t xa = o[2] / m->shard[2]; xa <= (o[2] + P - 1) / m->shard[2] && ok; xa++)
@@ -61,6 +68,7 @@ int cmd_ink_seam(int argc, char **argv) {
             for (int k = 1; k < P; k++) {
                 double sa = 0, sd = 0; size_t c = 0;
                 for (int u = 0; u < P; u++) for (int w = 0; w < P; w++) {
+                    if (lr > 0 && !(u < lr || u >= P - lr || abs(u - P / 2) < lr || w < lr || w >= P - lr || abs(w - P / 2) < lr)) continue;
                     size_t i1;
                     if (d == 0) i1 = k * st[0] + (size_t)u * st[1] + w; else if (d == 1) i1 = (size_t)u * st[0] + k * st[1] + w; else i1 = (size_t)u * st[0] + (size_t)w * st[1] + k;
                     const int a = v[i1 - st[d]], bb = v[i1];
@@ -76,7 +84,7 @@ int cmd_ink_seam(int argc, char **argv) {
     }
     free(v);
     if (!got) { fprintf(stderr, "ink-seam: no non-air corner found\n"); return 1; }
-    printf("ink-seam %s: %d corners, period %d offset %d (|dv| over pairs with max >= %d)\n", in, got, P, off, mn);
+    printf("ink-seam %s: %d corners, period %d offset %d (|dv| over pairs with max >= %d%s)\n", in, got, P, off, mn, lr > 0 ? ", seam-crossing lines only (--line)" : "");
     double J = 0;
     for (int d = 0; d < 3; d++) {
         const double B = bn[d] ? bs[d] / bn[d] : 0, I = in_[d] ? is[d] / in_[d] : 0;

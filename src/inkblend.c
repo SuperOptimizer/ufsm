@@ -250,7 +250,7 @@ int ink_blend_run(const char *out, double um, const double st[3], int n, const c
     int B = S;
     for (int i = 0; i < n; i++) { const z3_meta *m = z3_meta_of(zz[i]); for (int d = 0; d < 3; d++) if (m->shard[d] < B) B = (int)m->shard[d]; }
     /* --seamless 2's region (ink_blend_set_region) works on blocks, also B = S (one block per output shard) */
-    ink_blend_region *R = g_ib_reg; g_ib_reg = nullptr; if (R && n > 2) R = nullptr;
+    ink_blend_region *R = g_ib_reg; g_ib_reg = nullptr; if (R && n > 8) R = nullptr;
     { int ok = B >= 16 && (B < S || R) && S % B == 0 && !(getenv("UFSM_IB_BLOCK") && !atoi(getenv("UFSM_IB_BLOCK")));
       for (int i = 0; i < n && ok; i++) { const z3_meta *m = z3_meta_of(zz[i]); for (int d = 0; d < 3; d++) if (m->shard[d] % B || org[i][d] % B) ok = 0; }
       if (!ok) B = 0; }
