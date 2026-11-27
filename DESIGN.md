@@ -6,6 +6,59 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## ink-proto: prototype x teacher 3-D ink labels (arXiv 2606.29085 stage 2) with our own features lose to the teacher on HOLD (2026-11-27, branch inkproto-20261127, inkproto)
+
+**Idea.** The paper builds conservative 3-D labels as sigmoid(teacher) x minmax_chunk(cos(feature, ink prototype)) > 0.5, with air
+(CT < 50) masked. Its features come from an upstream DINO ViT, which we do not use. **Features:** the only per-voxel 3-D features of
+our own at ~2.4 um are our ink nets' trunk features. J1 died with no snapshot, the DINO2A ssl arm lost (−0.069), and dinovol is
+upstream. So this test uses R11P-12000's level-0 trunk output, the head's input (32 channels, `unet_head_feat_z`).
+
+**Code (opt-in; the off path is unchanged).**
+- `predict --proto-seed OUT.proto [--proto-thr 0.95]` sums the trunk features, raw and L2-normalised, over each window's interior
+  voxels whose own probability is >= thr.
+- `predict --proto P.proto [--proto-mean unit|raw]` replaces the output channel by 255 (1 + cos) / 2, CT-masked like any
+  probability.
+- `ufsm ink-proto label OUT --teacher .. --cos .. --ct ..` computes the per-chunk (`--chunk`, default 128) min-max of the cosine times
+  the teacher, masks CT < `--air` (default 50) and writes a score (1 + 254 s, 0 = masked) or a prob254 label (254 where s > `--thr`,
+  0 where not, 255 masked).
+- `ufsm ink-proto merge | show` handles the prototype files.
+- Kernels are in src/nn_proto.cu. tests/test_ink_proto.c checks the label chunk against a hand case and an independent loop, and
+  the kernels against host references.
+- predict refuses --tta, --channels, --heads, latent nets, --gpus, --feather and --seamless for the seed.
+
+**Seeds (no new clicks).** The 12 TRAIN 512^3 blocks per scroll with the most train ink and no val / hold voxels
+(/vesuvius/ufsm/inkproto/mkseed.sh), at teacher p >= 0.95.
+
+| | 1667 | P4 |
+|---|---|---|
+| seed voxels | 322 k | 1.32 M |
+| norm of the mean unit seed vector | 0.989 | 0.993 |
+
+The seed features are nearly collinear. The two scrolls' prototypes have cosine 0.989.
+
+**HOLD** (the tracker's 64 tiles per scroll; rung 2.2 = level 1 of the 1.129 um scans; w576 h32; `ink-audit --hold-only`; local CT
+copy /vesuvius/ufsm/inkperf/ctl/volcomp):
+
+| store | 1667 AUC | 1667 f1_128 | P4 AUC | P4 f1_128 |
+|---|---|---|---|---|
+| teacher R11P-12000 | .874 | .583 | .848 | .700 |
+| cosine alone | .793 | .669 | .823 | .723 |
+| score, chunk 128, air 50 | .831 | .561 | .837 | .681 |
+| score, no air mask | .830 | .562 | .839 | .682 |
+| score, chunk 64 | .843 | .558 | .828 | .681 |
+| score, chunk 256 | .855 | .561 | .846 | .680 |
+
+- **Paired** (FUSE, score − teacher ± region-jackknife SE): **1667 −0.043 ± 0.024** (63 regions), **P4 −0.011 ± 0.026** (64).
+- The binary label (s > 0.5, f1_128) is also below the teacher's, by −0.022 on 1667 and −0.020 on P4.
+- Labelled share: 7.9 % ink on 1667 and 10.4 % on P4. The air mask (CT < 50) drops 63 % / 43 % of the tiles' voxels.
+
+**Why it does not help here.** The prototype lies in the feature space of the teacher itself. The head is linear on those features,
+so the cosine only re-weights the teacher's own evidence. The per-chunk min-max then stretches the noise in chunks with little ink.
+The paper's gain comes from an independent representation (DINO trained on 10 scrolls).
+
+**Decision.** No student A/B. Repeat only with a feature extractor of our own that is independent of the teacher (a successful SSL
+or J1 trunk). The commands stay opt-in for that.
+
 ## Per-scroll / per-recipe ink eval: worst scroll, leak flags, band-tolerant F1; 1447 is the only scroll clean for every model (2026-11-27, branch inkeval-20261127, inkeval)
 
 Pooled dev numbers hid two things: which scroll a model fails on, and whether it trained on that scroll. `ufsm ink-strat` (src/inkstrat.c)
