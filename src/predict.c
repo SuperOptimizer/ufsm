@@ -35,6 +35,8 @@
 #include "sample.h"   /* (--aux-level: sample_aux_nc / sample_aux_byte, the trainer's coarse aux box) */
 #include "winauto.h"
 #include "fblend.h"
+#include "inkproto.h"
+static ink_proto_pred *g_proto_pp;   /* (--proto-seed / --proto: closed at the end; mgpu: main) */
 #include <errno.h>
 #include <openssl/evp.h>
 #include <fcntl.h>
@@ -1837,7 +1839,21 @@ static int predict_one(int argc, char **argv) {
                                      fprintf(stderr, " %s (ch %d%s%s%s)", PH[k].name, PH[k].c0, c1, PH[k].sb0 >= 0 ? " sub-cell" : "", PH[k].s0 >= 0 ? " stem" : ""); } fprintf(stderr, "\n"); }
     if (!ffd && tta > 1 && (split || half || sheet_task || rvfuse)) { fprintf(stderr, "predict: probability --tta: not with --split, half-resolution, sheet or recto/verso-fused outputs\n"); return 2; }
     if (ffd && out_ch && tta > 1) { fprintf(stderr, "predict: --channel N with --fit-* and --tta: not supported (the probability volume would come from the last symmetry pass)\n"); return 2; }
-    if (ffd && (split || (ngpu > 1 && !ffz))) { fprintf(stderr, "predict: --fit-fields runs on one GPU\n"); return 2; }   /* (--fit-zarr: z-layer workers with --gpus) */   /* (--channel N: the probability volume of channel N beside the fields, e.g. --channel ink) */
+    if (ffd && (split || (ngpu > 1 && !ffz))) { fprintf(stderr, "predict: --fit-fields runs on one GPU\n"); return 2; }
+    /* --proto-seed OUT.proto / --proto P.proto (2026-11-27, inkproto; src/inkproto.h): the seed sums of the trunk's level-0 features at the
+       voxels whose own output probability is >= --proto-thr, and / or the output replaced by (1 + cos(features, prototype)) / 2 */
+    const char *proto_seed = opt(argc, argv, "--proto-seed", nullptr), *proto_p = opt(argc, argv, "--proto", nullptr);
+    const double proto_thr = opt_atof("--proto-thr", opt(argc, argv, "--proto-thr", "0.95"));
+    const int proto_mode = !strcmp(opt(argc, argv, "--proto-mean", "unit"), "raw");
+    if (strcmp(opt(argc, argv, "--proto-mean", "unit"), "unit") && !proto_mode) { fprintf(stderr, "predict: --proto-mean unit | raw\n"); return 2; }
+    if (proto_seed || proto_p) {
+        const char *why = half ? "a low-resolution / latent net" : lhm ? "--heads" : mch_n > 1 ? "--channels" : tta > 1 ? "--tta" : ffd || ffz ? "--fit-*" : sheet_task ? "a sheet task"
+                        : rvfuse ? "--channel rv" : nwork > 1 ? "--gpus" : split ? "--split" : lat_store ? "--latents" : fea ? "--feather"
+                        : proto_seed && (opt_atoi("--seam-inproc", opt(argc, argv, "--seam-inproc", "0")) || opt_atoi("--seamless", opt(argc, argv, "--seamless", "0")) > 1) ? "--seamless (the seed would count the two grids' windows twice)" : nullptr;
+        if (why) { fprintf(stderr, "predict: --proto / --proto-seed: not with %s (one voxel net's channel on one GPU)\n", why); return 2; }
+        if (!(proto_thr > 0 && proto_thr < 1)) { fprintf(stderr, "predict: --proto-thr: 0 < thr < 1\n"); return 2; }
+        if (proto_p) snprintf(content, sizeof content, "ink-proto cosine 255 (1 + cos) / 2 (trunk level-0 features vs prototype)");
+    }   /* (--fit-zarr: z-layer workers with --gpus) */   /* (--channel N: the probability volume of channel N beside the fields, e.g. --channel ink) */
     z3 *auxz = nullptr; uint8_t *auxd = nullptr, *auxh = nullptr;   /* --aux ROOT KEY: the fifth input of 5-input checkpoints (train --aux-input) */
     const int aux_lv = opt_atoi("--aux-level", opt(argc, argv, "--aux-level", "-1"));   /* the aux volume's CT level (default: this level); coarser: the
                                                                                          trainer's device box path, sample_aux_byte (the cascade input) */
@@ -3530,6 +3546,12 @@ static int predict_one(int argc, char **argv) {
             if (mch_n > 1 && lg) lg = (const float *)(mch_lg + (size_t)(out_ch - mch_lo) * mch_cs);
             if (ffd && out_ch && lg) lg =(const float *)((const char *)lg + (size_t)out_ch * w3 * (unet_logits_h16(u) ? 2 : 4));   /* every head computed: channel out_ch of the [c][window] logits for the probability volume (e.g. --channel ink beside --fit-zarr) */
             if (sheet_task) lg += (size_t)out_ch * w3;   /* channel c of the [c][W^3] logits (B = 1); otherwise the only one */
+            if ((proto_seed || proto_p) && lg) {   /* (inkproto) the seed sums from the ink logits, then the cosine over them */
+                static ink_proto_pred *PP;   /* mgpu: main (one GPU: refused with --gpus above) */
+                if (!PP && !(PP = ink_proto_pred_open(cfg.widths[0], proto_seed, proto_thr, proto_p, proto_mode))) return 1;
+                if (ink_proto_pred_window(PP, u, (void *)lg, unet_logits_h16(u), Wz, W, hz, halo)) return 1;
+                g_proto_pp = PP;
+            }
             if (!ffd && tta > 1) {   /* --tta on the probability: the mean of the K passes' probabilities, as logit(mean) in the last pass's buffer */
                 if (!g_ps.tacc && !(g_ps.tacc = nn_malloc_try(w3 * 2))) { fprintf(stderr, "predict: --tta: no device memory for the accumulator (%.2f GB)\n", w3 * 2 / 1e9); return 1; }
                 const int lh0 = unet_logits_h16(u);
@@ -3820,6 +3842,7 @@ static int predict_one(int argc, char **argv) {
     if (mch_n > 1) fprintf(stderr, "predict: --channels: %d more channel stores (%s ...) from the same windows\n", mch_n - 1, mch_out[1]);
     free(MC);
     fprintf(stderr, "wrote %s (%ld tiles in %.0fs end-to-end, the windows %.0fs)\n", out, ntiles, now() - t0, t_win);
+    if (g_proto_pp) { const int r_ = ink_proto_pred_close(g_proto_pp); g_proto_pp = nullptr; if (r_) return 1; }
     if (SF) { const int r_ = sf_feats[0] ? surfp_write_feats(SF, sf_feats, sf_fst) : surfp_write(SF, sf_out); surfp_free(SF); SF = nullptr; if (r_) return 1; }
     /* (the share only with UFSM_SKIP_REPORT: without it the line read "... masked-1.000", taken for "every conv skipped" (latcodec 11-20); a
        masked launch runs the active tiles of its mask, not none) */

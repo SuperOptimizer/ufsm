@@ -54,6 +54,7 @@ int cmd_z3_fetch(int argc, char **argv);    /* src/z3fetch.c */
 int cmd_surf_resample(int argc, char **argv);   /* src/surfresample.c */
 int cmd_ink_blend(int argc, char **argv);   /* src/ingest.c */
 int cmd_ink_seam(int argc, char **argv);   /* src/inkseam.c */
+int cmd_ink_proto(int argc, char **argv);   /* src/inkproto.c */
 int cmd_ingest_kaggle(int argc, char **argv);
 int cmd_ingest_mesh(int argc, char **argv);
 int cmd_ls(int argc, char **argv);
@@ -175,6 +176,7 @@ static int usage(void) {
         "  ufsm z3-recode <group-dir> <out-group> --um U --lut FILE [--hist 1]   a local prob254 pyramid through a LUT (255 kept), value histogram\n"
         "  ufsm z3-fetch ROOT KEY --cache DIR --box z,y,x,dz,dy,dx [--scale F] [--margin 128] [--threads 16]   the box's chunks into a z3 chunk cache (no decode)\n"
         "  ufsm surf-resample SRC-SURFS SRC-MAPS DST-SURFS OUT [--suffix _reader3.tif] [--max-dist 4] [--scale 1]   a map on one surface set resampled onto another (3-D)\n"
+        "  ufsm ink-proto label OUT --teacher ROOT KEY --cos ROOT KEY --ct ROOT KEY --ct-um U --level L   prototype x teacher 3-D ink labels (predict --proto-seed / --proto)\n"
         "  ufsm ink-blend <out> --um U --tile S,S,S --grids z,y,x:... <in1> <in2> ...   overlapping uint8 predicts (predict --grid-origin) blended with sin^2 tile weights\n"
         "  ufsm phase-cmp A.json B.json [--boxes 24] [--P 256]   per source: the share of B's known on-the-fly phase voxels A leaves unknown (e.g. rmax 80 vs 160)\n"
         "  ufsm ink-seam <zarr> --um U [--period 512] [--offset 0] [--n 24]   window-seam jump of a uint8 predict (border vs interior |dv|)\n"
@@ -4989,6 +4991,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "z3-fetch")) return cmd_z3_fetch(argc, argv);
     if (!strcmp(cmd, "surf-resample")) return cmd_surf_resample(argc, argv);
     if (!strcmp(cmd, "ink-blend")) return cmd_ink_blend(argc, argv);
+    if (!strcmp(cmd, "ink-proto")) return cmd_ink_proto(argc, argv);
     if (!strcmp(cmd, "ink-seam")) return cmd_ink_seam(argc, argv);
     if (!strcmp(cmd, "ingest-kaggle")) return cmd_ingest_kaggle(argc, argv);
     if (!strcmp(cmd, "ingest-mesh")) return cmd_ingest_mesh(argc, argv);
