@@ -58,7 +58,6 @@ alone, because the mirror's L2 is already q2.
 
 Files: /vesuvius/ufsm/inkeval/{shellmeas.sh, shellmeas.out, shellab.sh, shellab.out, shab/rows.tsv}.
 
-## 1667 comparison unrolls: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
 ## Upstream villa's ray-slab winding net vs our counts on the wbench boxes: KILLED; count-field --method ray loses 0.55 GT ids (2026-11-27, rayslab)
 
 Question (lead): port villa's ray-slab winding-count net (`neural_tracing/winding_models`)? It is aimed at packed-sheet undercounting.
@@ -129,7 +128,7 @@ arrays, hence the per-box solves.
 - ray is worse on all 54 boxes.
 - `--method ray` stays a tool, not a candidate.
 
-: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
+## 1667 comparison unrolls: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
 
 Question (lead, for the user): what do the new ideas change in a real unroll, scored on GT? Same region and downstream steps for each
 arm, only the named input differs.
