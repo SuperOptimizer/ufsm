@@ -55,7 +55,8 @@ Runs: A, the coarse dev crops (inksdk/dev/crops, 7.9-9.4 um, 7 scans, 91 tiles);
 - **Draws and record:** its own seed-derived stream (scan_aug_plan_fourier), so with it on every other op's plan is byte-identical
   (paired arms). Its decisions live in their own scan_four record, not in scan_plan. With the op configured, that is a separate
   batch array (batch.four), handed to the device by nn_aug_set_fourier. scan_plan and scan_ct_rec keep master's layout (sizeof 1051488
-  / 1051536). With p 0 nothing is drawn or allocated, so batch and record hashes match master.
+  / 1051536). With p 0 nothing is drawn or allocated. bench_sampler's batch hash (12 batches, preset all, det, P 128, aug records included), merge
+  base vs branch: --gpu-aug 835ca01062dbbc69 = 835ca01062dbbc69, CPU aug de8a2eeceb2c537a = de8a2eeceb2c537a.
 - **Device:** a partial DFT by plane chunks. x is a GEMM of the window rows against a [P x 2 (K+1)] twiddle matrix, then y, then z
   accumulated in double. Then the gain, the inverse z and y, and x as a GEMM added into F. Split windows sum the band across ranks
   (zc_sum). Extra device memory is reserved only when the op is on (nn_aug_fourier_reserve, ≤ ~20 MB at K 48).
