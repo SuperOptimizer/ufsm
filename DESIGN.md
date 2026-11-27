@@ -6,6 +6,127 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Upstream villa's ray-slab winding net vs our counts on the wbench boxes: KILLED; count-field --method ray loses 0.55 GT ids (2026-11-27, rayslab)
+
+Question (lead): port villa's ray-slab winding-count net (`neural_tracing/winding_models`)? It is aimed at packed-sheet undercounting.
+The design is in /vesuvius/ufsm/rayslab/design.md:
+- the input is one 128² x 384 slab at ~9.6 um, along the sheet normal;
+- the encoder halves only the transverse axes, and 6 axial blocks attend along the ray (L 384) and across the plane;
+- the phase is cumsum(softplus), so it cannot decrease along the ray;
+- the loss is shift-invariant;
+- training uses 0139, 1667 and Paris 4.
+
+The published metrics (`scrollprize/winding_model_9um`) are in-sample only (validation_mode train_batch): a count error of 0.22-0.34
+windings per 3.7 mm column. A port is ~3 weeks, so S0 was a one-day kill test first.
+
+**S0, a measurement only.** The published checkpoint ran in inference only, in a PyTorch env outside ufsm, on the CPU (6 threads), with
+bf16 autocast as in villa's own inference. Nothing upstream entered ufsm.
+- **Harness:** /vesuvius/ufsm/rayslab/s0 (prep.sh, rs0.py, summ.py; rows in res/).
+- **Segments** are fit-compare's turn-count segments: 0.5 mm radial segments in z planes, the reference being the label oracle's phase
+  unwrapped along the segment. They are reimplemented in rs0.py and checked against fit-compare on 500P2-1 / try9 at stride 4:
+
+| | segments | phase off | phase off, packed | density off |
+|---|---|---|---|---|
+| rs0.py | 462 | 0.242 | 0.667 | 0.314 |
+| fit-compare | 461 | 0.243 | 0.690 | 0.312 |
+
+- **Slabs** are drawn on segments, two thirds of them packed (mean label spacing < 100 um). The ray is the radial direction, and the
+  slab frame is villa's own (slab_frame). Every 0.5 mm window along the central column that passes the fit-compare tests is scored.
+- **Villa's count** = phase(end) - phase(start) on the 4 centre columns.
+- **Our counts** use the same windows: try9 (`bl-t9`, cooled 33333) and u1 (`u1-fd615-ho`), each by phase and by density.
+- **Out of sample** = 0500P2 and 0814, which villa never trained on. They are held-out boxes for our nets.
+
+**Results.** Share of windows off by >= 1/2 turn, with 95 % CIs from a bootstrap resampled by slab. The paired difference is villa
+minus the best of our four counts on the same windows.
+
+| group | class | windows (slabs) | villa | try9 phase | try9 density | u1 phase | u1 density | villa - best ours | median error: villa / try9 density / u1 density |
+|---|---|---|---|---|---|---|---|---|---|
+| OOS 0500P2-1 | packed | 73 (67) | 0.77 | 0.67 | **0.48** | 0.52 | 0.52 | **+0.29 [+0.14, +0.42]** | -0.87 / +0.48 / +0.50 |
+| OOS 0500P2-1 | other | 51 (45) | 0.39 | 0.25 | 0.33 | 0.27 | 0.47 | +0.14 [-0.02, +0.31] | -0.35 / +0.35 / +0.38 |
+| OOS 0814 (8 boxes) | other | 135 (104) | 0.57 | - | - | 0.38 | 0.91 | +0.19 [+0.10, +0.28] | +0.77 / - / +1.91 |
+| in-sample P4 PH1-3 | packed | 236 (69) | 0.46 | 0.91 | 0.45 | 0.93 | **0.36** | +0.09 [+0.00, +0.19] | -0.25 / -0.30 / +0.08 |
+| in-sample P4 PH1-3 | other | 147 (52) | 0.44 | 0.70 | 0.39 | 0.68 | 0.63 | +0.05 [-0.11, +0.20] | +0.16 / +0.29 / +0.57 |
+| in-sample P4 HOLD | packed | 23 (13) | 0.26 | 0.78 | 0.39 | 0.70 | 0.48 | -0.13 [-0.39, +0.15] | +0.14 / +0.05 / +0.37 |
+
+**Kill rule** (pre-registered): villa must be >= 10 points better than our counts on out-of-sample packed segments. It is 29 points
+**worse** than try9's density on 0500P2. It undercounts packed sheets there, with a median of -0.87 turn per 0.5 mm, which is exactly
+the failure it was meant to fix. 0814 has only 2 packed windows (the boxes' packed share is 0-5.5 %, and all 0814 boxes are
+label-noise), so the out-of-sample packed evidence is 0500P2 alone. The kill stands anyway: villa is also worse on 0814's unpacked
+windows (+0.19, CI above 0).
+
+On Paris 4, where it trained, villa only matches our density counts:
+- on PH1-3 packed, 0.46 against try9 density 0.45 and u1 density 0.36;
+- it is far better than either net's phase count (0.91-0.93);
+- on HOLD it is 0.26 against 0.39, with the CI spanning 0 (n 23).
+
+So the architecture's gain over a local density head is not visible even in-sample. **The port (S1-S4) is not started.**
+
+**Caveats.**
+- Villa's input is our volcomp CT: q 8 at level 0 for 0814 / 0500P2 (9.362 um, 113 keV scans), and level 2 for Paris 4.
+- The ray is radial, not the sheet normal it trained along (+-3 deg).
+- Its output depends on the slab's orientation. On 4 packed 0500P2 segments, flipping H / W moved the count by 0.04-0.18 turn, and
+  swapping H and W moved it by up to 0.27. Rays at tens of degrees from the normal would add more. Neither effect is a 29-point one.
+
+**Side check: count-field --method ray vs ls**, the per-ray counting the design would have fed. This used the unroll's ref recipe
+(`--R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 --model-only 1 --iters 1200 --dir -1`) on try9's kept wbench fields of
+the 54 clean 1667 boxes. Each box was solved alone, then GT-scored with gtboxes.sh on the CPU. Script:
+/vesuvius/ufsm/rayslab/s0/cfray2.sh; rows in cf2/score.txt. The whole-band r3 fields of the 11-18 1667 run no longer hold their
+arrays, hence the per-box solves.
+- Voxel-weighted ids right: **ls 0.874, ray 0.329**.
+- ray is worse on all 54 boxes.
+- `--method ray` stays a tool, not a candidate.
+
+: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
+
+Question (lead, for the user): what do the new ideas change in a real unroll, scored on GT? Same region and downstream steps for each
+arm, only the named input differs.
+
+**Setup:**
+- Region: PHerc1667 level-2 box z 6656..8320 × the whole section (16 mm of scroll), unrolled by scripts/unroll/unroll.sh at master
+  cf536c92 (NOINK, CLEAN=0). Pipeline: rectosp, MFREF, ref, slabs, join, check, wraps, snap, strip.
+- Scoring: the 16 wbench C boxes fully inside the region (cmp/gtboxes-z6656.tsv), GT ids of the joined model.
+  - Packed: C20, C21, C22.
+  - Label-noise: C1, C20, C67, C69.
+- Bootstrap: paired over boxes (voxel-weighted, 20000 resamples), unrollrun/sh/cmpboot.sh. Runs are in /vesuvius/ufsm/unrollrun/cmp/PHerc1667-{A,B,C}.
+
+**Arms:**
+- A: try9cool cooled-33333 fields (production).
+- B: fz-phbm. `field-blend` of A's fields with w24 snap/6000 fields (level 0, h 8, window 640 halo 64): `--weights 1,0 --plane-w
+  phase=1,1 --conf mean` (condnet's recipe).
+- C: A's fields, ref with `count-field --cf-robust 8 --cf-robust-delta 0.02` (globwind ef7cf27c, GPU solve).
+
+| arm | ids joined, 16 boxes | 12 clean | 3 packed | ids ref-cf | wraps |
+|---|---|---|---|---|---|
+| A try9 | 0.8193 | 0.8937 | 0.6921 | 0.7980 | 45 |
+| B fz-phbm | 0.7860 | 0.8518 | 0.6939 | 0.7630 | 45 |
+| C cf-robust | **0.8293** | **0.9049** | **0.6962** | **0.8133** | 44 |
+
+Paired differences against A (joined ids):
+
+| diff | set | mean | 95 % CI | boxes better |
+|---|---|---|---|---|
+| C − A | all | +0.0100 | [+0.0041, +0.0176] | 14 / 16 |
+| C − A | clean | +0.0112 | [+0.0038, +0.0207] | 11 / 12 |
+| C − A | packed | +0.0040 | [+0.0016, +0.0064] | 3 / 3 |
+| B − A | all | −0.0333 | [−0.0813, +0.0001] | 5 / 16 |
+| B − A | clean | −0.0419 | [−0.1031, +0.0022] | 4 / 12 |
+| B − A | packed | +0.0017 | [−0.0104, +0.0168] | 1 / 3 |
+
+**What the numbers show:**
+- C helps nearly everywhere and hurts nowhere by more than 0.002 (C67 0.728 -> 0.726). The largest gains are C62 +0.052, C70 +0.025
+  and C30 +0.023. The ref-cf itself gains +0.015.
+- B's loss is three open boxes: C28 0.931 -> 0.640, C58 0.903 -> 0.815 and C62 0.904 -> 0.864. The packed ones are flat (C22 +0.017,
+  C21 −0.002).
+- So the wbench per-box fusion gain on packed boxes does not carry into a region unroll at w24 6000. The blended phase seems to break
+  the count in some open stretches; this was not traced.
+
+Caveats: one region of one scroll, 16 boxes that are spatially correlated, so the CI understates the between-region variance.
+
+Decision (lead's rule: adopt if the CI excludes 0):
+- `--cf-robust 8 --cf-robust-delta 0.02` is the unroll ref's default: `CFROBUST` in scripts/unroll/unroll.sh refpool;
+  `CFROBUST=` gives the old L2 ref. Test: tests/test_unroll_cfrobust.sh.
+- fz-phbm is not adopted for unrolls.
+
 ## ATLAS-15k as extra labels: import, inventory, CPU quality audit; 58 % of its area passes a gate (2026-11-27, branch atlas-20261127, atlas)
 
 **Dataset.** huggingface.co/datasets/Qualzz20/ATLAS-15k (rev ac4b982a, CC BY-NC 4.0): 14,678 recto patches on 28 scrolls, 2,306 cm².
@@ -758,6 +879,28 @@ and R1 last. E0 / S2 / E2D2 stay within .006 of each other. The 50 um band lifts
   at 1.1 um.
 
 Files: /vesuvius/ufsm/inkeval/{prep.sh (rows), table.sh, band.sh, leaks.tsv, table*.out, strat*.tsv, rows/}.
+
+**Addendum (11-27 afternoon): lossless vs volcomp q8 CT per scroll.** No new predicts. The rows are pullct's dev A/B (ab2d / ab2e: reader3
+ctx r8 median; E0-avg vox) and inksdk's PICKS3 amendment 1 (1447 / 0841), paired by crop with ink-strat (inkeval/ll.sh, ll-*.out).
+B − A ± SE (crops up / n):
+
+| scroll (read) | reader3 lossless − q8 | E0 lossless − q8 |
+|---|---|---|
+| 1447 (8.64 um L0) | **+.035 ± .009** (25/28) | E2D2-t8: **+.027 ± .008** (24/28) |
+| 0139 (9.36 um L0) | +.013 ± .003 (23/40) | +.001 ± .012 |
+| 0009B h116 (8.64 um L0) | +.010 ± .003 (41/48) | +.021 ± .006 |
+| 0343 (8.64 um L0) | +.002 ± .002 (ceiling .998) | +.030 ± .025 |
+| 0172 (7.91 um, 53 keV, L0) | −.002 ± .004 | +.015 ± .008 |
+| 0841 (2.403 um read at L2) | −.000 ± .003 | E2D2-t8: +.002 ± .004 |
+| HOLD 1667 / P4 (R1 at L2 of 1.129 um) | −.000 ± .009 / +.009 ± .006 (pullct ab3, ink-audit pairs) | |
+
+- **The gain is real on 1.2 m coarse scans read at native L0** (1447, 0139, 0009B).
+- **It is nil where the read is pooled.** The mirror is q 8 / 4 / 2 / 1 by level, so an L2 read is already q2.
+- **q2 is enough.** pullct's dev mean4: q8 → q2 +.0054 ± .0013, then q2 → lossless +.0004 ± .0004.
+- **Cost of the coarse L0 levels** (31 scans, 34.2 Tvox; the q8 mirror's L0 is 260 GB = .0076 B/vox):
+  - q2 ≈ 2.8x q8 ≈ 0.73 TB; lossless ≈ 19-23x ≈ 5-6 TB (pullct rate: material boxes .031 B/vox at q8, .086 at q2, .61-.79 at q0);
+  - built from S3 at the measured ~55 Mvox/s (65 s per 3.6 Gvox): about 1 week single-stream for all L0, or ~6 h per scan;
+  - a surface shell (pullct's context boxes: all 147 dev crops in 33 GB lossless) scales with the inked area, not with the scan.
 
 ## ufsm umbilicus: the umbilicus by sheet-normal voting, a villa vc_gen_umbilicus port (2026-11-27, branch axisfind-20261127, axisfind)
 

@@ -19,7 +19,7 @@
 #           fields/rsp --src <m7 prob> --half-um 400 --half2-um 800 --blend 0.3 (RECTOSPX overrides the flags; RECTOSRC="ROOT KEY UM"
 #           names the source): the sheet spacing blended with the m7 recto hit spacing (RECTO 11-02: whole P4 ids .1764 -> .2054, 1667 slabs
 #           +.006..+.045, 0139 -.01..-.02); the ref, slabs and later stages then read fields/rsp. No m7 for this scan + level: skipped.
-#   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads) REFX: extra count-field flags (e.g. --rho-scale S)
+#   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads) REFX: extra count-field flags (e.g. --rho-scale S); CFROBUST: the L1 ref flags (default --cf-robust 8 --cf-robust-delta 0.02, CFROBUST= = L2)
 #   slabs   -> ref: snapped slab fits, FITLANES lanes per GPU in FITGPUS ("0 1"; auto: by device memory, 1..3); the INKGPU lanes start once the ink is done; then the
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
 #   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail) +
@@ -234,7 +234,7 @@ mstart() {
   elif [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK FEMA FPX FGRID INKCK INKSEAM INKCMD LATINK_CK R3W R3GATE R3PWGATE FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK FEMA FPX FGRID INKCK INKSEAM INKCMD LATINK_CK R3W R3GATE R3PWGATE FILLX FLATX SLABFIT SLABI SLABOV REFX CFROBUST REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -441,7 +441,10 @@ ctcal() {
 # short, 12 B per cell of a cross-section, a multiple of the pool 8, then of 128, until 2026-11-17)
 # MSTRIDE 1 (was 4): the model's local gauge from every chunk. With 4 only every 4th chunk had one (count-field now interpolates the rows
 # between, but the 1667 refs were coherent on 1 / K of z: unroll #8 recheck 11-14); the full pass costs ~4x a 7 s GPU model pass
-refpool() { echo "--R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --model-only 1 --model-stride ${MSTRIDE:-1} ${REFX:-}"; }
+# CFROBUST (default "--cf-robust 8 --cf-robust-delta 0.02"; CFROBUST= = the old L2 integration): the ref integrates the count edges in
+# L1 (8 small-delta Huber IRLS passes per level, globwind ef7cf27c). 1667 region A/B (z 6656..8320, 16 GT boxes, try9 fields, 2026-11-27):
+# joined ids 0.8193 -> 0.8293, paired box bootstrap +0.0100 [+0.0041, +0.0176], 14 / 16 boxes better (DESIGN "1667 comparison unrolls")
+refpool() { echo "--R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --model-only 1 --model-stride ${MSTRIDE:-1} ${CFROBUST---cf-robust 8 --cf-robust-delta 0.02} ${REFX:-}"; }
 # refcz: the ref's chunk rows, fixed (REFCZ, 512; lead 2026-11-17): they had come from the free host memory (--mem-gb lowered to 60 % of
 # what was available) and change the ref (0332: 512 vs 640 rows, delta p99 0.017 turn, max 1.03, so two runs' joined models differed).
 # count-field takes fewer only when --mem-gb cannot hold them, with a DEFAULTED: line; the ref stage logs the rows it used
