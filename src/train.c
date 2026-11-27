@@ -120,6 +120,7 @@ typedef struct {
     void *ev_up[2], *ev_done[2]; /* upload into buffer i finished; the compute that last used buffer i finished */
     void *ev_lab[2];             /* lab_early: buffer i's label planes built (the head slabs wait for it; the forward only for ev_up) */
     size_t hs_lg_bytes; int lsc_tried, tails;
+    nn_aug_keep xk; void *xsl; int xsl_on, xsl_raw; void *xsl_at, *xchk;   /* (xchk: UFSM_LAT_XSLAB=check, the whole channel as uploaded) */   /* g_xslab: the window's kept scanned bytes, the slab's CT planes, on, the batch scratch the input went into */
     int lchunk;                  /* lab_early under --split z: the label warp in chunks through hs_lg (nn_lw_sink), no second plane allocated */
     uint8_t *lsc;                /* lab_early: the second label-warp scratch plane (the first: hs_lg, idle from the gradient pass to the next statistics pass) */
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
@@ -209,7 +210,7 @@ static int g_lat_padup;   /* UFSM_LAT_PAD_UP=1: the head slabs upsample / adjoin
    scratch2's heads, ~28 % of lat_up4_k / lat_adj_xy_k / lat_adj_z_k, ~1.9 % of the P 768 step; fuse-20261114) */
 #define LUPN (g_lat && g_pad_ch >= 0 && LUPC == g_cout && !g_lat_padup ? g_pad_ch : LUPC)
 #define LGFC (g_lat_guide == 64 ? LBASE : LNC)   /* the outputs whose gradient is summed in fp32 (the sub-cell outputs' goes straight into the 16-bit copy: -4 B per output and cell) */   /* the interpolated outputs (the sub-cell head's 128 others are read per voxel) */
-#define LGUIDE(dir) do { if (g_lat_guide == 8) nn_lat_guide4(d->x, D, H, W, z0, nz, d->hs_lg, 24, g_side_ch, 2, dir); else nn_lat_guide(d->x, D, H, W, z0, nz, d->hs_lg, g_cout, g_side_ch, dir); } while (0)   /* the latent-grid network's outputs */
+#define LGUIDE(dir) do { if (g_lat_guide == 8) nn_lat_guide4(xv, D, H, W, z0, nz, d->hs_lg, 24, g_side_ch, 2, dir); else nn_lat_guide(xv, D, H, W, z0, nz, d->hs_lg, g_cout, g_side_ch, dir); } while (0)   /* the latent-grid network's outputs */
 static float g_lat_dp;   /* --lat-direct-p (sample.h lat_direct_p): direct windows' trunk input from their stored latvol cells (lat_hook) */
 static float g_lat_jit;   /* --lat-step-jitter J: each training window quantised with step x 2^(J u), u uniform in [-1, 1] (a latent store's step in window-normalised units varies with the window's sd) */
 static int g_lat_c, g_lat_have; static float g_lat_step, g_lat_bas[29 * 64], g_lat_gain[29];   /* --lat-basis FILE [--lat-c 29 --lat-step 0.25]: the learned cell channels (latfit.h) */
@@ -217,6 +218,9 @@ static int g_lcheck;    /* UFSM_LAT_STREAM=check: the device planes as well, eve
 static int g_lat_fuse;  /* the streamed head's gradient pass fused per loss group (nn_lat_fuse_grad: upsample + guide + BCE gradient + transposed upsample per
                            coarse cell, no fp16 slab for those channels): the normal / density group always, the side pair of the guided head (lat_guide 5);
                            the winding mod 4 channels and the other heads' side channels keep the slab chain. UFSM_LAT_FUSE=0 off */
+static int g_xslab;   /* mgpu: config. UFSM_LAT_XSLAB=1 (--lat streamed head, --gpu-aug, one GPU): the full-resolution CT channel lives in the level-0 gradient
+                         buffer from its upload to the forward's input conversion only; the head slabs write their planes again from the kept scanned bytes
+                         (nn_aug_rewrite, the same bytes): 1 B per voxel (the kept bytes) instead of a 2-byte channel buffer of its own */
 static int g_lat_hs;    /* --lat: the head streamed with the slabs (no whole cell logits, no whole coarse gradient): head_slab_pass runs the network's head on the
                            cell planes a slab reads (unet_head_fwd_z, both passes) and, in the backward's head callback, hands each slab's finished
                            planes of the coarse gradient to unet_head_bwd_z from a rolling buffer. Every head; UFSM_LAT_HEAD_STREAM=0 off */
@@ -992,6 +996,16 @@ static void ct_upload(const batch *b, void *x, void *rad, int B, int P, int asyn
     if (async) nn_h2d_copy_stream(x, bx(b), (size_t)B * g_xs * p3 * xbytes()); else nn_h2d(x, bx(b), (size_t)B * g_xs * p3 * xbytes());
     if (g_gpu_in) { if (async) nn_h2d_copy_stream(rad, b->rad, rad_bytes(B)); else nn_h2d(rad, b->rad, rad_bytes(B)); }
 }
+/* g_xslab: the batch scratch the input goes into (lean 2: the head of [head | tail] in gout[0], else gout[0]); ct_upload through it keeps the
+   window's scanned bytes for the slabs (nn_aug_keep) and stops on a moved buffer (a rebuild) or a host-built input (no source bytes to keep) */
+static void *xsl_scratch(gpu_state *d) { const size_t n = (size_t)g_Pz * d->hs_P * d->hs_P * 2; return unet_lean_nob(d->u) ? unet_batch_scratch(d->u, n, 0) : unet_grad_scratch(d->u, n); }
+static void ct_upload_d(gpu_state *d, const batch *b, void *x, void *rad, int B, int P, int async) {
+    if (d->xsl_on && (xsl_scratch(d) != d->xsl_at || x != d->xsl_at)) { fprintf(stderr, "UFSM_LAT_XSLAB: the level-0 gradient buffer moved (a network rebuild)\n"); exit(1); }
+    d->xsl_raw = !b->ct8;   /* (a host-built input, validation's: no bytes to keep; its slabs read the whole channel, which no backward overwrites) */
+    nn_aug_keep_set(d->xsl_on ? &d->xk : nullptr); ct_upload(b, x, rad, B, P, async); nn_aug_keep_set(nullptr);
+    if (d->xsl_on && b->ct8 && !strcmp(getenv("UFSM_LAT_XSLAB"), "check")) {   /* (tests: the whole channel as uploaded, for the slabs' comparison) */
+        const size_t n = (size_t)g_Pz * P * P * 2; if (!d->xchk) d->xchk = nn_malloc(n); nn_sync(); nn_d2d(d->xchk, x, n); nn_sync(); }
+}
 /* diagnostic UFSM_DUMP_WIN=PREFIX (with UFSM_SYNC_UPLOAD=1 and --gpu-input 0, cubes): the first UFSM_DUMP_N (8) host windows as
    PREFIX-NN.jpg, rows z-mid / y-mid / x-mid, columns CT channel | phase hue over the CT (a host ink plane instead: the ink target, red =
    ink, blue tint = known no ink) | winding mod 4 hue over the CT (unknown: CT only) */
@@ -1118,7 +1132,7 @@ static void upload(gpu_state *d, const batch *b, int B, int P) {
     nn_ptick("loader wait + host");   /* (UFSM_PTICK with UFSM_SYNC_UPLOAD=1: the upload's phases) */
     if (g_lstream) { if (b->ct8) nn_h2d(d->rad, b->rad, rad_bytes(B)); lab_stream(d, b, d->cur, d->rad, B, P, 0); }   /* (before the input: its buffer is the scratch) */
     nn_ptick("label upload + warp + d2h");
-    ct_upload(b, d->x, d->rad, B, P, 0); if (g_lat_dp > 0) lat_take(d, b, d->cur, B, 0); ssl2_upload(d, b, d->cur, P, 0);
+    ct_upload_d(d, b, d->x, d->rad, B, P, 0); if (g_lat_dp > 0) lat_take(d, b, d->cur, B, 0); ssl2_upload(d, b, d->cur, P, 0);
     nn_ptick("CT upload + gpu-aug");
     if (g_tm_unused) {}
     else if (g_pack) { lab_upload(0, b, d->m, lw_pm(b) ? d->pm : nullptr, b->tm, b->pm, d->rad, B, P, 0); if (!g_pkf) nn_unpack_tm(d->t, d->m, B, p3, 0); }   /* (--pack-targets excludes --heads; the
@@ -1152,7 +1166,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
     size_t p3 = (size_t)g_Pz * P * P;
     if (d->upsplit) {   /* the head now, after the backward's last read of X2 and the records; the tail with upload_tail */
         nn_stream_wait(1, unet_l0_3buf_head_free(d->u));
-        ct_upload(b, d->xb[i], d->radb[i], B, P, 1); if (g_lat_dp > 0) lat_take(d, b, i, B, 1); ssl2_upload(d, b, i, P, 1);
+        ct_upload_d(d, b, d->xb[i], d->radb[i], B, P, 1); if (g_lat_dp > 0) lat_take(d, b, i, B, 1); ssl2_upload(d, b, i, P, 1);
         d->tail_due = b;
         return;
     }
@@ -1186,7 +1200,7 @@ static void upload_async(gpu_state *d, const batch *b, int i, int B, int P) {
             if (d->side <= 0) fprintf(stderr, "label warp: %s (UFSM_LAB_EARLY=0 off)\n", d->lchunk ? "after the input, under the forward (--split z: in chunks through hs_lg)" : "at the step boundary");
         }
         if (g_lstream) { if (b->ct8) nn_h2d_copy_stream(d->radb[i], b->rad, rad_bytes(B)); if (!lab_early(d)) lab_stream(d, b, i, d->radb[i], B, P, 1); }
-        ct_upload(b, d->xb[i], d->radb[i], B, P, 1); if (g_lat_dp > 0) lat_take(d, b, i, B, 1); ssl2_upload(d, b, i, P, 1);
+        ct_upload_d(d, b, d->xb[i], d->radb[i], B, P, 1); if (g_lat_dp > 0) lat_take(d, b, i, B, 1); ssl2_upload(d, b, i, P, 1);
         if (g_tm_unused) {}
         else if (g_pack) { lab_upload(0, b, d->mb[i], lw_pm(b) ? d->pmb[i] : nullptr, b->tm, b->pm, d->radb[i], B, P, 1); if (!g_pkf) nn_unpack_tm(d->tb[i], d->mb[i], B, p3, 1); }   /* (copy stream) */
         else {
@@ -1232,7 +1246,7 @@ static void upload_tail(gpu_state *d, int B, int P) {
     if (d->hsplit) {   /* the input (inside gout[0]: the stem's weight gradient read it until the step's end); --gpu-aug batches: then their
                           label planes, warped on the device with the radial records just uploaded (upload_async left them) */
         if (g_lstream && b->ct8) { nn_h2d_copy_stream(d->radb[i], b->rad, rad_bytes(B)); if (!lab_early(d)) lab_stream(d, b, i, d->radb[i], B, P, 1); }
-        ct_upload(b, d->xb[i], d->radb[i], B, P, 1); if (g_lat_dp > 0) lat_take(d, b, i, B, 1); ssl2_upload(d, b, i, P, 1);
+        ct_upload_d(d, b, d->xb[i], d->radb[i], B, P, 1); if (g_lat_dp > 0) lat_take(d, b, i, B, 1); ssl2_upload(d, b, i, P, 1);
         if (b->ct8 && (!g_lstream || g_lcheck)) {
             if (g_side && !g_single) lab_upload(1, b, d->sideb[i], nullptr, b->side, nullptr, d->radb[i], B, P, 1);
             if (pm_used() && !lw_pm(b)) nn_h2d_copy_stream(d->pmb[i], b->pm, (size_t)B * p3);
@@ -1265,6 +1279,7 @@ static void diagnose_nan(gpu_state *d, int B, int P, int step, const char *out) 
     int cb = d->cur ^ 1;
     size_t xbytes_ = nx * xbytes();
     void *hx = malloc(xbytes_); nn_d2h(hx, d->xb[cb], xbytes_);
+    if (d->xsl_on) { memset(hx, 0, xbytes_); fprintf(stderr, "nan diagnosis: the input is not kept (UFSM_LAT_XSLAB: its buffer is the level-0 gradient's): shown as 0\n"); }
     uint8_t *ht = malloc((size_t)B * g_tc * p3), *hm = malloc((size_t)B * p3), *hw = malloc((size_t)B * g_tc);
     if (g_tm_unused) { memset(ht, 0, (size_t)B * g_tc * p3); memset(hm, 0, (size_t)B * p3); }   /* (unwrap2: no target / mask on the device) */
     else { nn_d2h(ht, d->tb[cb], (size_t)B * g_tc * p3); nn_d2h(hm, d->mb[cb], (size_t)B * p3); } nn_d2h(hw, d->wb[cb], (size_t)B * g_tc);
@@ -1631,6 +1646,17 @@ static void head_slab_pass(gpu_state *d, int pass) {
            The shared op state (SR counter) passes with the turn, so the SR draws differ from UFSM_SPLIT_YIELD=0 but stay deterministic. */
         { static int yon = -1; if (yon < 0) yon = !getenv("UFSM_SPLIT_YIELD") || ufsm_env_on("UFSM_SPLIT_YIELD"); if (z0 && yon && split_side() >= 0) split_yield(); }
         const size_t ns = (size_t)nz * hw, vb = (size_t)z0 * hw;
+        const void *xv = d->x;   /* the CT channel as this slab's kernels read it (indexed by window voxel) */
+        if (d->xsl_on && d->xsl_raw && d->hs_train) { fprintf(stderr, "UFSM_LAT_XSLAB: a training window without its source bytes (a host-built input): run without UFSM_LAT_XSLAB\n"); exit(1); }
+        if (d->xsl_on && !d->xsl_raw) { const int za = z0 > 0 ? z0 - 1 : 0, zb = z1 < D ? z1 + 1 : D;   /* (g_xslab: its planes and the stencils' one-plane halo, written again) */
+                         nn_aug_rewrite(&d->xk, d->rad, za, zb - za, d->xsl); xv = (const char *)d->xsl - (size_t)za * hw * 2;
+                         if (d->xchk) {   /* UFSM_LAT_XSLAB=check: the rewritten planes against the uploaded channel, byte for byte */
+                             static thread_local long tot, bad;   /* mgpu: debug (per thread) */
+                             const size_t nb = (size_t)(zb - za) * hw * 2; uint8_t *ha = malloc(nb), *hb = malloc(nb); nn_sync();
+                             nn_d2h(ha, d->xsl, nb); nn_d2h(hb, (const char *)d->xchk + (size_t)za * hw * 2, nb);
+                             for (size_t j = 0; j < nb; j++) bad += ha[j] != hb[j];
+                             tot += (long)nb; free(ha); free(hb);
+                             if (z1 == D) fprintf(stderr, "lat xslab check: pass %d, %ld of %ld slab bytes differ so far\n", pass, bad, tot); } }
 #define LGC(c) ((char *)d->hs_lg + (size_t)(c) * ns * 2)
         const uint8_t *sdb = d->sdb, *w4 = d->w4, *wc = d->wc, *apl[AUX_N]; for (int j = 0; j < AUX_N; j++) apl[j] = d->aux[j];
         uint8_t *tcp[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};   /* this slab's block of the cache: sidet, sidem, rvt, rvm, nt, nm */
@@ -1725,7 +1751,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                     char fn_[1100]; snprintf(fn_, sizeof fn_, "%s%s", getenv("UFSM_LGC_DUMP"), d->side == 0 ? ".s0" : d->side == 1 ? ".s1" : ""); FILE *f = fopen(fn_, z0 ? "ab" : "wb");
                     if (f) { const int32_t q2[2] = {qa, qb}; fwrite(q2, 4, 2, f); fwrite(hb, 1, nb, f); fclose(f); } free(hb); if (z1 == D) dn_[d->side + 1]++; }
             }
-            if (fsu) fsd = !nn_fstem_up_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), d->fs_drop ? 0 : g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns, d->lgc, qa, qb - qa, g_side_ch, LBASE);
+            if (fsu) fsd = !nn_fstem_up_fwd(xv, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), d->fs_drop ? 0 : g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns, d->lgc, qa, qb - qa, g_side_ch, LBASE);
             if (fsd) {}
             else if (fuse) for (int r = 0; r < 2; r++) { if (fr[r][1] > fr[r][0]) nn_lat_up_slab_c((const char *)d->lgc + (size_t)fr[r][0] * (qb - qa) * (H / 4) * (W / 4) * 2, 1, fr[r][1] - fr[r][0], D / 4, H / 4, W / 4, z0, nz, LGC(fr[r][0]), qa, qb - qa); }
             else nn_lat_up_slab_c(d->lgc, 1, LUPN, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, qa, qb - qa);
@@ -1749,7 +1775,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_lat_nsub > 2) { if (g_lat_hs) lat_sub_extra(0, d->lgc, 1, D / 4, H / 4, W / 4, z0, nz, d->hs_lg, ns, nullptr, qa, qb - qa);
                               else lat_sub_extra(0, d->lg, unet_logits_h16(d->u), D / 4, H / 4, W / 4, z0, nz, d->hs_lg, ns, nullptr, 0, 0); }
         if (g_lat_hs) { FT("  u guide / shuffle"); PT("upsample"); }
-        if (!fsd && g_fstem && !d->fs_drop && nn_fstem_fwd(d->x, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
+        if (!fsd && g_fstem && !d->fs_drop && nn_fstem_fwd(xv, D, H, W, z0, nz, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, d->hs_lg, ns)) { fprintf(stderr, "--fstem: slab shape\n"); abort(); }
         if (g_fstem) FT("  u fine stem fwd");
         if (!pass && !d->hs_train && getenv("UFSM_PARITY_DUMP")) parity_dump_slab(d, z0, nz, D, H, W);   /* (diagnostic: the parity audit's validation logits) */
         const shape5 one = {1, 1, nz, H, W}, two = {1, 2, nz, H, W}, seven = {1, 7, nz, H, W};
@@ -1818,7 +1844,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (g_fibh) { FIBH_TARGETS(); FIBH_LOSS(0); }   /* --fib-head: the H / V masks (sums 74, 79), the direction (84) */
             float pw0 = 1.f, rw0 = 0.f; int u70 = -1; if (fuse) nn_loss_cfg_get(&pw0, &rw0, &u70);
             if (g_single) ;   /* (the ink head's statistics above only) */
-            else if (fside) { nn_lat_fuse_stats(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_side_ch, 2, 1, g_cout, d->x, st, sm, d->sidew, pw0, -1, d->hs_ds + 10, light); nn_ent_acc(st, sm, 2, ns, d->hs_ent + HE_SIDE); }
+            else if (fside) { nn_lat_fuse_stats(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_side_ch, 2, 1, g_cout, xv, st, sm, d->sidew, pw0, -1, d->hs_ds + 10, light); nn_ent_acc(st, sm, 2, ns, d->hs_ent + HE_SIDE); }
             else {
                 nn_loss_stats_acc_e(LGC(g_side_ch), st, sm, d->sidew, two, d->hs_ds + 10, d->hs_ent + HE_SIDE);
                 if (g_side == 2 && g_rv != 1) nn_pair_angerr(LGC(g_side_ch), LGC(g_side_ch + 1), st, sm, ns, d->hs_ent + HE_ANG);   /* the phase pair's angle error (log) */
@@ -1902,7 +1928,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (z0 == 0) nn_zero(d->latg, (size_t)LGFC * qc * pl * 4);
             if (g_fstem && !d->fs_drop) {   /* (before the adjoints reuse the planes; g_lsplit: the owned planes only, the weights' sums add across the GPUs) */
                 int a = 0, b = D; hs_keep(d, 0, &a, &b); a = a > z0 ? a : z0; b = b < z1 ? b : z1;
-                if (b > a) nn_fstem_bwd(d->x, D, H, W, a, b - a, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, (const char *)d->hs_lg + (size_t)(a - z0) * hw * 2, ns, unet_grad_ptr(d->u) + unet_fstem_off(d->u));
+                if (b > a) nn_fstem_bwd(xv, D, H, W, a, b - a, unet_live_params(d->u) + unet_fstem_off(d->u), g_fstem, g_fs_n, g_fs_ch, (const char *)d->hs_lg + (size_t)(a - z0) * hw * 2, ns, unet_grad_ptr(d->u) + unet_fstem_off(d->u));
             }
             if (g_fstem) FT("  a fine stem bwd");
             if (g_lat_guide == 64) { nn_lat_shuffle_adj_c((char *)d->hs_lg + (size_t)g_side_ch * ns * 2, D / 4, H / 4, W / 4, LBASE, 2, z0, nz, d->latgl, q0, qc);
@@ -1912,7 +1938,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
             if (fuse) {   /* the fused groups straight from the cell logits (before the slab adjoint takes the normal targets as its scratch) */
                 float pw, rw; int u7; nn_loss_cfg_get(&pw, &rw, &u7);
                 const float ls = lside, ln[7] = {lnorm, lnorm, lnorm, lnorm, lnorm, lnorm, ldens};
-                if (fside) nn_lat_fuse_grad(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_side_ch, 2, 1, g_cout, d->x, st, sm, d->sidew, d->sscratch, pw, rw, -1, &ls, d->fpart, d->latg, q0, qc, light ? d->hs_ds + 10 : nullptr);
+                if (fside) nn_lat_fuse_grad(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_side_ch, 2, 1, g_cout, xv, st, sm, d->sidew, d->sscratch, pw, rw, -1, &ls, d->fpart, d->latg, q0, qc, light ? d->hs_ds + 10 : nullptr);
                 FT("  f fused side");
                 nn_lat_fuse_grad(d->lgc, 1, qa, qb - qa, D / 4, H / 4, W / 4, z0, nz, g_norm_ch, 7, 0, -1, nullptr, d->nt, d->nm, d->nw, d->nscratch, pw, rw, u7, ln, d->fpart, d->latg, q0, qc, light ? d->hs_ds + 20 : nullptr);
                 FT("  f fused normal");
@@ -2498,6 +2524,7 @@ static void run_batch(gpu_state *d, int B, int P, float dice_w, int train) {
         if (d->ssl_win) ssl_teacher(d, ls, P);   /* --ssl, an unlabelled window: the teacher's targets, the student's masked input */
         int ld = 0; if (g_lat_dp > 0 && train) for (int s = 0; s < B && s < 8; s++) ld |= d->latd[d->cur][s].on;   /* --lat-direct-p: the direct windows' rows from their cells */
         if (ld) unet_set_input_hook(d->u, lat_hook, d);
+        if (d->xsl_on) { unet_build(d->u, ls, 1); if (xsl_scratch(d) != d->xsl_at || d->x != d->xsl_at) { fprintf(stderr, "UFSM_LAT_XSLAB: the level-0 gradient buffer moved under the input (a network rebuild)\n"); exit(1); } }
         lg = unet_forward_x(d->u, d->x, ls, train, g_xfmt != 0);
         if (ld) unet_set_input_hook(d->u, nullptr, nullptr);
         nn_ptick("trunk forward");
@@ -4725,6 +4752,11 @@ int cmd_train(int argc, char **argv) {
         }
         g_lat_hs = g_lat && g_head_slab && g_hs_z % 4 == 0 && g_hs_z >= 8 && g_hs_z < g_Pz && !ufsm_env_on("UFSM_LAT_CHECK") && (!getenv("UFSM_LAT_HEAD_STREAM") || ufsm_env_on("UFSM_LAT_HEAD_STREAM"));
         if (g_lsplit && !g_lat_hs) { fprintf(stderr, "--lat 4 --split z: the streamed latent head (UFSM_LAT_HEAD_STREAM on, no UFSM_LAT_CHECK)\n"); return 2; }
+        if (ufsm_env_on("UFSM_LAT_XSLAB")) {
+            g_xslab = g_lat_hs && g_gpu_aug_want && B == 1 && !split && !g_lsplit && !g_ssl && !(g_lat_dp > 0) && g_lat_guide != 5 && !g_lat_dec && !g_restore && !getenv("UFSM_ERF") && !getenv("UFSM_DUMP_DEV");
+            fprintf(stderr, "%slatent grid: UFSM_LAT_XSLAB: %s\n", g_xslab ? "" : "DEFAULTED: ", g_xslab ? "the CT channel in the level-0 gradient buffer until the input conversion, written again per head slab from the kept bytes"
+                    : "off (needs the streamed head, --gpu-aug, B 1, one GPU, no --ssl / --lat-direct-p / --lat-guide 5 / --lat-dec / UFSM_ERF / UFSM_DUMP_DEV)");
+        }
         g_lat_fuse = g_lat_hs && g_unwrap2 && g_side_ch == 0 && g_norm_ch == 2 && g_w4_ch == 9 && !(g_pg_lambda > 0) && !(g_ptrunc_tau > 0) && !g_fibn && nn_get_loss_grad_h16() && nn_get_f16()   /* (--fib-normal-lambda: the unfused chain; --ink-head fused too since fuse-20261114: the ink channel is outside the group) */
                     
                      && (!getenv("UFSM_LAT_FUSE") || ufsm_env_on("UFSM_LAT_FUSE"));
@@ -4916,7 +4948,9 @@ int cmd_train(int argc, char **argv) {
                    plane (+ the papyrus mask when pm_used), unwrap2's winding + component planes, the aux planes. Before: 4 + 4 + 2 per aux at any
                    lean, i.e. 2x the lean modes' planes and 2 B per voxel too many for the phase (P 704 single ink, lean: the ink plane 0.35 GB, not 0.70) */
                 need = grec + tb + tb / 14 + trainer + (nn_get_loss_tol() ? (size_t)B * p3 : 0) + (g_aff ? (size_t)2 * B * p3 : 0) + (g_fibdir > 0 ? (size_t)8 * B * p3 : 0) + (g_unwrap ? (g_head_slab ? (size_t)(g_single ? 0 : nbuf * (1 + pm_used())) * B * p3 + (size_t)g_hs_z * P * P * (g_single ? 2 * g_scout : 2 * g_cout + 11) + 4096 : (size_t)15 * B * p3) + (g_unwrap2 && !g_single ? (size_t)2 * nbuf * B * p3 : 0) + ((size_t)nbuf * g_naux * B * p3 + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv)) + 12 * g_fibh) * g_hs_z * P * P) : 0) + (g_cond ? (size_t)7 * B * p3 : 0) + (g_pap_head ? (size_t)4 * B * p3 : 0) + (g_restore ? (size_t)B * p3 * (cand[c].lean ? 5 : 1) + restore_scratch_bytes(g_Pz, P, P, fminf(g_rr.sc_step[0], 4.f)) + 256 : 0) + ws_residual + (split ? (size_t)4 * B * 32 * P * P * 2 : 0) + (g_gpu_aug_want && (gin || g_lat) ? (g_lsplit ? nn_aug_device_bytes_z(P, g_gpu_aug_want >= 2 && !g_w4dev_want ? 2 * P : P, g_Pz, 16) : nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0)) : 0);   /* split: two slots of halo send / receive planes */   /* kernel workspaces: measured device growth / tracked ~1.07 + 0.3 GB, + 0.2 GB margin for other processes */
-                if (g_lat) need += (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
+                const size_t g0lat = g_lat && cand[c].gmx ? nn_mx_bytes((shape5){B, cfg.widths[0], g_Pz / 4, P / 4, P / 4}, unet_grad_mx4() ? 4 : 8) : 0;
+                const size_t xinl = g_xslab && cand[c].lean >= 2 && xinb <= g0lat ? p3 + (size_t)(g_hs_z + 2) * P * P * 2 : xinb;   /* (g_xslab: the kept bytes + the slab's planes) */
+                if (g_lat) need += (xin_sep ? 0 : xinl) + (g_tm_unused ? 0 : batb) + (g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : ((size_t)LNC * 2 + (size_t)LGFC * 4) * (p3 / 64));   /* --lat: the full-resolution batch beside the cell-grid network, the coarse logit gradient (fp32 + 16-bit) */
                 if (g_ssl) need += (size_t)g_ssl * g_ssl_S * 5 + (size_t)g_ssl_npts * (g_ssl * 8 + 8) + 4096 + (size_t)g_sslh.nslot * (g_Pz / 4) * (P / 4) * (P / 4)
                                    + (g_ssl_views == 2 ? 2 * ((size_t)g_Pz * P * P * 2 + g_ssl_S * 12 + 65536) : 0);   /* (+ --ssl-heads: a byte per head channel and cell) */
                   /* --ssl: int8 targets + the side head's fp32 gradient, the hinge's
@@ -4938,12 +4972,12 @@ int cmd_train(int argc, char **argv) {
                     const size_t v = (size_t)B * p3, aug = g_gpu_aug_want && (gin || g_lat) ? (g_lsplit ? nn_aug_device_bytes_z(P, g_gpu_aug_want >= 2 && !g_w4dev_want ? 2 * P : P, g_Pz, 16) : nn_aug_device_bytes(P) + (g_gpu_aug_want == 2 ? nn_label_warp_device_bytes(P) : 0)) : 0;
                     const size_t uwp = g_unwrap ? (size_t)(g_single ? 0 : nbuf * (1 + pm_used())) * v + (g_unwrap2 && !g_single ? (size_t)2 * nbuf * v : 0) + (size_t)nbuf * g_naux * v : 0;
                     const size_t uws = g_unwrap && g_head_slab ? (size_t)g_hs_z * P * P * (g_single ? 2 * g_scout : 2 * g_cout + 11) + (size_t)(3 * (g_rv != 0) + 2 * (g_ink2 || (g_fibn && !g_rv)) + 12 * g_fibh) * g_hs_z * P * P : 0;   /* (fibh: fht 2, fhm 2, fdt 7, fdm 1) */
-                    const size_t latb = g_lat ? (xin_sep ? 0 : xinb) + (g_tm_unused ? 0 : batb) : 0;
+                    const size_t latb = g_lat ? (xin_sep ? 0 : xinl) + (g_tm_unused ? 0 : batb) : 0;
                     const size_t lath = g_lat && g_lat_hs ? ((size_t)LNC * (LGFC < LNC ? 6 : 4) + (size_t)LGFC * 4) * (size_t)(g_hs_z / 4 + 2) * (P / 4) * (P / 4) + (g_lat_fuse ? nn_lat_fuse_part(7, P / 4, P / 4, g_hs_z) : 0) : 0;
                     const double listed = (double)uwp + uws + aug + latb + lath + (g_mil ? mil_bytes() : 0), task = (double)need - grec - tb - tb / 14 - trainer - ((size_t)550 << 20);
                     fprintf(stderr, "memory plan parts (mode %d, %.0f Mvox): label planes %.2f GB (%.1f B/vox; uint8 codes: phase / side, w4, comp, ink, %d aux) + head slabs %.2f + gpu-aug staging %.2f (%.1f B/vox, uint8 CT / labels)"
                             " + lat batch %.2f (input %s, targets / mask %s) + lat head slab %.2f; the label stream %s; +1/14 margin; task %.2f GB = these %.2f + other %.2f (the planner's other task terms, unlisted)\n",
-                            c, v / 1e6, uwp / 1e9, (double)uwp / v, g_naux, uws / 1e9, aug / 1e9, (double)aug / v, latb / 1e9, xin_sep ? "separate" : "in gout[0]", g_tm_unused ? "unused" : "on device", lath / 1e9,
+                            c, v / 1e6, uwp / 1e9, (double)uwp / v, g_naux, uws / 1e9, aug / 1e9, (double)aug / v, latb / 1e9, xin_sep ? "separate" : g_lat ? (xinl < xinb ? "kept bytes + slab planes (UFSM_LAT_XSLAB)" : "own buffer") : "in gout[0]", g_tm_unused ? "unused" : "on device", lath / 1e9,
                             g_lat && g_head_slab && B == 1 && (g_xs == 1 || g_gpu_want) && xbytes() == 2 && g_side ? "replaces the label planes by 2 slab sets" : "off", task / 1e9, listed / 1e9, (task - listed) / 1e9);
                 }
                 if (ufsm_env_on("UFSM_MEM_REPORT"))   /* the planner's terms of this mode */
@@ -5269,6 +5303,22 @@ int cmd_train(int argc, char **argv) {
         d->hsplit = lean && g_head_slab && !d->upsplit && !split && !g_restore && d->side < 0 && !g_aff && !g_cond && !g_pap_head && !g_distill && !g_heads
                     && (!getenv("UFSM_HSPLIT") || ufsm_env_on("UFSM_HSPLIT"));
         if (d->hsplit) { d->ev_hs = nn_event_create(); nn_event_record(d->ev_hs, 0); if (g == 0) fprintf(stderr, "batch upload: target planes during the backward, input and packed targets after the loss fetch\n"); }
+        if (g_xslab) {   /* UFSM_LAT_XSLAB: the input's own buffer goes; it lives in the level-0 gradient buffer, dead from the backward's end (the
+                            input goes up after it, upload_tail) to the forward's input conversion; the head slabs write their planes again */
+            void *xs_ = nullptr;
+            if (lean && d->hsplit && d->side < 0 && g_xs == 1 && xbytes() == 2) {   /* (the own buffer freed before the build: the plan counted it out) */
+                nn_free(d->xb[0]); d->xb[0] = d->xb[1] = nullptr;
+                unet_build(d->u, (shape5){B, cfg.cin, g_Pz / 4, P / 4, P / 4}, 1); xs_ = xsl_scratch(d);
+                if (!xs_) { d->xb[0] = d->xb[1] = nn_malloc(p3 * 2); d->x = d->xb[d->cur]; }
+            }
+            if (xs_) {
+                d->xb[0] = d->xb[1] = (float *)xs_; d->x = d->xb[d->cur]; d->xsl_at = xs_;
+                d->xk = (nn_aug_keep){nn_malloc(p3), nn_malloc(nn_aug_keep_rec_bytes()), (float *)nn_malloc(4 * sizeof(float)), nullptr, P};
+                d->xsl = nn_malloc((size_t)(g_hs_z + 2) * P * P * 2); d->xsl_on = 1;
+            }
+            if (g == 0) fprintf(stderr, "%slatent grid: UFSM_LAT_XSLAB: %s\n", xs_ ? "" : "DEFAULTED: ", xs_ ? "the CT channel in the level-0 gradient buffer, the kept bytes + the slab planes beside it"
+                                : "the CT channel keeps its own buffer (needs lean 2 with the split upload, and a level-0 gradient buffer of 2 B per voxel)");
+        }
         const char *e = nn_check(); if (e) { fprintf(stderr, "GPU %d: %s\n", d->dev, e); return 1; }
     }
     nn_init(G[0].dev);

@@ -34,6 +34,42 @@ Gate (card 1, the 2000-step snapshot, 1667 level 0, a 1024^3 box at the C10 corn
 Time, 1024 x 2048^2 box, window seconds: master 640 18 s; branch 640 17, 1152 20, 1280 26. The box is small: at 1152 / 1280 the 4 windows
 mostly compute halo.
 
+### Training memory for w24 at P > 640 (planner numbers, UFSM_MEM_DRY=1 / UFSM_MEM_REPORT=2)
+
+w24's args (init try9, unwrap2 + rv + ink + fib heads, lat 4, lat_guide 64, fstem 16), mode 4 (MX gradients, chunked, lean 2, a1 offloaded).
+Free for the plan: 7.83 GB, after buffers allocated outside it: gpudec 1.57, onfly slot 3.10 (--onfly-mb 3072), mesh stamp 0.81, ink-mil 0.33.
+
+| P | network | task (head slabs, aug staging, lat batch, label slabs, margins) | ws + fixed | plan GB |
+|---|---|---|---|---|
+| 640 | 2.47 | 4.56 | 0.70 | 7.74 |
+| 768 | 4.25 | 6.41 | 0.82 | 11.49 |
+| 896 | 6.73 | 8.78 | 1.00 | 16.51 |
+| 1024 | 10.02 | 11.78 | 1.24 | 23.05 |
+
+At P 1024, four level-0 tensors (256 ch MX-fp4 = 136 B/cell: enc a2, enc a1/down, dec a2, gout) make 9.1 of the network's 10.0 GB.
+
+| lever | free / plan at P 768 | changes results? |
+|---|---|---|
+| --ct-gpu-decode 0 (only ~2 % of w24's requests decoded on the GPU) | free 7.83 -> 9.41 | no (same bytes, CPU decode) |
+| + --onfly-mb 1536 | free 10.82 | no (the slot is a cache) |
+| + head slab z 16 (UFSM_HEAD_SLAB_Z) | plan 11.49 -> 10.19: fits; P 896 14.74: does not | no (per-slab sums in the same order; step cost: q7 below) |
+
+Ideas weighed (estimates from the planner's terms):
+- (#4) the lat batch's full-resolution fp16 input rebuilt per head slab from a kept uint8 post-scan copy (aug_write_k over the slab's voxels):
+  1 B/vox instead of 2 = 1.07 GB at P 1024, 0.72 at 896, 0.45 at 768. The gpu-aug staging buffer cannot be that copy: the label warp, ink
+  bits and label stream reuse it after the CT write.
+- (#5) the input inside a level-0 network buffer: dropped. Only l3b (three level-0 buffers) leaves one free, and l3b exists only for
+  8/16-wide level 0 and excludes head_ext with half_res.
+- One card at P 1024 is out of reach (~8.7 GB short of 12.6 even with all of the above); P 896 needs hs_z 8 + #4. P 1024 is the 2-GPU split's.
+
+2-GPU split (--split z with --lat 4, g_lsplit): scratch2 ran P 1024 at 11.59 GB/card with hs_z 8 and onfly 768; halo +3-6 % compute,
+GPUs ~92 % busy, staged peer copies 14-17 GB/s.
+
+Slab windows (--Pz 128, P 1152-1536), parked: with --lat, Pz must be a multiple of 128; the sampler refuses slabs with --echo-max, gpu-aug
+(CPU fallback, DEFAULTED), geometry augmentation and scanner augmentation, so a slab run is not w24's recipe. The CPU sampler-only check at
+P 1536 was OOM-killed (rc 137) at a 30 GB memcap, and the split's sampler-only check at P 1024 filled the 40 GB dev slice (rc 137, it
+also killed a neighbour's job): host batch slots grow with the window x slots; size sampler-only checks at these P in the train slice.
+
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
 
 - Why: under -std=c23, phasecmp.c called floor / ceil / llround without <math.h> (fixed in b32c16ca). mcc took them as int f()

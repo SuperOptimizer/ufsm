@@ -443,6 +443,7 @@ test_echo                                      | gpu          |    40 | tests/te
 test_train_devcheck                            |              |     2 | tests/test_train_devcheck.sh ./$B/ufsm $TMPDIR/devcheck
 test_health                                    | gpu,slow     |    60 | tests/test_health.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/health
 test_lab_early_split                           | gpu          |    40 | tests/test_lab_early_split.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/labearlysplit
+test_lat_xslab                                 | gpu          |    40 | tests/test_lat_xslab.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/latxslab
 test_mcc_compile                               |              |    30 | bash tests/mcc_compile.sh
 # the sanitize group (ops audit #9): compute-sanitizer racecheck (shared-memory hazards) / synccheck (barrier misuse) on small GPU tests
 test_ink_mil~racecheck                         | gpu,slow     |   120 | bash tests/sanitize.sh racecheck ./$B/test_ink_mil

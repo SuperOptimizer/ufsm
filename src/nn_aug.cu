@@ -30,7 +30,8 @@ typedef struct {
     void *fw; size_t fw_n;            /* the scanner's work volume when the CT channel's planes do not hold it (narrow z ranges) */
     const void *key; int ks0, ks1;  /* key: the host plane whose source planes [ks0, ks1) the staging buffer holds unchanged */
 } aug_dev;
-static aug_dev g_ad[16];   /* per device, two slots (nn_zcomm.slot: two ranks on one device in the tests) */
+static aug_dev g_ad[16];
+static thread_local nn_aug_keep *g_keep;   /* nn_aug_keep_set (per GPU thread) */   /* per device, two slots (nn_zcomm.slot: two ranks on one device in the tests) */
 static int lw_keyed(const aug_dev *a, const void *h, int s0, int s1) { return a->key == h && a->ks0 == s0 && a->ks1 == s1; }
 static void lw_setkey(aug_dev *a, const void *h, int s0, int s1) { a->key = h; a->ks0 = s0; a->ks1 = s1; }
 
@@ -738,10 +739,28 @@ extern "C" void nn_aug_ct_z(const uint8_t *ct8_h, const void *rec_h_, const void
         zc_sum(zc, a->usc + 1, 2, 0, s);
     }
     aug_norm_k<<<1, 1, 0, s>>>(a->usc, p3, a->rec, a->scal);
+    if (g_keep && !split) {   /* nn_aug_keep_set: what aug_write_k reads, for nn_aug_rewrite's slabs (the staging buffer is reused by the label warp next) */
+        if (g_keep->P != P) { fprintf(stderr, "nn_aug_keep: kept for P %d, the window is %d\n", g_keep->P, P); abort(); }
+        CK(cudaMemcpyAsync((uint8_t *)g_keep->ct + (size_t)ta * P2, a->stage, (size_t)(tb - ta) * P2, cudaMemcpyDeviceToDevice, s));
+        CK(cudaMemcpyAsync(g_keep->rec, a->rec, sizeof(scan_ct_rec), cudaMemcpyDeviceToDevice, s));
+        CK(cudaMemcpyAsync(g_keep->scal, a->scal, 4 * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        g_keep->ntab = a->ntab;
+    } else if (g_keep) { fprintf(stderr, "nn_aug_keep: not with split windows\n"); abort(); }
     void *H = (char *)ct16 - (size_t)z0 * P2 * xb;
     aug_write_k<<<nblk((size_t)nz * P2, 256), 256, 0, s>>>(in, P, (const float *)rad_d, a->rec, a->scal, a->ntab, H, (size_t)z0 * P2, (size_t)(z0 + nz) * P2);
     nn_ptick_fine("    x ct sums + write");
     CK(cudaEventRecord(a->done, s)); a->used = 1;
+    KCHECK();
+}
+/* train UFSM_LAT_XSLAB: the window's scanned source bytes, record and z-score kept, so the CT channel's planes can be written again per head
+   slab (aug_write_k over the slab's voxels: the same bytes as the whole-window write) after the whole channel's buffer was reused */
+extern "C" size_t nn_aug_keep_rec_bytes(void) { return sizeof(scan_ct_rec); }
+extern "C" void nn_aug_keep_set(nn_aug_keep *k) { g_keep = k; }
+extern "C" void nn_aug_rewrite(const nn_aug_keep *k, const void *rad_d, int z0, int nz, void *ct16) {
+    const int P = k->P; const size_t P2 = (size_t)P * P;
+    if (!k->ntab || z0 < 0 || nz < 1 || z0 + nz > P) { fprintf(stderr, "nn_aug_rewrite: planes [%d, %d) of %d (kept: %s)\n", z0, z0 + nz, P, k->ntab ? "yes" : "nothing yet"); abort(); }
+    void *H = (char *)ct16 - (size_t)z0 * P2 * 2;
+    aug_write_k<<<nblk((size_t)nz * P2, 256), 256>>>((const uint8_t *)k->ct, P, (const float *)rad_d, (const scan_ct_rec *)k->rec, k->scal, k->ntab, H, (size_t)z0 * P2, (size_t)(z0 + nz) * P2);
     KCHECK();
 }
 extern "C" void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h_, const void *rad_d, int P, void *ct16, int on_copy_stream) {
