@@ -6,6 +6,57 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## 1667 comparison unrolls: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
+
+Question (lead, for the user): what do the new ideas change in a real unroll, scored on GT? Same region and downstream steps for each
+arm, only the named input differs.
+
+**Setup:**
+- Region: PHerc1667 level-2 box z 6656..8320 × the whole section (16 mm of scroll), unrolled by scripts/unroll/unroll.sh at master
+  cf536c92 (NOINK, CLEAN=0). Pipeline: rectosp, MFREF, ref, slabs, join, check, wraps, snap, strip.
+- Scoring: the 16 wbench C boxes fully inside the region (cmp/gtboxes-z6656.tsv), GT ids of the joined model.
+  - Packed: C20, C21, C22.
+  - Label-noise: C1, C20, C67, C69.
+- Bootstrap: paired over boxes (voxel-weighted, 20000 resamples), unrollrun/sh/cmpboot.sh. Runs are in /vesuvius/ufsm/unrollrun/cmp/PHerc1667-{A,B,C}.
+
+**Arms:**
+- A: try9cool cooled-33333 fields (production).
+- B: fz-phbm. `field-blend` of A's fields with w24 snap/6000 fields (level 0, h 8, window 640 halo 64): `--weights 1,0 --plane-w
+  phase=1,1 --conf mean` (condnet's recipe).
+- C: A's fields, ref with `count-field --cf-robust 8 --cf-robust-delta 0.02` (globwind ef7cf27c, GPU solve).
+
+| arm | ids joined, 16 boxes | 12 clean | 3 packed | ids ref-cf | wraps |
+|---|---|---|---|---|---|
+| A try9 | 0.8193 | 0.8937 | 0.6921 | 0.7980 | 45 |
+| B fz-phbm | 0.7860 | 0.8518 | 0.6939 | 0.7630 | 45 |
+| C cf-robust | **0.8293** | **0.9049** | **0.6962** | **0.8133** | 44 |
+
+Paired differences against A (joined ids):
+
+| diff | set | mean | 95 % CI | boxes better |
+|---|---|---|---|---|
+| C − A | all | +0.0100 | [+0.0041, +0.0176] | 14 / 16 |
+| C − A | clean | +0.0112 | [+0.0038, +0.0207] | 11 / 12 |
+| C − A | packed | +0.0040 | [+0.0016, +0.0064] | 3 / 3 |
+| B − A | all | −0.0333 | [−0.0813, +0.0001] | 5 / 16 |
+| B − A | clean | −0.0419 | [−0.1031, +0.0022] | 4 / 12 |
+| B − A | packed | +0.0017 | [−0.0104, +0.0168] | 1 / 3 |
+
+**What the numbers show:**
+- C helps nearly everywhere and hurts nowhere by more than 0.002 (C67 0.728 -> 0.726). The largest gains are C62 +0.052, C70 +0.025
+  and C30 +0.023. The ref-cf itself gains +0.015.
+- B's loss is three open boxes: C28 0.931 -> 0.640, C58 0.903 -> 0.815 and C62 0.904 -> 0.864. The packed ones are flat (C22 +0.017,
+  C21 −0.002).
+- So the wbench per-box fusion gain on packed boxes does not carry into a region unroll at w24 6000. The blended phase seems to break
+  the count in some open stretches; this was not traced.
+
+Caveats: one region of one scroll, 16 boxes that are spatially correlated, so the CI understates the between-region variance.
+
+Decision (lead's rule: adopt if the CI excludes 0):
+- `--cf-robust 8 --cf-robust-delta 0.02` is the unroll ref's default: `CFROBUST` in scripts/unroll/unroll.sh refpool;
+  `CFROBUST=` gives the old L2 ref. Test: tests/test_unroll_cfrobust.sh.
+- fz-phbm is not adopted for unrolls.
+
 ## ATLAS-15k as extra labels: import, inventory, CPU quality audit; 58 % of its area passes a gate (2026-11-27, branch atlas-20261127, atlas)
 
 **Dataset.** huggingface.co/datasets/Qualzz20/ATLAS-15k (rev ac4b982a, CC BY-NC 4.0): 14,678 recto patches on 28 scrolls, 2,306 cm².
