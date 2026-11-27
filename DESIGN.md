@@ -6,6 +6,45 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Hard-spot sampling: a share of the draws from merge-flagged / id-change cells (2026-11-27, branch hardspot-20261127, hardspot)
+
+Port of upstream villa's hard-spot training (`tracers/sheets/evaluation/hard_spots.py`, `data.hard_windows` / `hard_fraction`: a fixed
+share of training episodes starts at a recorded failure spot of a model; research/villa.md idea 4). Ours draws a fixed share of a
+source's training windows from cells marked hard, instead of uniformly over its draw cells.
+
+- **Map** (`ufsm hard-map`, src/hardmap.c): uint8 per cell of 2^lev level-0 voxels of a scan (RAW + RAW.json: grid, lev, um, ct),
+  0 easy, 1..255 hard weight. Inputs: `--mf ZARR` (merge-flag plane in a field frame from `--fields`; weight = 255 x share of the
+  cell's material field cells at mf >= `--mf-thr` 179, kept when >= `--mf-min` 0.1 and >= 64 material cells) and / or `--boxes TSV`
+  (`z0 y0 x0 z1 y1 x1 w`: wbench per-box errors, the unroll's id-change places, disagreement boxes; max with 255 w).
+- **Source key** `"hard": {"map": RAW, "frac": F}`. The sampler maps each draw cell's centre into the map's frame (the same scan: the
+  map's `ct` basename must match, its um a power of two of the source's), keeps the cells with weight > 0 that are not in a held-out
+  box, and repeats each (w + 31) / 32 = 1..8 times. With probability F the position draw takes a cell from this list, else from the
+  usual index (edge-boost / zboost / focus apply to the usual index only). `--hard-frac F` > 0 overrides every source's frac, < 0 is off.
+  Validation samplers ignore the map. A map that marks none of the draw cells prints DEFAULTED.
+- **Off = byte-identical**: a source without a map draws no extra random number (test_sampbias: 8 deterministic batches of the
+  fixture source with and without a map at `--hard-frac -1`, every plane's hash equal).
+- **Logged**: at start the hard cells per source; sampler-only and the end of training print, per hard source, the kept windows
+  from hard draws, the share of all its kept windows on hard cells, and that share among the other draws alone (the unboosted rate).
+- test_sampbias: the index of a 4.8 um map on the 9.6 um fixture (exactly the cells below z 128, 8 times each), frac 0.5 -> 0.3-0.7
+  of 80 kept windows, off = identical hashes, on changes them; hard-map on a synthetic mf plane + a box (cell values exact).
+  bench_sampler hashes (deterministic fixture runs: plain, a holdout box, the trainer recipe) are the same for origin/master and the branch.
+- **1667 map** (`maps/PHerc1667-mf179.raw` in /vesuvius/ufsm/hardspot): the q2 mf plane (wgraph c7cf, 4635 x 1568 x 1616 field cells,
+  h 2 at 9.596 um), level-7 cells of the 2.399 um scan (290 x 119 x 119, 307 um). 42 s on 6 threads, 0.2 GB RSS. 237738 of 983777
+  material cells are hard (0.24 at share >= 0.1); weights: 36 % of the hard cells >= 224, 17 % at 32-63.
+- **Sampler-only** (CPU, PHerc1667-A48: the stored codesA at 4.8 um, P 256, w24's holdouts, edge-boost / snap-jitter / stick-src on;
+  frac 0.3, 600 kept windows): 18001 of 130018 draw cells hard (0.138; 5150 dropped in held-out boxes)
+
+  | | share |
+  |---|---|
+  | kept windows from hard draws | 0.352 (requested 0.3: hard draws are rejected less; 314 rejections in all) |
+  | kept windows on a hard cell | 0.448 |
+  | the same among the other draws (unboosted rate) | 0.149 |
+
+  So frac 0.3 triples the windows centred on merge-flagged cells. On w24's own source (2.4 um, onfly mesh labels on the CPU) the
+  same map marks 157091 of 1147175 draw cells (0.137); its windows cost ~70 s each on the CPU, too slow for a share count.
+- Only 1667 has a whole-scroll mf plane. Paris 4 / 0139 / 0814 need predicted fields + `ufsm merge-flag`, or per-box error rows
+  (wbench) as `--boxes`.
+
 ## Per-scroll / per-recipe ink eval: worst scroll, leak flags, band-tolerant F1; 1447 is the only scroll clean for every model (2026-11-27, branch inkeval-20261127, inkeval)
 
 Pooled dev numbers hid two things: which scroll a model fails on, and whether it trained on that scroll. `ufsm ink-strat` (src/inkstrat.c)
@@ -421,6 +460,22 @@ at w320).
   border voxels see zero-padded context. That fits `--seamless 2` taking the jump to 0.11 (unroll's ab640c).
 - The fix is a larger halo or seamless, not frozen statistics.
 - w1024 at level 0 does not fit a 16 GB card (an 18.25 GB slab buffer; predict stops with an OOM error, rc 1).
+- **Halo vs seamless (11-27, gn/seam832.sh, gn/hold832h.sh, master 41f1176c, card 1).** The PHerc1203 block above, interior 512;
+  ink-seam jump at the window seams (offset 0) and at the half-offset lattice (offset 256):
+
+  | arm | predict s | jump off0 | jump off256 |
+  |---|---|---|---|
+  | w576 h32 | 18 | 4.76 | −0.06 |
+  | w704 h96 | 32 | 2.77 | −0.03 |
+  | w832 h160 | 52 | 1.24 | −0.02 |
+  | w576 h32 `--seamless 2` | 68 | 0.13 | 0.11 |
+
+  HOLD at rung 1.1, w832 h160 − w768 h32, paired: 1667 .903 vs .896 = +0.006 ± 0.010, P4 .895 vs .891 = +0.003 ± 0.006
+  (predict 136 vs 105 s). The CT for this HOLD check is a local copy re-staged for it (r11/ctl/stage3.sh, 39 GB).
+- **Verdict:** a larger halo is AUC-neutral and cuts the seam ~4x, but `--seamless 2` is ~10x lower again at 1.3x the time.
+  Seamless 2 stays the seam fix; no predict default changed.
+- A first run of this A/B on an old branch build (before perf's blend-region fix f7478578) showed seamless 2 at off256 7.64, i.e.
+  pass b's own seams. That was the stale binary, not a current bug.
 
 ## PHerc1203 status: every read so far shows no text; card 0 stops reading this band (2026-11-26, unroll)
 
