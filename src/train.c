@@ -363,6 +363,7 @@ static int g_mil, g_mil_mode = 1, g_mil_stride = 2, g_mil_max = 65536; static fl
    voxel target's unknowns), BCE of the pooled ink logit along the normal over +-R window voxels at step (tau 0: max; > 0: tau log mean exp), the mean
    over the window's rays x L x the source's ink weight; at most --ink-mil-max rays a window (the device buffers; the backward's sort ~300 B per sample) */
 static int g_ink_air;   /* --ink-air S (--ink-head, needs the --rv papyrus plane): unlabelled air voxels on the S-voxel window lattice -> ink 0 targets (nn_ink_air) */
+static int g_inkneg_R, g_inkneg_from, g_inkneg_on; static float g_inkneg_thr;   /* --ink-neg-guard R / --ink-neg-gate T [--ink-neg-from STEP]: unlabelled-is-unknown for the ink negatives (nn_ink_neg), training passes from STEP */
 static float g_ink_smooth;   /* --ink-smooth EPS (--ink-head): label smoothing of the ink BCE target, t (1 - eps) + eps / 2 (villa: 0.1) */
 static int g_unwrap, g_norm_ch, g_norm_s = 4; static float g_ink_lambda = 1.f, g_ink_dice = 0.f, g_norm_lambda = 1.f, g_dens_lambda = 1.f, g_dens_scale = 32.f;   /* --density-lambda: the density channel's BCE weight (default --normal-lambda) */
 static float g_contact_w, g_contact_um = 70.f;   /* mgpu: config. --contact-weight W [--contact-um U] (rvsub 2026-11-19): rv and fibre H / V masks x W where labelled sheets touch (spacing <= U) */
@@ -1811,7 +1812,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
                 nn_loss_stats_acc(LGC(1), d->t + l3 + vb, d->pm + vb, d->w + 1, one, d->hs_ds + 5);
             } else if (!g_single) nn_wind4_stats(LGC(g_w4_ch), LGC(g_w4_ch + 1), w4 + vb, wc + vb, d->sidem, ns, d->w4ds);
             FT("  s wind4 stats");
-            if (g_ink2) { nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0 + mil_zoff(d), H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm); hs_clip(d, pass, d->inkm, z0, z1, hw); if (src_surf_only(si)) nn_zero(d->inkm, ns); nn_loss_stats_acc_e(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5, d->hs_ent + HE_INK); }
+            if (g_ink2) { nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth); if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0 + mil_zoff(d), H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm); if (g_inkneg_on && d->hs_train) nn_ink_neg(ink, vb, ns, D, H, W, g_inkneg_R, LGC(g_ink2_ch), g_inkneg_thr, d->inkm, 0); hs_clip(d, pass, d->inkm, z0, z1, hw); if (src_surf_only(si)) nn_zero(d->inkm, ns); nn_loss_stats_acc_e(LGC(g_ink2_ch), d->inkt, d->inkm, d->inkw, one, d->hs_ds + 5, d->hs_ent + HE_INK); }
             int mz0, mnz; size_t mbo;
             if (nmil && mil_clip(d, 0, z0, nz, hw, &mz0, &mnz, &mbo) && ink_mil_fwd_slab(LGC(g_ink2_ch) + mbo, 0, mz0, mnz, MD, H, W, mrays, nmil, g_mil_R, g_mil_step, d->milacc, nullptr)) { fprintf(stderr, "ink mil: fwd_slab failed\n"); exit(1); }   /* (the logits: fp16) */   /* --ink-head (the recto / ink v1 slots are free) */
             if (mck) { _Float16 *h = malloc(ns * 2); nn_sync(); nn_d2h(h, LGC(g_ink2_ch), ns * 2); for (size_t q = 0; q < ns; q++) mlg[vb + q] = (float)h[q]; free(h); nn_d2h(mink + vb, ink + vb, ns); }   /* (+ the ink target plane the loss reads) */
@@ -1843,6 +1844,7 @@ static void head_slab_pass(gpu_state *d, int pass) {
         if (g_ink2) {   /* --ink-head: soft BCE over the known ink voxels, times --ink-lambda x the source's "ink_weight" */
             nn_ink_targets_smooth(ink + vb, ns, d->inkt, d->inkm, g_ink_smooth);
             if (g_ink_air && pap) nn_ink_air(pap + vb, ns, z0 + mil_zoff(d), H, W, g_ink_air, g_ink_smooth, d->inkt, d->inkm);   /* --ink-air: + the air lattice as ink 0 */
+            if (g_inkneg_on && d->hs_train) nn_ink_neg(ink, vb, ns, D, H, W, g_inkneg_R, LGC(g_ink2_ch), g_inkneg_thr, d->inkm, 1);   /* --ink-neg-guard / --ink-neg-gate (both passes: the same mask; counted here) */
             hs_clip(d, pass, d->inkm, z0, z1, hw);
             if (src_surf_only(si)) nn_zero(d->inkm, ns);   /* (a surf_only source: the teacher pixels train the surface head only; no known ink voxel) */
             const float iw = g_ink_lambda * (si >= 0 && g_S && si < g_S->n ? (float)g_S->src[si].ink_weight : 1.f) * src_head_w(si, SH_INK);
@@ -3212,6 +3214,10 @@ int cmd_train(int argc, char **argv) {
             }
         }
         g_ink_lambda = (float)atof(opt(argc,argv,"--ink-lambda","1")); g_ink_dice = (float)atof(opt(argc,argv,"--ink-dice","0"));
+        g_inkneg_R = atoi(opt(argc,argv,"--ink-neg-guard","0")); g_inkneg_thr = (float)atof(opt(argc,argv,"--ink-neg-gate","0")); g_inkneg_from = atoi(opt(argc,argv,"--ink-neg-from","0"));
+        if (g_inkneg_R < 0 || g_inkneg_R > 8 || !(g_inkneg_thr >= 0 && g_inkneg_thr < 1) || g_inkneg_from < 0 || ((g_inkneg_R || g_inkneg_thr > 0) && (!g_unwrap2 || !g_ink2))) {
+            fprintf(stderr, "--ink-neg-guard R (0..8 voxels), --ink-neg-gate T (0: off, else 0 < T < 1), --ink-neg-from STEP >= 0: with --task unwrap2 --ink-head 1\n"); return 2; }
+        if (g_inkneg_R || g_inkneg_thr > 0) fprintf(stderr, "ink negatives: unknown within %d voxels of a labelled positive (guard), where the ink head's p > %g (gate; 0 off), training passes from step %d\n", g_inkneg_R, g_inkneg_thr, g_inkneg_from);
         g_ink_air = atoi(opt(argc,argv,"--ink-air","0"));   /* (DESIGN 2026-11-13: the face-band ink labels never reach air, so the head's level there was free) */
         if (g_ink_air < 0 || (g_ink_air && (!g_unwrap2 || !g_ink2 || !g_rv))) { fprintf(stderr,"--ink-air S: S >= 1 voxels, with --task unwrap2 --ink-head 1 and --rv (the papyrus plane)\n"); return 2; }
         if (g_ink_air) fprintf(stderr, "ink air: unlabelled air voxels (papyrus plane known, < 127) on the %d^3-voxel lattice are ink-0 targets\n", g_ink_air);
@@ -5786,6 +5792,7 @@ int cmd_train(int argc, char **argv) {
         }
         g_verso_on = g_verso && step >= g_verso_start;
         g_ptrunc_on = g_ptrunc_tau > 0 && step >= g_ptrunc_from;   /* (off again for the validation passes below) */
+        g_inkneg_on = (g_inkneg_R > 0 || g_inkneg_thr > 0) && step >= g_inkneg_from;
         { uint64_t h = (uint64_t)step * 0x9E3779B97F4A7C15ull + (uint64_t)seed; h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
           g_verso_flip = g_verso_on && g_verso_swap > 0 && (double)(h >> 11) * 0x1p-53 < g_verso_swap; }   /* same on every GPU */
         g_sheet_ramp=fminf(1.f,(float)(step-schedule_start)/500.f);
@@ -6206,6 +6213,7 @@ int cmd_train(int argc, char **argv) {
             if (g_rpairs) { free(g_rpv); g_rpv = calloc((size_t)S->n * RP_NST, sizeof *g_rpv); }
             if (step % val_every == 0 || step == steps || g_stop) {
                 g_ptrunc_on = 0;   /* (validation: the plain phase loss) */
+                g_inkneg_on = 0;   /* (validation: every labelled negative) */
                 const int nv = split ? 2 : 1;   /* split: validation windows are split too */
                 int val_gn_live; {
                     int dfl = 0; const long gn_n = unet_gn_ema_updates(G[0].u), gn_w = unet_gn_ema_warm(G[0].u);
@@ -6429,6 +6437,7 @@ int cmd_train(int argc, char **argv) {
                 if (kk) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " (kl %s)", kb); }
                 for (int k = 0; k < 8; k++) acc_kl[k] = acc_kln[k] = 0;
             }
+            if (g_inkneg_R > 0 || g_inkneg_thr > 0) { unsigned long long ic[3]; nn_ink_neg_counts(ic); size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " inkneg guard %.4f gate %.4f", ic[0] ? (double)ic[1] / ic[0] : 0.0, ic[0] ? (double)ic[2] / ic[0] : 0.0); }
             if (g_ptrunc_tau > 0) { unsigned long long pc[2]; nn_phase_trunc_counts(pc); size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " trunc %.4f", pc[0] ? (double)pc[1] / pc[0] : 0.0); }
             else if (g_unwrap && !g_unwrap2) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " ink bce %.4f normal bce %.4f", acc_ink / nok, acc_norm / nok); }
             if (g_fibdir > 0) { size_t na = strlen(affs); snprintf(affs + na, sizeof affs - na, " dir bce %.4f", acc_norm / nok); }

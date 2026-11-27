@@ -6,6 +6,62 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Noisy ink labels: label smoothing exists, unlabelled-is-unknown negatives (--ink-neg-guard / --ink-neg-gate), an ADELE design (2026-11-27, branch inklabelfix-20261127, inklabelfix)
+
+What the ink head trains on today (checked in the code):
+
+- **Label smoothing** is already in: `--ink-smooth EPS` (nn_ink_targets_smooth, 2026-11-11). It smooths the voxel BCE target, the soft Dice
+  (same target plane) and the MIL ray label (ink_mil_fin's eps). The production ink and unrollperf recipes run 0.1, the paper's 3-D value;
+  the paper's 0.25 belongs to its 2.5-D nets. Nothing to add here; 0.25 could be one A/B arm.
+- **The mask.** inksplat writes prob254: 254 ink, 0 no ink, 255 unknown. A pixel outside the supervision mask, or one without an open
+  face, is unknown (the MIL rays cover the faceless ones). Inside the supervision mask every untraced pixel is a hard 0. So an untraced
+  letter inside a supervised region trains as "no ink", and so does the rim of a trace drawn a few pixels off the letter. `--ink-air S`
+  adds air voxels as 0 on an S-lattice; they are physics, not labels.
+
+**New, opt-in: unlabelled-is-unknown for the labelled negatives** (nn_ink_neg in nn_elem.cu; train.c head_slab_pass, both passes, training
+only: validation keeps every labelled negative, so val BCE stays comparable across arms). A known negative voxel (prob254 < 127; the
+air lattice reads 255 and is left alone) leaves the mask when:
+
+- `--ink-neg-guard R` (0..8 voxels at the window's level): a label positive (127..254) lies in the (2R + 1)^3 cube around it. This is
+  an explicit ignore band beyond the trace, for traces drawn up to R voxels off the letter. It looks at the labels only, so the net's
+  predictions cannot feed back into it.
+- `--ink-neg-gate T` (0 < T < 1): the ink head's current p > T at that voxel. The net already reads ink there, and the "no ink" label is
+  more likely a missing trace than a measurement. This is ADELE's correction step (below) in its mask form, applied online from the
+  same forward. It risks confirmation bias, so it starts at `--ink-neg-from STEP` (default 0; meant for fine-tunes from a trained net).
+- The log line gets ` inkneg guard F gate G`: the fractions of the known negatives dropped since the last log line (all GPUs).
+
+Both flags default to 0. Off, no kernel runs and no buffer is allocated, so the off path is byte-identical. Cost: one elementwise kernel
+per slab and pass. The guard reads the (2R + 1)^3 cube for known negatives only (R 2: 125 bytes, cached). test_ink_mil checks the
+masks and counts byte-exact against a host rule: five (R, T) cases with air-lattice voxels, a slab inside a 20 x 22 x 24 window.
+
+**ADELE (Liu et al., CVPR 2022, arXiv 2110.03740) on our ink head: the design.** ADELE tracks, per class, the IoU of the training
+predictions against the noisy labels. It fits y(t) = a (1 - exp(-b t^c)) to that curve. Once the slope falls to (1 - r) of its start
+(r 0.9), the net has fitted the clean labels and starts to memorise the noisy ones. From then on, ADELE replaces each label with the
+prediction where the prediction is confident (> 0.8), and adds a multi-scale consistency term so the corrected targets are stable.
+Mapped onto our losses:
+
+1. **Classes and grouping.** Two classes (ink, no ink) **per source**, not per scroll. Label quality differs by source: hand traces,
+   teacher pseudo-labels, HF labels, the atlas. Training IoU per source and class: device counters (tp, fp, fn at p > 0.5 over the known
+   voxels) in the ink loss-stats kernel, summed per window, read on the host at --log-every. The MIL rays get their own counters from
+   ink_mil_fin's pooled logit against the ray label, since the faceless pixels have no voxel IoU.
+2. **Onset detection on the host** (C, a new onset.c + test on synthetic curves): a Gauss-Newton fit of a, b, c on the series of each
+   (source, class) pair every log interval. Correction starts once the slope has fallen by r = 0.9 and at least 10 points exist. This
+   replaces `--ink-neg-from` with a per-source start step. A fine-tune from a trained net starts already saturated, so its onset is step
+   0 and the fixed-step gate built here covers it.
+3. **Correction, voxel targets.** For negatives, p > T masks the voxel (the gate above). Rewriting the target to p, as ADELE does,
+   would be a 2-line change in the same kernel (t := p x 255, m kept); the mask form is the conservative first arm. For positives
+   (`--ink-pos-gate`, to add), p < 1 - T masks the voxel. That covers band voxels off the true sheet and traces of letters that are not there.
+4. **Correction, MIL rays.** In ink_mil_fin, per ray from the pooled zr: label 0 with sigmoid(zr) > T, or label 1 with sigmoid(zr) <
+   1 - T, gets dL/dz = 0 (fin already writes each ray's dL/dz, so no extra pass). The ray label is what misses the depth offset. The MIL
+   max-pool absorbs the offset of a positive ray, so the positive half matters less here than in the voxel targets.
+5. **Onfly labels need no store.** ADELE keeps one corrected label per pixel across epochs. Ours are rebuilt per window, so the
+   correction is always the current net's, from the forward that computes the loss. That is the same rule applied online, at no
+   I/O cost.
+6. **Scale consistency.** ADELE's multi-scale term needs a second forward. Our cheap equivalent is to gate on an EMA or snapshot-averaged
+   net's prediction instead of the live one. That costs a second forward too, so we defer it until the plain gate shows a gain.
+7. **Guards.** The holdouts (0841, 1447, the HOLD boxes) see no correction (validation runs ungated). Per cycle, the gate must not lower
+   HOLD AUC; that is the confirmation-bias check from ink-labels.md #6.
+
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
 
 - Why: under -std=c23, phasecmp.c called floor / ceil / llround without <math.h> (fixed in b32c16ca). mcc took them as int f()
