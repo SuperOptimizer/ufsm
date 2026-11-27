@@ -4351,7 +4351,7 @@ int cmd_train(int argc, char **argv) {
             train_unread_flags(argc, argv);   /* (after the last read: --replay / --replay-gap warned falsely before; mini audit opts 4) */
             const int step_ms = getenv("UFSM_SAMPLER_STEP_MS") ? atoi(getenv("UFSM_SAMPLER_STEP_MS")) : 0;   /* (a simulated GPU step per batch: the echo share at that pace) */
             sampler *sq = sampler_start(S, &sc); if (!sq) { fprintf(stderr, "cannot start the sampler\n"); return 1; }
-            const int nb = atoi(so); const double t0 = now(); double tf = 0, twait = 0; double so_emb[4] = {0, 0, 0, 0};   /* (twait: in sampler_next after the first batch; so_emb: --distill target / CT-block counts) */
+            const int nb = atoi(so); const double t0 = now(); double tf = 0, twait = 0; double so_emb[4] = {0, 0, 0, 0}; double so_cnd[4] = {0, 0, 0, 0};   /* (twait: in sampler_next after the first batch; so_emb: --distill target / CT-block counts) */
             /* per source: windows, and per window the shares of material (CT > 0), known phase and known winding mod 4 (w4 per voxel only
                without --w4 runs: UFSM_W4_RUNS=0) over the window's voxels (source grid) */
             double (*cov)[5] = calloc((size_t)S->n, sizeof *cov); int (*lvc)[MAXLEV] = calloc((size_t)S->n, sizeof *lvc); double (*lvm)[MAXLEV][2] = calloc((size_t)S->n, sizeof *lvm);
@@ -4416,6 +4416,12 @@ int cmd_train(int argc, char **argv) {
                                 so_emb[2] += any; } so_emb[3] += ng; }
                     }
                 }
+                if (g_cnd && b->cnd) {   /* --cond-fields: the share of conditioning cells with data, and of windows with any (dropped / outside: none) */
+                    const size_t ng = g_cnd_n / ((size_t)B * COND_K);
+                    for (int n = 0; n < B; n++) { const int8_t *e = b->cnd + (size_t)n * COND_K * ng; size_t k = 0;
+                        for (size_t q = 0; q < ng; q++) { int any = 0; for (int c = 0; c < COND_K && !any; c++) any = e[(size_t)c * ng + q] != 0; k += any; }
+                        so_cnd[0] += (double)k; so_cnd[1] += (double)ng; so_cnd[2] += k > 0; so_cnd[3] += 1; }
+                }
                 sampler_release(sq, b);
                 if ((i + 1) % 10 == 0 || i + 1 == nb) { const double dt = now() - t0 - tf; uint64_t fe, ee; sampler_echo_stats(sq, &fe, &ee);
                     fprintf(stderr, "sampler-only: %d batches, %.1f s (first %.1f s), %.1f Mvox/s after the first", i + 1, now() - t0, tf, i > 0 ? (double)i * B * g_Pz * P * P / 1e6 / dt : 0.);
@@ -4423,6 +4429,7 @@ int cmd_train(int argc, char **argv) {
                     fprintf(stderr, ", waited %.1f s", twait);
                     if (so_emb[1] > 0) fprintf(stderr, ", distill targets on %.1f%% of the head cells (CT-nonzero %d^3 blocks %.1f%%)", 100.0 * so_emb[0] / so_emb[1], g_distill_div,
                                                so_emb[3] > 0 ? 100.0 * so_emb[2] / so_emb[3] : NAN);
+                    if (so_cnd[1] > 0) fprintf(stderr, ", conditioning on %.1f%% of the cells, %.0f%% of the windows", 100.0 * so_cnd[0] / so_cnd[1], 100.0 * so_cnd[2] / so_cnd[3]);
                     fprintf(stderr, "\n");
                     sampler_hostmem(sq, stderr, 0); }   /* (the host memory by owner every 10 batches: slow growth shows where) */
             }
