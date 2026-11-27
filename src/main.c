@@ -1,6 +1,7 @@
 /* ufsm CLI. */
 #include "afv.h"
 #include "mergeflag.h"
+#include "hardmap.h"
 int cmd_denselab_render(int argc, char **argv);   /* src/denselab.c */
 int cmd_ink_rayface(int argc, char **argv);       /* src/denselab.c */
 int cmd_ink_wrapscore(int argc, char **argv);     /* src/wrapscore.c */
@@ -312,6 +313,7 @@ static int usage(void) {
         "  ufsm ink-wrapscore WRAPS SEGS.json OUT --ct-key K --maps n=DIR,..   held-out ink AUC of rendered maps on an unroll's wraps (pairwrap in C, cached samples)\n"
         "  ufsm ink-rayface SOURCES.json [--source N] [--gpu D] [--verify N]   the onfly ink sources' MIL face-drop bits precomputed (no CT read per window)\n"
         "  ufsm merge-flag <fields-dir> [--out DIR] [--thr 179]               the merged-sheet score per field cell (plane mf: phase vs density count, confidence)\n"
+        "  ufsm hard-map --out RAW --um U --shape Z,Y,X [--mf ZARR] [--boxes TSV]  the sampler's hard-spot map (a source's \"hard\": merges, id changes)\n"
         "  ufsm wrap-mf <wraps-dir> --fields DIR [--mf DIR] [--out DIR]       per-wrap uncertain share from mf, <wrap>_mf.tif masks on the vertex grid\n"
         "  ufsm self-gate <wraps-dir> <out-dir> --fields DIR --model FIT [--ct ..] [--nb FIT].. [--exclude ..]   strict stretches of a box fit -> label tifxyz + q.tif\n"
         "  ufsm ct-fields <ct-root> <key> <fields-dir> --ct-um U   CT planes ct / cs of a fit-field directory (fit --w-ct / --w-cspacing)\n"
@@ -5160,6 +5162,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "refine")) return cmd_refine(argc, argv);
     if (!strcmp(cmd, "surf-stats")) return cmd_surf_stats(argc, argv);
     if (!strcmp(cmd, "merge-flag")) return cmd_merge_flag(argc, argv);
+    if (!strcmp(cmd, "hard-map")) return cmd_hard_map(argc, argv);
     if (!strcmp(cmd, "denselab-render")) return cmd_denselab_render(argc, argv);
     if (!strcmp(cmd, "ink-rayface")) return cmd_ink_rayface(argc, argv);
     if (!strcmp(cmd, "ink-wrapscore")) return cmd_ink_wrapscore(argc, argv);

@@ -6,6 +6,28 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Hard-spot sampling: a share of the draws from merge-flagged / id-change cells (2026-11-27, branch hardspot-20261127, hardspot)
+
+Port of upstream villa's hard-spot training (`tracers/sheets/evaluation/hard_spots.py`, `data.hard_windows` / `hard_fraction`: a fixed
+share of training episodes starts at a recorded failure spot of a model; research/villa.md idea 4). Ours draws a fixed share of a
+source's training windows from cells marked hard, instead of uniformly over its draw cells.
+
+- **Map** (`ufsm hard-map`, src/hardmap.c): uint8 per cell of 2^lev level-0 voxels of a scan (RAW + RAW.json: grid, lev, um, ct),
+  0 easy, 1..255 hard weight. Inputs: `--mf ZARR` (merge-flag plane in a field frame from `--fields`; weight = 255 x share of the
+  cell's material field cells at mf >= `--mf-thr` 179, kept when >= `--mf-min` 0.1 and >= 64 material cells) and / or `--boxes TSV`
+  (`z0 y0 x0 z1 y1 x1 w`: wbench per-box errors, the unroll's id-change places, disagreement boxes; max with 255 w).
+- **Source key** `"hard": {"map": RAW, "frac": F}`. The sampler maps each draw cell's centre into the map's frame (the same scan: the
+  map's `ct` basename must match, its um a power of two of the source's), keeps the cells with weight > 0 that are not in a held-out
+  box, and repeats each (w + 31) / 32 = 1..8 times. With probability F the position draw takes a cell from this list, else from the
+  usual index (edge-boost / zboost / focus apply to the usual index only). `--hard-frac F` > 0 overrides every source's frac, < 0 is off.
+  Validation samplers ignore the map. A map that marks none of the draw cells prints DEFAULTED.
+- **Off = byte-identical**: a source without a map draws no extra random number (test_sampbias: 8 deterministic batches of the
+  fixture source with and without a map at `--hard-frac -1`, every plane's hash equal).
+- **Logged**: at start the hard cells per source; sampler-only and the end of training print, per hard source, the kept windows
+  from hard draws, the share of all its kept windows on hard cells, and that share among the other draws alone (the unboosted rate).
+- test_sampbias: the index of a 4.8 um map on the 9.6 um fixture (exactly the cells below z 128, 8 times each), frac 0.5 -> 0.3-0.7
+  of 80 kept windows, off = identical hashes, on changes them; hard-map on a synthetic mf plane + a box (cell values exact).
+
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
 
 - Why: under -std=c23, phasecmp.c called floor / ceil / llround without <math.h> (fixed in b32c16ca). mcc took them as int f()

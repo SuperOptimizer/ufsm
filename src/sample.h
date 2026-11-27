@@ -47,6 +47,8 @@ typedef struct {
                                 0.58-0.85 (9.6 um) and 0.43-0.69 (19.2 um) of the interior */
     float vox_cap;           /* --vox-cap K: a source's geometry-head loss scaled by min(1, K x its mean known-phase share / the weighted mean share): the loss is a per-window
                                 mean, so a source whose windows hold few labels got its voxels up to x8 (0500P2-gt) */
+    float hard_frac;         /* --hard-frac F (hardspot 2026-11-27): > 0 overrides every "hard" source's frac (the share of its position draws from its hard cells), < 0 turns
+                                them off, 0 keeps the json's */
     float focus_w;           /* --focus-w W: overrides every "focus" source's w (packed-sheet draw weight, off at 0 / without a map) */
     int stick;               /* --stick-src N: a rejected draw is retried from the SAME source up to N times (the rejections took 35-46 % of 1299 / 0139-u2ink draws) */
     int snap;                /* align training windows to the CT chunk grid (3x fewer chunks decoded per window) */
@@ -332,6 +334,8 @@ uint64_t sampler_aug_count(const sampler *sp, int which);   /* windows that rece
 /* draws dropped by reason: [0] the coarse CT probe (min_fg, before the CT read), [1] the CT read's min_fg, [2] empty targets
    (empty_keep), [3] overlapping a holdout box (training; not counted in rejected) */
 void sampler_reject_reasons(const sampler *sp, uint64_t why[4]);
+void sampler_hard_stats(const sampler *sp, int si, uint64_t out[3]);   /* source si: windows kept from a hard-cell draw, all its kept windows, kept windows on a hard cell
+                                                                          (by either draw: the unboosted rate is (out[2] - out[0]) / (out[1] - out[0])) */
 void sampler_prof_print(const sampler *sp);   /* env UFSM_SAMPLER_PROF=1: per-stage cpu ms per patch */
 /* UFSM_SAMPLER_PROF: windows built and their mean wall ms from the first draw attempt, by source class (0 labelled, 1 ct_only) */
 void sampler_class_stats(const sampler *sp, uint64_t n[2], double ms[2]);

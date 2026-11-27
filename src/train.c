@@ -3992,6 +3992,7 @@ int cmd_train(int argc, char **argv) {
     sc.echo_max = opt_atoi("--echo-max", opt(argc, argv, "--echo-max", "0"));   /* --echo-max M: adaptive echoing, a step that would wait for data redraws a recent window (sample.h) */
     sc.snap_jitter = opt_atoi("--snap-jitter", opt(argc, argv, "--snap-jitter", "0")); sc.edge_boost = opt_atoi("--edge-boost", opt(argc, argv, "--edge-boost", "0")); sc.vox_cap = (float)opt_atof("--vox-cap", opt(argc, argv, "--vox-cap", "0"));
     sc.focus_w = (float)opt_atof("--focus-w", opt(argc, argv, "--focus-w", "0")); sc.stick = opt_atoi("--stick-src", opt(argc, argv, "--stick-src", "0"));
+    sc.hard_frac = (float)opt_atof("--hard-frac", opt(argc, argv, "--hard-frac", "0"));   /* (hardspot: > 0 overrides the sources' "hard" frac, < 0 off) */
     if (sc.snap_jitter || sc.edge_boost || sc.vox_cap > 0 || sc.focus_w > 0 || sc.stick) fprintf(stderr, "sampler balance: snap-jitter %d, edge-boost %d, vox-cap %g, focus-w %g, stick-src %d\n", sc.snap_jitter, sc.edge_boost, sc.vox_cap, sc.focus_w, sc.stick);
     sc.echo_keep = split ? 1 : ng;   /* (the windows a step takes; sampler_start holds 2 per window as echo candidates only when the slots spare them) */
     const int ngh = split ? 1 : ng;   /* (batches the trainer holds: one per GPU; --split z: one window on both, 2026-11-14) */
@@ -4420,6 +4421,9 @@ int cmd_train(int argc, char **argv) {
             free(lvc);
             free(cov);
             sampler_hostmem(sq, stderr, 0);
+            for (int s = 0; s < S->n; s++) { uint64_t hs[3]; sampler_hard_stats(sq, s, hs); if (S->src[s].hard && hs[1])
+                fprintf(stderr, "sampler-only: source %-34s hard draws %llu of %llu windows (%.3f); on hard cells %.3f (the other draws alone %.3f)\n", S->src[s].name,
+                        (unsigned long long)hs[0], (unsigned long long)hs[1], (double)hs[0] / (double)hs[1], (double)hs[2] / (double)hs[1], hs[1] > hs[0] ? (double)(hs[2] - hs[0]) / (double)(hs[1] - hs[0]) : NAN); }
             uint64_t prod = 0, rej = 0; sampler_stats(sq, &prod, &rej); fprintf(stderr, "sampler-only: produced %llu rejected %llu\n", (unsigned long long)prod, (unsigned long long)rej); if (sampler_aug_count(sq, AUGN_HIST)) fprintf(stderr, "sampler-only: scanner hist augmentation: %llu windows\n", (unsigned long long)sampler_aug_count(sq, AUGN_HIST));
             { dcache_stats dc; dcache_get_stats(&dc); phase_onfly_stats po; phase_onfly_get_stats(&po);   /* (perf2: how much of the on-the-fly labels the derived cache served) */
               fprintf(stderr, "sampler-only: derived cache %llu cells from memory, %llu from disk (%llu of them from the dense store, %.1f s), %llu computed (%.1f s); onfly phase %llu reads, %llu tiles, %.1f s in the pair rule\n",
@@ -6578,6 +6582,9 @@ int cmd_train(int argc, char **argv) {
     uint64_t why[4]; sampler_reject_reasons(sp, why);
     fprintf(stderr, "done in %.0fs; sampler produced %llu, rejected %llu (coarse probe %llu, after the CT read %llu, empty targets %llu; holdout overlaps %llu)\n",
             now() - t0, (unsigned long long)prod, (unsigned long long)rej, (unsigned long long)why[0], (unsigned long long)why[1], (unsigned long long)why[2], (unsigned long long)why[3]);
+    for (int s = 0; s < S->n; s++) { uint64_t hs[3]; sampler_hard_stats(sp, s, hs); if (S->src[s].hard && hs[1])
+        fprintf(stderr, "hard draws: %s %llu of %llu windows (%.3f); on hard cells %.3f (the other draws alone %.3f)\n", S->src[s].name, (unsigned long long)hs[0], (unsigned long long)hs[1],
+                (double)hs[0] / (double)hs[1], (double)hs[2] / (double)hs[1], hs[1] > hs[0] ? (double)(hs[2] - hs[0]) / (double)(hs[1] - hs[0]) : NAN); }
     if (sc.crush.p > 0) fprintf(stderr, "crush augmentation: %llu crushed windows\n", (unsigned long long)sampler_crushed(sp));
     {   static const char *an[AUGN_N] = {"xscan", "tear", "delam", "sheet-density", "curv", "inclusions", "scanner hist"};
         for (int k = 0; k < AUGN_N; k++) if (sampler_aug_count(sp, k)) fprintf(stderr, "%s augmentation: %llu windows\n", an[k], (unsigned long long)sampler_aug_count(sp, k)); }
