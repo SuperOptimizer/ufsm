@@ -45,7 +45,9 @@ static int isurf_load(isurf *s, const char *dir) {
     char p[1400]; snprintf(p, sizeof p, "%s/meta.json", dir); FILE *f = tfx_meta_fopen(p); if (!f) return -1;
     char m[16384] = {0}; const size_t mn = fread(m, 1, sizeof m - 1, f); (void)mn; fclose(f);
     const char *q = strstr(m, "\"scale\""); if (!q || !(q = strchr(q, '['))) return -1;
-    s->scale = atof(q + 1); q = strstr(m, "\"voxel_size_um\""); s->vox_um = q ? atof(strchr(q, ':') + 1) : 2.399;
+    /* no voxel_size_um in the meta: 0 = unknown (was a silent 2.399, which read the 9.362 um HercUeNet 1203 mesh at x 0.256, 11-26);
+       every user resolves it from --surf-um (or ink-ext's explicit --ct-um) or refuses: ie_surf_um */
+    s->scale = atof(q + 1); q = strstr(m, "\"voxel_size_um\""); s->vox_um = q ? atof(strchr(q, ':') + 1) : 0;
     static const char *nm[3] = {"x", "y", "z"}; float **A[3] = {&s->X, &s->Y, &s->Z};
     for (int k = 0; k < 3; k++) {
         int w, h; snprintf(p, sizeof p, "%s/%s.tif", dir, nm[k]); *A[k] = img_read_f32(p, &w, &h);
@@ -69,9 +71,26 @@ static int isurf_crop(isurf *s, int c0, int r0, int cw, int rh) {
     return 0;
 }
 static void isurf_free(isurf *s) { free(s->X); free(s->Y); free(s->Z); }
+/* the surface's voxel size: --surf-um (overrides the meta), else the meta's voxel_size_um, else (ct_fallback) an explicit --ct-um (the mesh in
+   the CT's level-0 voxels; said aloud), else refuse: -1 with the reason on stderr. No default (lead 11-26). */
+static int ie_surf_um(isurf *s, int argc, char **argv, int ct_fallback, const char *who) {
+    const double su = opt_atof("--surf-um", iopt(argc, argv, "--surf-um", "0"));
+    if (su > 0) { s->vox_um = su; return 0; }
+    if (s->vox_um > 0) return 0;
+    const char *cu = ct_fallback ? iopt(argc, argv, "--ct-um", nullptr) : nullptr;
+    if (cu && atof(cu) > 0) {
+        s->vox_um = atof(cu);
+        fprintf(stderr, "%s: %s: meta.json has no voxel_size_um: surface coordinates taken as --ct-um %.4g um voxels\n", who, s->name, s->vox_um);
+        return 0;
+    }
+    fprintf(stderr, "%s: %s: meta.json has no voxel_size_um: pass --surf-um U (the mesh's voxel size%s); refusing to guess\n", who, s->name,
+            ct_fallback ? ", or --ct-um when it is in the CT's level-0 voxels" : "");
+    return -1;
+}
 /* the valid vertices of a tifxyz / .sfc as z, y, x triples in its own voxels (*vox_um: their size); 0 on success (ink3d-ext --surface) */
-int ie_surface_points(const char *path, float **zyx, size_t *n, double *vox_um) {
+int ie_surface_points(const char *path, float **zyx, size_t *n, double *vox_um, int argc, char **argv) {
     isurf S; if (isurf_load(&S, path)) return -1;
+    if (ie_surf_um(&S, argc, argv, 0, "ink3d-ext")) { isurf_free(&S); return -2; }
     size_t k = 0; float *o = malloc((size_t)S.w * S.h * 3 * sizeof *o);
     if (!o) { isurf_free(&S); return -1; }
     for (size_t i = 0; i < (size_t)S.w * S.h; i++) if (S.Z[i] >= 0) { o[3 * k] = S.Z[i]; o[3 * k + 1] = S.Y[i]; o[3 * k + 2] = S.X[i]; k++; }
@@ -785,7 +804,7 @@ static int raw_mode(int argc, char **argv, ie_net *net, int kind) {
 /* a loaded surface for the run: --surf-um, coordinates in the CT's level-0 voxels (e.g. 9.596 um level-2 wraps of a 2.399 um scan:
    rescaled; S->vox_um, the physical grid spacing, is kept), --grid-crop (c0,r0,cols,rows of the tifxyz grid). 0 ok */
 static int surf_prep(const irun *X, isurf *S, int argc, char **argv, int quiet) {
-    { const double su = opt_atof("--surf-um", iopt(argc, argv, "--surf-um", "0")); if (su > 0) S->vox_um = su; }   /* tifxyz voxel size when its meta has none (default 2.399) */
+    if (ie_surf_um(S, argc, argv, 1, "ink-ext")) return -2;   /* --surf-um / meta / explicit --ct-um, else refuse */
     if (X->nlev) {
         const double f = S->vox_um / X->lev_um[0];
         if (fabs(f - 1) > 0.01) {
@@ -821,6 +840,19 @@ int cmd_ink_ext(int argc, char **argv) {
     const int kind = ie_model_kind(mname); if (kind < 0) { fprintf(stderr, "ink-ext: unknown model %s\n", mname); return 2; }
     /* hecate24 runs MX5 (NVFP4-style fp4) by default: 1667 w013 bench, card 1 exclusive, interleaved x2: net 484 vs 538 s (1.11x), wall
        501 vs 552-602 s; held-out AUC -0.0002 [-0.0009, +0.0004] (DESIGN 2026-11-17). UFSM_XNET_MX=0 keeps fp16 (parity tests). */
+    {   /* refuse before the GPU / weights / CT: a --surface whose meta.json has no voxel_size_um needs --surf-um or an explicit --ct-um */
+        const int given = opt_atof("--surf-um", iopt(argc, argv, "--surf-um", "0")) > 0 || atof(iopt(argc, argv, "--ct-um", "0")) > 0;
+        for (int a = 2; a + 1 < argc && !given; a++) if (!strcmp(argv[a], opt_n("--surface"))) {
+            char p[1400]; snprintf(p, sizeof p, "%s/meta.json", argv[a + 1]); FILE *f = tfx_meta_fopen(p);
+            if (!f) continue;   /* (unreadable: isurf_load reports it) */
+            char m[16384] = {0}; const size_t mn = fread(m, 1, sizeof m - 1, f); (void)mn; fclose(f);
+            if (!strstr(m, "\"voxel_size_um\"")) {
+                fprintf(stderr, "ink-ext: %s: meta.json has no voxel_size_um: pass --surf-um U (the mesh's voxel size), or --ct-um when it is in the CT's "
+                                "level-0 voxels; refusing to guess\n", argv[a + 1]);
+                return 2;
+            }
+        }
+    }
     if (kind == ie_model_kind("hecate24") && !getenv("UFSM_XNET_MX")) { setenv("UFSM_XNET_MX", "5", 1); fprintf(stderr, "ink-ext: hecate24 in MX5 (UFSM_XNET_MX=0: fp16)\n"); }
     if (xnet_init(opt_atoi("--gpu", iopt(argc, argv, "--gpu", "0")))) return 1;
     enum { MAXE = 16 }; ie_net *nets[MAXE]; int nnet = 0;
@@ -942,7 +974,7 @@ surfaces:;
         isurf S;
         if (lonly) { memset(&S, 0, sizeof S); snprintf(S.name, sizeof S.name, "%s", iopt(argc, argv, "--name", "layers")); S.scale = 1; S.vox_um = X.px_um; S.w = S.h = 2; }
         else if (isurf_load(&S, argv[a + 1])) { fprintf(stderr, "ink-ext: cannot read tifxyz %s\n", argv[a + 1]); rc = 1; continue; }
-        if (!lonly && surf_prep(&X, &S, argc, argv, 0)) { fprintf(stderr, "ink-ext: bad --grid-crop\n"); return 2; }
+        { const int sp = lonly ? 0 : surf_prep(&X, &S, argc, argv, 0); if (sp) { if (sp == -1) fprintf(stderr, "ink-ext: bad --grid-crop\n"); return 2; } }
         if (pf) {   /* this surface's chunks (unless queued as the previous one's next), then the next surface's behind them */
             if (a != pf_next) pf_surface(pf, &X, &S);
             pf_next = -1;
@@ -1288,8 +1320,9 @@ int cmd_tifxyz_bbox(int argc, char **argv) {
    voxel size and winding; bbox / area recomputed by tifxyz_write). --px 1: the window in render pixels (render --scale 1: grid x step)
    instead of grid vertices, e.g. a crop picked on a wrap render or an ink-ext map. */
 int cmd_tifxyz_crop(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: ufsm tifxyz-crop <tifxyz|wNNN.sfc> <out-dir> c0,r0,cols,rows [--px 1]\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: ufsm tifxyz-crop <tifxyz|wNNN.sfc> <out-dir> c0,r0,cols,rows [--px 1] [--surf-um U (meta without voxel_size_um)]\n"); return 2; }
     isurf S; if (isurf_load(&S, argv[2])) { fprintf(stderr, "tifxyz-crop: cannot read %s\n", argv[2]); return 1; }
+    if (ie_surf_um(&S, argc, argv, 0, "tifxyz-crop")) { isurf_free(&S); return 2; }   /* (the crop's meta carries it on: no unknown 0 / guessed 2.399) */
     double c[4]; if (sscanf(argv[4], "%lf,%lf,%lf,%lf", c, c + 1, c + 2, c + 3) != 4 || c[2] <= 0 || c[3] <= 0) { fprintf(stderr, "tifxyz-crop: window c0,r0,cols,rows\n"); return 2; }
     if (opt_atoi("--px", iopt(argc, argv, "--px", "0"))) for (int k = 0; k < 4; k++) c[k] *= S.scale;   /* render px -> grid vertices */
     const int c0 = (int)floor(c[0]), r0 = (int)floor(c[1]), cw = (int)ceil(c[0] + c[2]) - c0 + 1, rh = (int)ceil(c[1] + c[3]) - r0 + 1;
