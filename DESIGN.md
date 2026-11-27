@@ -6,6 +6,29 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
+
+- Why: under -std=c23, phasecmp.c called floor / ceil / llround without <math.h> (fixed in b32c16ca). mcc took them as int f()
+  and gave no diagnostic. The doubles came back as garbage, so every mapped box collapsed to 0,0,0.
+- Now under -std=c99 and later these are errors (file:line, the name, and the header for about 200 libc functions):
+  - a call to an undeclared function, or to an unknown __builtin_X;
+  - a declaration without a type specifier;
+  - a K&R parameter without its declaration (C23 rejects K&R identifier lists outright).
+- Opt-in switches bring the old rules back, each use still warned: -fpermissive, -Wno-error=implicit-function-declaration,
+  -Wno-error=implicit-int. C89 mode warns. C++ / CUDA already rejected undeclared calls; MCC_IMPLICIT_CXX now warns.
+- microc tests: tests/cerr.sh, 15 cases.
+- The pin is edfc7a3 (tag ufsm-pin-20261127): 01873d0 plus only the fix (cherry-pick of main's 0cde866).
+- Codegen: all 132 .cu units have byte-identical PTX against 01873d0 (--ptx-out over the release command lines). Host .c objects
+  differ only in debug info.
+- ufsm master builds clean under it, and mcc -fsyntax-only finds nothing in tests/*.c (307 files).
+- Not in the pin, left for their own GPU A/B (production widths, >= 3 runs per arm): the 10 microc main commits 01873d0..92ce831.
+  - Those with code: fd1473f (partial jump threading by a phi of constants), 728649b / 24aa19e / 603479b ("moves before a
+    branch", v1 and v2).
+  - The note commit 4178a6b, which flags 285d308 (the vectoriser's double-width lanes) as "landed on main by mistake".
+  - The merges 26fd525 (jitpin), 7989bd1 (csetdev), 086574d (f4pdev), ce9ba2f (mvexit) and 92ce831 (mvpin).
+  - Their PTX differs from the pin in 117 of the 132 units (every lp_*, most nn_*).
+  - 285d308 itself has been in the pin since before 01873d0 (an ancestor). Only the note asking for its review is outside.
+
 ## Two-level pair rule for the 2.4 um labels (option 3) and the w24 trainer memory fixes (2026-11-27, branch opt3-20261127, unrollperf)
 
 **Pair rule.** At rmax 160 the level-0 rule needs a 162-voxel halo: a 3072 MB tile (edge 588) keeps only a 264^3 interior.
