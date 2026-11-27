@@ -329,6 +329,7 @@ void nn_lat_place_rv(const void *lg, int lh16, int d, int h, int w, const uint8_
    before on the same stream) with the jitter into ct16. Device scratch: nn_aug_device_bytes(P) (one P^3 byte staging buffer). */
 void nn_aug_ct(const uint8_t *ct8_h, const void *rec_h, const void *rad_d, int P, void *ct16, int on_copy_stream);
 size_t nn_aug_device_bytes(int P);
+void nn_aug_fourier_reserve(int P, int K);   /* SA_FOURIER on (band half-size K at P): nn_aug_device_bytes includes its buffers (0: off) */
 /* split windows (one window's z halves on two GPUs): the collectives nn_aug_ct_z calls, both ranks at the same points (the shared plan
    decides them). xchg: with rank peer, send ns bytes from send_d and receive nr bytes into recv_d (device pointers; either size may be
    0: a one-way carry), complete on stream when it returns. sum: n device values (type 0 u64, 1 f64, 2 u32) summed in place across the

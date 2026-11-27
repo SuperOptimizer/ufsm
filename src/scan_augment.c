@@ -10,7 +10,7 @@
 #endif
 
 const char *const scan_aug_names[SA_N] = {"seam", "air", "lowres", "blur", "sharpen", "bias", "ring", "cupping", "slice",
-                                          "noise", "cnoise", "tone", "quant", "dropslice", "cutout", "chunk", "paganin", "gin", "hist", "motion"};
+                                          "noise", "cnoise", "tone", "quant", "dropslice", "cutout", "chunk", "paganin", "gin", "hist", "motion", "fourier"};
 #include <stdio.h>
 int scan_aug_load_hist(const char *path, scan_aug_cfg *c) {
     FILE *f = fopen(path, "r"); if (!f) return -1;
@@ -352,8 +352,18 @@ unsigned scan_aug_plan(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8
     const size_t P2 = (size_t)P * P, p3 = P2 * P;
     uint64_t rs = seed;
     unsigned on = 0;
-    for (int i = 0; i < SA_N; i++) if (c->p[i] > 0 && uniform(&rs) < c->p[i]) on |= 1u << i;
+    for (int i = 0; i < SA_N; i++) if (i != SA_FOURIER && c->p[i] > 0 && uniform(&rs) < c->p[i]) on |= 1u << i;
     if (!allow_seam) on &= ~(1u << SA_SEAM);
+    uint64_t fs = seed ^ UINT64_C(0xf0a1e2b3c4d5e6f7);   /* SA_FOURIER: its own stream (the other ops draw as without it) */
+    if (c->p[SA_FOURIER] > 0 && uniform(&fs) < c->p[SA_FOURIER]) {
+        const double cut = c->fourier_cut > 0 ? c->fourier_cut : SA_FOURIER_CUT, cI = fmin(cut * P, SA_FOURIER_KMAX + 1.0), S4 = SO(SA_FOURIER);
+        const int K = (int)floor(cI) < SA_FOURIER_KMAX ? (int)floor(cI) : SA_FOURIER_KMAX;
+        if (K >= 1 && K < P / 2) {
+            on |= 1u << SA_FOURIER; p->four_K = K; p->four_cut = (float)cI;
+            for (int j = 0; j < 3; j++) p->four_a[j] = (float)(.7 * S4 * sym1(&fs));
+            p->four_b = (float)(.35 * S4 * sym1(&fs));
+        }
+    }
     p->on = on;
     if (!on) return 0;
     p->ns = seed ^ UINT64_C(0x5ca1ab1e0ddba11);
@@ -544,6 +554,57 @@ void scan_plan_notair(const scan_plan *p, uint8_t *restrict ctu, uint8_t *restri
         for (int z = b0[0]; z < b1[0]; z++) for (int y = b0[1]; y < b1[1]; y++) memset(ctu + z * P2 + (size_t)y * P + b0[2], 0, b1[2] - b0[2]);
     }
 }
+/* SA_FOURIER on the float CT (scan_augment.h): the band's DFT coefficients X(k) = sum_r f(r) e^{-2 pi i k.r / P} (air voxels read as the
+   material mean) for |k_d| <= K, kx >= 0 (real input: the kx < 0 half is the conjugate), separably x, y, z one plane at a time; D = X (m - 1);
+   f += P^-3 sum_k c_kx Re(D e^{+2 pi i k.r / P}) (c 1 at kx 0, else 2). Double precision, angles from (k r mod P): the device's reference */
+static void fourier_ref(const scan_plan *p, float *F, const uint8_t *Z) {
+    const int P = p->P, K = p->four_K, NK = K + 1, NY = 2 * K + 1; const size_t P2 = (size_t)P * P;
+    const double mean = p->mean;
+    double *cs = malloc(2 * (size_t)P * sizeof *cs), *X = calloc((size_t)NY * NY * NK * 2, sizeof *X), *rx = malloc((size_t)P * NK * 2 * sizeof *rx),
+           *ry = malloc((size_t)NY * NK * 2 * sizeof *ry), *row = malloc((size_t)P * sizeof *row);
+    if (!cs || !X || !rx || !ry || !row) abort();
+    double *sn = cs + P;
+    for (int m = 0; m < P; m++) { cs[m] = cos(2 * M_PI * m / P); sn[m] = sin(2 * M_PI * m / P); }
+#define FMOD(a) ((int)((((long)(a)) % P + P) % P))
+    for (int z = 0; z < P; z++) {
+        for (int y = 0; y < P; y++) {
+            const float *f = F + z * P2 + (size_t)y * P; const uint8_t *zr = Z + z * P2 + (size_t)y * P;
+            for (int x = 0; x < P; x++) row[x] = zr[x] ? mean : f[x];
+            for (int kx = 0; kx < NK; kx++) { double re = 0, im = 0; for (int x = 0; x < P; x++) { const int m = FMOD((long)kx * x); re += row[x] * cs[m]; im -= row[x] * sn[m]; }
+                rx[((size_t)y * NK + kx) * 2] = re; rx[((size_t)y * NK + kx) * 2 + 1] = im; }
+        }
+        for (int a = 0; a < NY; a++) for (int kx = 0; kx < NK; kx++) {
+            double re = 0, im = 0; const int ky = a - K;
+            for (int y = 0; y < P; y++) { const int m = FMOD((long)ky * y); const double c = cs[m], s = -sn[m], u = rx[((size_t)y * NK + kx) * 2], v = rx[((size_t)y * NK + kx) * 2 + 1];
+                re += u * c - v * s; im += u * s + v * c; }
+            ry[((size_t)a * NK + kx) * 2] = re; ry[((size_t)a * NK + kx) * 2 + 1] = im;
+        }
+        for (int b = 0; b < NY; b++) { const int m = FMOD((long)(b - K) * z); const double c = cs[m], s = -sn[m];
+            for (int a = 0; a < NY; a++) for (int kx = 0; kx < NK; kx++) { const double u = ry[((size_t)a * NK + kx) * 2], v = ry[((size_t)a * NK + kx) * 2 + 1];
+                double *x = X + (((size_t)b * NY + a) * NK + kx) * 2; x[0] += u * c - v * s; x[1] += u * s + v * c; } }
+    }
+    for (int b = 0; b < NY; b++) for (int a = 0; a < NY; a++) for (int kx = 0; kx < NK; kx++) {
+        double *x = X + (((size_t)b * NY + a) * NK + kx) * 2; const double g = (double)scan_fourier_gain(p, b - K, a - K, kx) - 1;
+        x[0] *= g; x[1] *= g;
+    }
+    const double s3 = 1.0 / ((double)P * P2);
+    for (int z = 0; z < P; z++) {
+        for (int a = 0; a < NY; a++) for (int kx = 0; kx < NK; kx++) {   /* ry = the plane's sum over kz */
+            double re = 0, im = 0;
+            for (int b = 0; b < NY; b++) { const int m = FMOD((long)(b - K) * z); const double *x = X + (((size_t)b * NY + a) * NK + kx) * 2; re += x[0] * cs[m] - x[1] * sn[m]; im += x[0] * sn[m] + x[1] * cs[m]; }
+            ry[((size_t)a * NK + kx) * 2] = re; ry[((size_t)a * NK + kx) * 2 + 1] = im;
+        }
+        for (int y = 0; y < P; y++) {
+            for (int kx = 0; kx < NK; kx++) { double re = 0, im = 0;
+                for (int a = 0; a < NY; a++) { const int m = FMOD((long)(a - K) * y); const double u = ry[((size_t)a * NK + kx) * 2], v = ry[((size_t)a * NK + kx) * 2 + 1]; re += u * cs[m] - v * sn[m]; im += u * sn[m] + v * cs[m]; }
+                rx[kx * 2] = re * (kx ? 2 : 1) * s3; rx[kx * 2 + 1] = im * (kx ? 2 : 1) * s3; }
+            float *f = F + z * P2 + (size_t)y * P;
+            for (int x = 0; x < P; x++) { double d = 0; for (int kx = 0; kx < NK; kx++) { const int m = FMOD((long)kx * x); d += rx[kx * 2] * cs[m] - rx[kx * 2 + 1] * sn[m]; } f[x] = (float)(f[x] + d); }
+        }
+    }
+#undef FMOD
+    free(cs); free(X); free(rx); free(ry); free(row);
+}
 void scan_aug_exec(const scan_plan *p, uint8_t *ctu, void *scratch) {
     const unsigned on = p->on;
     if (!on) return;
@@ -566,6 +627,7 @@ void scan_aug_exec(const scan_plan *p, uint8_t *ctu, void *scratch) {
     if (on & 1u << SA_AIR) { const float level = p->air_level; for (size_t k = 0; k < p3; k++) if (Z[k]) { F[k] = level; Z[k] = 0; } }
     if (p->bop_on[0]) bop_apply(F, P, 0, &p->bop[0], tmp);
     bop_apply_yx(F, P, p->bop_on[1] ? &p->bop[1] : nullptr, p->bop_on[2] ? &p->bop[2] : nullptr, tmp);
+    if (on & 1u << SA_FOURIER) fourier_ref(p, F, Z);
     if (on & 1u << SA_BIAS) {   /* smooth multiplicative field: exp(N(0, b)) on a 3..5 grid, linearly interpolated */
         const int g = p->bias_g; const float *G = p->bias_G;
         int *ix = malloc(P * sizeof *ix); float *wx = malloc(P * sizeof *wx), crow[5]; if (!ix || !wx) abort();

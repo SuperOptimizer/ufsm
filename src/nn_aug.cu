@@ -29,7 +29,9 @@ typedef struct {
     cudaEvent_t done; int used;       /* the last window's work (the staging buffer is shared by both streams' calls) */
     void *fw; size_t fw_n;            /* the scanner's work volume when the CT channel's planes do not hold it (narrow z ranges) */
     const void *key; int ks0, ks1;  /* key: the host plane whose source planes [ks0, ks1) the staging buffer holds unchanged */
+    double *fX; float2 *fD, *fR, *ftw; float *fW, *fV; int fP, fK; size_t fR_n;   /* SA_FOURIER: the band, its change, a chunk's y / z partials, tables */
 } aug_dev;
+static size_t g_four_resv;   /* SA_FOURIER: the bytes nn_aug_device_bytes adds (nn_aug_fourier_reserve) */
 static aug_dev g_ad[16];   /* per device, two slots (nn_zcomm.slot: two ranks on one device in the tests) */
 static int lw_keyed(const aug_dev *a, const void *h, int s0, int s1) { return a->key == h && a->ks0 == s0 && a->ks1 == s1; }
 static void lw_setkey(aug_dev *a, const void *h, int s0, int s1) { a->key = h; a->ks0 = s0; a->ks1 = s1; }
@@ -552,7 +554,7 @@ static aug_dev *aug_get(int P, size_t sb, int slot = 0) {   /* sb: the staging b
     return a;
 }
 extern "C" void nn_aug_cnoise_chunk(int nz) { g_cn_z = nz; }
-extern "C" size_t nn_aug_device_bytes(int P) { const size_t p3 = (size_t)P * P * P, p2 = (size_t)P * P, zc = AUG_CN_BYTES / (p2 * 4) < 1 ? 1 : AUG_CN_BYTES / (p2 * 4); return p3 + 4 * p2 * 4 + (zc < (size_t)P ? zc : (size_t)P) * p2 * 4 + sizeof(scan_plan) + sizeof(scan_ct_rec) + 65536 * 4 + 8192; }
+extern "C" size_t nn_aug_device_bytes(int P) { const size_t p3 = (size_t)P * P * P, p2 = (size_t)P * P, zc = AUG_CN_BYTES / (p2 * 4) < 1 ? 1 : AUG_CN_BYTES / (p2 * 4); return p3 + 4 * p2 * 4 + (zc < (size_t)P ? zc : (size_t)P) * p2 * 4 + sizeof(scan_plan) + sizeof(scan_ct_rec) + 65536 * 4 + 8192 + g_four_resv; }
 extern "C" size_t nn_label_warp_device_bytes(int P) { return (size_t)P * P * P + 2048; }   /* --gpu-aug 2: the second P^3 of staging, the tables */
 /* nn_aug_ct_z: the staging of ns source planes, the work volume when a rank's planes plus 2 halo planes pass its nz output planes */
 extern "C" size_t nn_aug_device_bytes_z(int P, int ns, int nz, int halo) {
@@ -561,6 +563,110 @@ extern "C" size_t nn_aug_device_bytes_z(int P, int ns, int nz, int halo) {
 }
 /* the z-range builders' staging: 2 ns P^2 (ns: the most source planes s1 - s0 of a call) and the tables */
 extern "C" size_t nn_label_warp_device_bytes_z(int P, int ns) { return 2 * (size_t)ns * P * P + 2048; }
+
+/* ---- SA_FOURIER (scan_augment.h; the host reference scan_augment.c fourier_ref): the band's DFT by plane chunks (x as a GEMM against the
+   twiddle matrix, then y, then z accumulated in double), the gain, and the inverse (z, y, then x as a GEMM added into F). NK = K + 1
+   (kx >= 0), NY = 2 K + 1; the twiddles e^{2 pi i m / P} at m = k r mod P ---- */
+__global__ void four_tab_k(int P, int K, float2 *tw, float *W, float *V) {   /* tw[P]; W[P][2 NK] (cos, -sin); V[2 NK][P] (c_k cos, -c_k sin) / P^3 */
+    const int NK = K + 1; const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const double s3 = 1.0 / ((double)P * P * P);
+    if (i < (size_t)P) { double sn, cs; sincospi(2.0 * (double)i / P, &sn, &cs); tw[i] = make_float2((float)cs, (float)sn); }
+    if (i < (size_t)P * NK) {
+        const int x = (int)(i / NK), k = (int)(i % NK), m = (int)(((long long)k * x) % P); double sn, cs; sincospi(2.0 * (double)m / P, &sn, &cs);
+        W[(size_t)x * 2 * NK + 2 * k] = (float)cs; W[(size_t)x * 2 * NK + 2 * k + 1] = (float)-sn;
+        const double c = (k ? 2.0 : 1.0) * s3;
+        V[(size_t)(2 * k) * P + x] = (float)(c * cs); V[(size_t)(2 * k + 1) * P + x] = (float)(-c * sn);
+    }
+}
+/* C[M x N] = A[M x Kd] B[Kd x N], 64 x 32 tiles, 256 threads, 2 x 4 outputs each. MODE 0: A = the window's rows F[a0 + r P + k] (16-bit,
+   Kd = P; air voxels read as mean), C stored (ldc N). MODE 1: A float (lda Kd), C added into F[a0 + r P + n] (N = P) */
+template <int MODE> __global__ void four_gemm_k(const void *A_, const float *B, float *C, __half *F, int M, int N, int Kd, const uint8_t *in, int air, float mean, size_t a0) {
+    __shared__ float As[32][68]; __shared__ float Bs[32][36];
+    const int tid = threadIdx.x, ty = tid >> 3, tx = tid & 7, m0 = blockIdx.y * 64, n0 = blockIdx.x * 32;
+    float acc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+    for (int k0 = 0; k0 < Kd; k0 += 32) {
+        for (int i = 0; i < 8; i++) {
+            const int idx = tid + i * 256, r = idx >> 5, kk = idx & 31, gr = m0 + r, gk = k0 + kk; float v = 0;
+            if (gr < M && gk < Kd) {
+                if (MODE == 0) { const size_t k = a0 + (size_t)gr * Kd + gk; v = air && !in[k] ? mean : h2f(((const __half *)A_)[k]); }
+                else v = ((const float *)A_)[(size_t)gr * Kd + gk];
+            }
+            As[kk][r] = v;
+        }
+        for (int i = 0; i < 4; i++) { const int idx = tid + i * 256, kk = idx >> 5, c = idx & 31, gk = k0 + kk, gc = n0 + c; Bs[kk][c] = gk < Kd && gc < N ? B[(size_t)gk * N + gc] : 0.f; }
+        __syncthreads();
+        const int kn = Kd - k0 < 32 ? Kd - k0 : 32;
+        for (int kk = 0; kk < kn; kk++) {
+            const float x0 = As[kk][ty], x1 = As[kk][ty + 32];
+            for (int j = 0; j < 4; j++) { const float b = Bs[kk][tx * 4 + j]; acc[0][j] += x0 * b; acc[1][j] += x1 * b; }
+        }
+        __syncthreads();
+    }
+    for (int u = 0; u < 2; u++) { const int gr = m0 + ty + 32 * u; if (gr >= M) continue;
+        for (int j = 0; j < 4; j++) { const int gc = n0 + tx * 4 + j; if (gc >= N) continue;
+            if (MODE == 0) C[(size_t)gr * N + gc] = acc[u][j];
+            else { __half *f = F + a0 + (size_t)gr * N + gc; *f = f2h(h2f(*f) + acc[u][j]); } } }
+}
+static __device__ __forceinline__ int fmodp(int a, int P) { const int m = a % P; return m < 0 ? m + P : m; }
+static __device__ __forceinline__ float2 cmul(float2 a, float2 b) { return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+/* forward y over a chunk: R[zl][a][kx] = sum_y Rx[zl][y][kx] e^{-i ky y} (Rx: the x GEMM's (re, im) rows) */
+__global__ void four_fy_k(const float2 *Rx, float2 *R, const float2 *tw, int P, int K, int nzc) {
+    const int NK = K + 1, NY = 2 * K + 1; const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)nzc * NY * NK) return;
+    const int kx = (int)(i % NK), a = (int)(i / NK % NY), zl = (int)(i / ((size_t)NK * NY)), ky = a - K;
+    float2 s = make_float2(0, 0); const float2 *r = Rx + (size_t)zl * P * NK + kx;
+    for (int y = 0; y < P; y++) { float2 w = tw[fmodp(ky * y, P)]; w.y = -w.y; const float2 t = cmul(r[(size_t)y * NK], w); s.x += t.x; s.y += t.y; }
+    R[i] = s;
+}
+/* forward z: X[b][a][kx] += sum over the chunk's planes z0 + zl of R e^{-i kz z} (double) */
+__global__ void four_fz_k(const float2 *R, double *X, const float2 *tw, int P, int K, int z0, int nzc) {
+    const int NK = K + 1, NY = 2 * K + 1; const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x, nb = (size_t)NY * NK;
+    if (i >= (size_t)NY * nb) return;
+    const int kz = (int)(i / nb) - K; const size_t j = i % nb;
+    double re = 0, im = 0;
+    for (int zl = 0; zl < nzc; zl++) { float2 w = tw[fmodp(kz * (z0 + zl), P)]; w.y = -w.y; const float2 r = R[(size_t)zl * nb + j];
+        re += (double)r.x * w.x - (double)r.y * w.y; im += (double)r.x * w.y + (double)r.y * w.x; }
+    X[2 * i] += re; X[2 * i + 1] += im;
+}
+__global__ void four_gain_k(const double *X, float2 *D, const scan_plan *p, int K) {   /* D = X (m - 1) */
+    const int NK = K + 1, NY = 2 * K + 1; const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)NY * NY * NK) return;
+    const int kx = (int)(i % NK), a = (int)(i / NK % NY), b = (int)(i / ((size_t)NK * NY));
+    const double g = (double)scan_fourier_gain(p, b - K, a - K, kx) - 1;
+    D[i] = make_float2((float)(X[2 * i] * g), (float)(X[2 * i + 1] * g));
+}
+/* inverse z: R[zl][a][kx] = sum_b D[b][a][kx] e^{+i kz z} */
+__global__ void four_iz_k(const float2 *D, float2 *R, const float2 *tw, int P, int K, int z0, int nzc) {
+    const int NK = K + 1, NY = 2 * K + 1; const size_t nb = (size_t)NY * NK, i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)nzc * nb) return;
+    const int zl = (int)(i / nb); const size_t j = i % nb; float2 s = make_float2(0, 0);
+    for (int b = 0; b < NY; b++) { const float2 t = cmul(D[(size_t)b * nb + j], tw[fmodp((b - K) * (z0 + zl), P)]); s.x += t.x; s.y += t.y; }
+    R[i] = s;
+}
+/* inverse y: Dy[zl][y][kx] = sum_a R[zl][a][kx] e^{+i ky y} (the x GEMM's A rows) */
+__global__ void four_iy_k(const float2 *R, float2 *Dy, const float2 *tw, int P, int K, int nzc) {
+    const int NK = K + 1, NY = 2 * K + 1; const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= (size_t)nzc * P * NK) return;
+    const int kx = (int)(i % NK), y = (int)(i / NK % P), zl = (int)(i / ((size_t)NK * P));
+    const float2 *r = R + (size_t)zl * NY * NK + kx; float2 s = make_float2(0, 0);
+    for (int a = 0; a < NY; a++) { const float2 t = cmul(r[(size_t)a * NK], tw[fmodp((a - K) * y, P)]); s.x += t.x; s.y += t.y; }
+    Dy[i] = s;
+}
+static size_t four_chunk(const aug_dev *a, int P, int K) { return a->cn_n / ((size_t)P * (K + 1) * 2); }   /* planes of Rx / Dy in a->cn */
+static size_t four_bytes(int P, int K, size_t nzc) {
+    const size_t NK = K + 1, NY = 2 * K + 1;
+    return NY * NY * NK * (16 + 8) + nzc * NY * NK * 8 + (size_t)P * 8 + (size_t)P * NK * 2 * 4 * 2 + 4096;
+}
+static void four_get(aug_dev *a, int P, int K) {
+    const size_t NK = K + 1, NY = 2 * K + 1, nzc = four_chunk(a, P, K) < (size_t)P ? four_chunk(a, P, K) : (size_t)P;
+    if (a->fP == P && a->fK == K && a->fR_n >= nzc * NY * NK) return;
+    if (a->fX) { CK(cudaDeviceSynchronize()); cudaFree(a->fX); cudaFree(a->fD); cudaFree(a->fR); cudaFree(a->ftw); cudaFree(a->fW); cudaFree(a->fV); }
+    CK(cudaMalloc(&a->fX, NY * NY * NK * 16)); CK(cudaMalloc(&a->fD, NY * NY * NK * 8)); CK(cudaMalloc(&a->fR, nzc * NY * NK * 8));
+    CK(cudaMalloc(&a->ftw, (size_t)P * 8)); CK(cudaMalloc(&a->fW, (size_t)P * NK * 2 * 4)); CK(cudaMalloc(&a->fV, (size_t)P * NK * 2 * 4));
+    four_tab_k<<<nblk((size_t)P * NK, 256), 256>>>(P, K, a->ftw, a->fW, a->fV); KCHECK(); CK(cudaDeviceSynchronize());
+    a->fP = P; a->fK = K; a->fR_n = nzc * NY * NK;
+}
+extern "C" void nn_aug_fourier_reserve(int P, int K) { g_four_resv = K > 0 ? four_bytes(P, K, (size_t)P) : 0; }
 
 /* ---- the scanner ops of a plan on F (16-bit, the input bytes loaded) over the source planes [oa, ob) of the window, stream s. F and
    in (the staged bytes) are virtual whole-window pointers: valid for the planes the caller staged (owned planes plus the halo h on F).
@@ -604,6 +710,27 @@ static void aug_scan(aug_dev *a, const scan_plan *p, int P, __half *F, uint8_t *
         const size_t rb = k0 / P, re = k1 / P;
         if (g_bop_line) { aug_bop_uniq_k<<<1, 1, 0, s>>>(&pd->bop[2], P, a->uw, a->ui, a->nu); aug_bop_xu_k<<<nblk(re - rb, R), 256, (size_t)R * P * 2, s>>>(F, &pd->bop[2], P, R, a->uw, a->ui, a->nu, rb, re); }
         else aug_bop_x_k<<<(unsigned)(re - rb), 128, (size_t)P * 4, s>>>(F, &pd->bop[2], P, rb);
+    }
+    if (on & 1u << SA_FOURIER) {   /* (the air rule: scan_aug_exec's Z at this point, the input's zeros unless SA_AIR) */
+        const int K = p->four_K, NK = K + 1, NY = 2 * K + 1; four_get(a, P, K);
+        const size_t nzm = four_chunk(a, P, K) < (size_t)P ? four_chunk(a, P, K) : (size_t)P, nx = (size_t)NY * NY * NK;
+        if (nzm < 1) { fprintf(stderr, "nn_aug: the fourier op's chunk holds no plane (P %d, K %d)\n", P, K); abort(); }
+        float2 *Rx = (float2 *)a->cn; const int air = !(on & 1u << SA_AIR);
+        CK(cudaMemsetAsync(a->fX, 0, nx * 16, s));
+        for (int z = oa; z < ob; z += (int)nzm) {
+            const int nzc = z + (int)nzm < ob ? (int)nzm : ob - z; const int M = nzc * P;
+            four_gemm_k<0><<<dim3(nblk(2 * NK, 32), nblk(M, 64)), 256, 0, s>>>(F, a->fW, (float *)Rx, nullptr, M, 2 * NK, P, in, air, (float)p->mean, (size_t)z * P2);
+            four_fy_k<<<nblk((size_t)nzc * NY * NK, 128), 128, 0, s>>>(Rx, a->fR, a->ftw, P, K, nzc);
+            four_fz_k<<<nblk(nx, 128), 128, 0, s>>>(a->fR, a->fX, a->ftw, P, K, z, nzc);
+        }
+        zc_sum(zc, a->fX, (int)(2 * nx), 1, s);
+        four_gain_k<<<nblk(nx, 128), 128, 0, s>>>(a->fX, a->fD, pd, K);
+        for (int z = oa; z < ob; z += (int)nzm) {
+            const int nzc = z + (int)nzm < ob ? (int)nzm : ob - z; const int M = nzc * P;
+            four_iz_k<<<nblk((size_t)nzc * NY * NK, 128), 128, 0, s>>>(a->fD, a->fR, a->ftw, P, K, z, nzc);
+            four_iy_k<<<nblk((size_t)M * NK, 128), 128, 0, s>>>(a->fR, Rx, a->ftw, P, K, nzc);
+            four_gemm_k<1><<<dim3(nblk(P, 32), nblk(M, 64)), 256, 0, s>>>(Rx, a->fV, nullptr, F, M, P, 2 * NK, nullptr, 0, 0.f, (size_t)z * P2);
+        }
     }
     nn_ptick_fine("      y load + blur ops");
     if (on & 1u << SA_BIAS) aug_point_k<<<nb, 256, 0, s>>>(F, pd, P, 0, k0, k1);

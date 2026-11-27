@@ -5,11 +5,12 @@
    seam shifts CT, labels, ignore and the axis together; dropped slices / cutouts are ignored when drop_ignore; voxels
    the op zeroes (chunk dropouts, simulated air masking) lose supervision through the CT > 0 mask. */
 #pragma once
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
 enum { SA_SEAM, SA_AIR, SA_LOWRES, SA_BLUR, SA_SHARPEN, SA_BIAS, SA_RING, SA_CUPPING, SA_SLICE, SA_NOISE, SA_CNOISE,
-       SA_TONE, SA_QUANT, SA_DROPSLICE, SA_CUTOUT, SA_CHUNK, SA_PAGANIN, SA_GIN, SA_HIST, SA_MOTION, SA_N };
+       SA_TONE, SA_QUANT, SA_DROPSLICE, SA_CUTOUT, SA_CHUNK, SA_PAGANIN, SA_GIN, SA_HIST, SA_MOTION, SA_FOURIER, SA_N };
 extern const char *const scan_aug_names[SA_N];
 
 typedef struct {
@@ -18,7 +19,18 @@ typedef struct {
     int drop_ignore;  /* 1: dropped slices and cutouts are unsupervised (else the label stays and the net must infer it) */
     float s[SA_N];    /* per-op magnitude scale overriding strength (0: strength) */
     const float *hist; int nhist;   /* SA_HIST: nhist target material CDFs of 256 values each (scan_aug_load_hist) */
+    float fourier_cut;              /* SA_FOURIER: the band edge in cycles per voxel (0: SA_FOURIER_CUT) */
 } scan_aug_cfg;
+/* SA_FOURIER (inkaug 11-27, scanner style without touching the ink band): the window's 3-D DFT amplitude scaled below a cutoff, phase
+   kept. The DFT coefficients k (integer cycles per window, |k_d| <= K = floor(cut P)) with 0 < |k| < cut P are multiplied by a real,
+   positive, even gain m(k) = exp(g(|k| / (cut P)) + b (3 k_z^2 / |k|^2 - 1)), g piecewise linear through knots a0..a2 at r = 0, 1/3, 2/3
+   and 0 at r = 1 (continuous at the edge), b an anisotropy between the scan axis and the slice plane; every other coefficient (DC, the
+   band above the cut) is unchanged. Air voxels read as the material mean during the transform (the papyrus / air step would dominate
+   the low band). Magnitudes a ~ U(-.7, .7) s, b ~ U(-.35, .35) s. The op draws from its own stream (seed-derived), so turning it on
+   leaves every other op's draws unchanged (paired A/B arms). CPU: the reference in double (scan_aug_exec, ~P^3 K MACs: tests); train
+   runs it on the device (--gpu-aug, src/nn_aug.cu) */
+#define SA_FOURIER_CUT .03f
+#define SA_FOURIER_KMAX 48
 /* SA_PAGANIN: phase-retrieval-like low-pass, per axis the two-sided exponential exp(-|t| / lambda) (transfer 1 / (1 + c f^2), the
    Paganin form), lambda (0.4 .. 1.6) s voxels. SA_GIN: a random shallow conv net on the CT (1..3 voxel kernels, 2..4 positive-biased
    channels, leaky ReLU), rescaled to the window's material mean / sd and blended in (alpha 0.3 .. 1). SA_HIST: the window's material
@@ -70,7 +82,19 @@ typedef struct {
     int nchunk, chunk_b0[SA_MAXBOX][3], chunk_b1[SA_MAXBOX][3];   /* SA_CHUNK: boxes that read as air */
     int hist_on; double hist_alpha; float hist_ct[256];          /* SA_HIST: the target CDF */
     uint64_t ns;                        /* the per-voxel noise stream's seed (noise, cnoise, dropped slices, noisy cutouts, in that order) */
+    int four_K; float four_cut, four_a[3], four_b;   /* SA_FOURIER: index box half-size, band edge (index units), knots, anisotropy */
 } scan_plan;
+/* SA_FOURIER's gain at integer frequency (kz, ky, kx): 1 outside the band and at DC */
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+static inline float scan_fourier_gain(const scan_plan *p, int kz, int ky, int kx) {
+    const float k2 = (float)(kz * kz + ky * ky + kx * kx), c = p->four_cut;
+    if (k2 <= 0 || k2 >= c * c) return 1.f;
+    const float r = sqrtf(k2) / c * 3.f; const int j = r < 1 ? 0 : r < 2 ? 1 : 2; const float t = r - (float)j;
+    const float a0 = p->four_a[j], a1 = j < 2 ? p->four_a[j + 1] : 0.f;
+    return expf(a0 + t * (a1 - a0) + p->four_b * (3.f * (float)(kz * kz) / k2 - 1.f));
+}
 unsigned scan_aug_plan(const scan_aug_cfg *c, uint64_t seed, uint8_t *ctu, uint8_t *tgt, int nch, uint8_t *ign, int P,
                        const int64_t o[3], float *cy, float *cx, int hasax, const int chunk[3], int allow_seam, scan_plan *p);
 void scan_aug_exec(const scan_plan *p, uint8_t *ctu, void *scratch);   /* scratch: 5 P^3 bytes */

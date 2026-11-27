@@ -145,6 +145,7 @@ int cmd_ink_runs(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach_up(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_devcrops(int argc, char **argv);   /* src/inksplat.c */
+int cmd_ink_augaudit(int argc, char **argv);   /* src/inkaugaudit.c */
 int cmd_ink_place(int argc, char **argv);   /* src/inkplace.c */
 int cmd_ink_find(int argc, char **argv);   /* src/inkplace.c */
 int cmd_obj_tifxyz(int argc, char **argv);   /* src/inkplace.c */
@@ -233,6 +234,7 @@ static int usage(void) {
         "  ufsm ink-runs LABELS.tif [--mask M] [--px-um U] [--row TAG]   ink stroke width quartiles (min of the row / column run per ink px)\n"
         "  ufsm ink-teach --segs SEGS --teacher NAME=MAP%%s .. --out DIR   2D teacher maps -> calibrated, gated soft ink label windows (on-the-fly ink)\n"
         "  ufsm ink-teach-up SEGS-TEACH.json OUT [--up 2]   ink-teach windows at label_scale / up (p bilinear in the mask, mask nearest)\n"
+        "  ufsm ink-augaudit --crops DIR --out TSV   do the scanner augmentations erase the ink signal? (per op: high-pass / LDA separability)\n"
         "  ufsm ink-devcrops SEGS.json --box B --ct-key K --um U --out DIR   scoring crops (clean layout) of the windows inside held-out boxes\n"
         "  ufsm ink-place PLACE.tsv OUT [--px-um 4.8] [--search 12]   2-D label crops (0 / 1 / ignore) placed on mesh canvases as on-the-fly ink windows, REF check\n"
         "  ufsm ink-find REF REFMASK --crop C.png --s S [--down 64]   where a 2-D label crop lies on a labelled mesh canvas (8 orientations, cell Pearson r)\n"
@@ -5094,6 +5096,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-teach")) return cmd_ink_teach(argc, argv);
     if (!strcmp(cmd, "ink-teach-up")) return cmd_ink_teach_up(argc, argv);
     if (!strcmp(cmd, "ink-devcrops")) return cmd_ink_devcrops(argc, argv);
+    if (!strcmp(cmd, "ink-augaudit")) return cmd_ink_augaudit(argc, argv);
     if (!strcmp(cmd, "ink-place")) return cmd_ink_place(argc, argv);
     if (!strcmp(cmd, "ink-find")) return cmd_ink_find(argc, argv);
     if (!strcmp(cmd, "obj-tifxyz")) return cmd_obj_tifxyz(argc, argv);

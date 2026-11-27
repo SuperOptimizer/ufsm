@@ -29,7 +29,7 @@ static void fill(vol *v, int air, int flat) {
 }
 static float g_tcdf[256];   /* the hist op's target: material uniform over 150..220 */
 static scan_aug_cfg one(int op, float strength) {
-    scan_aug_cfg c = {.strength = strength, .drop_ignore = 1}; if (op >= 0) c.p[op] = 1;
+    scan_aug_cfg c = {.strength = strength, .drop_ignore = 1, .fourier_cut = .1f}; if (op >= 0) c.p[op] = 1;   /* (fourier: cut P 4.8, K 4) */
     for (int v = 0; v < 256; v++) g_tcdf[v] = v < 150 ? 0.f : v >= 220 ? 1.f : (v - 149) / 71.f;
     c.hist = g_tcdf; c.nhist = 1;
     return c;
@@ -174,8 +174,51 @@ static void test_generalisation_ops(void) {
     }
 }
 
+/* SA_FOURIER: the output's DFT at every coefficient of the index box and a sample above it, in double: above the band (and at DC)
+   the bytes' rounding only (|dX| ~ sqrt(N / 12)); in the band the ratio X_out / X_in is the plan's real gain (phase kept) where the
+   input coefficient is strong; the op's own stream leaves the other ops' draws as without it */
+static void dft_at(const uint8_t *v, int kz, int ky, int kx, double *re, double *im) {
+    double a = 0, b = 0;
+    for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++) {
+        const double t = -2 * M_PI * ((double)((kz * z + ky * y + kx * x) % P + P) / P); const double f = v[((size_t)z * P + y) * P + x];
+        a += f * cos(t); b += f * sin(t); }
+    *re = a; *im = b;
+}
+static void test_fourier(void) {
+    for (uint64_t seed = 0; seed < 4; seed++) {
+        for (int z = 0; z < P; z++) for (int y = 0; y < P; y++) for (int x = 0; x < P; x++)
+            v0.ct[((size_t)z * P + y) * P + x] = (uint8_t)lround(128 + 25 * sin(2 * M_PI * (2 * z + y) / P) + 15 * cos(2 * M_PI * (x - 3 * z) / P) + 5 * (((x * 7 + y * 3 + z * 11) % 9) - 4) / 4.0);
+        memset(v0.ign, 0, N); v1 = v0;
+        scan_aug_cfg c = one(SA_FOURIER, 1); c.fourier_cut = .2f;   /* (cut P 9.6: K 9) */
+        scan_plan *pl = malloc(sizeof *pl);
+        const unsigned on = scan_aug_plan(&c, seed, v1.ct, v1.tgt, NCHT, v1.ign, P, O, v1.cy, v1.cx, 1, CHUNK, 1, pl);
+        CHECK(on == 1u << SA_FOURIER && pl->four_K == 9, "fourier fires with K = floor(cut P)");
+        scan_aug_exec(pl, v1.ct, scratch);
+        const double noise = sqrt((double)N / 12); int bad_hi = 0, bad_band = 0, nband = 0;
+        static const int ks[][3] = {{2, 1, 0}, {0, 1, 1}, {-3, 0, 1}, {3, 0, -1}, {-1, 0, 1}, {0, 0, 0}, {0, 12, 0}, {10, 1, 1}, {5, 5, 5}, {7, 7, 0}, {0, 20, 3}, {13, 2, 9}};
+        for (size_t i = 0; i < sizeof ks / sizeof *ks; i++) {
+            double r0, i0, r1, i1; dft_at(v0.ct, ks[i][0], ks[i][1], ks[i][2], &r0, &i0); dft_at(v1.ct, ks[i][0], ks[i][1], ks[i][2], &r1, &i1);
+            const int kx = ks[i][2] < 0 ? -ks[i][2] : ks[i][2], sg = ks[i][2] < 0 ? -1 : 1;   /* (the plan's gain is even: m(-k) = m(k)) */
+            const double g = scan_fourier_gain(pl, sg * ks[i][0], sg * ks[i][1], kx), k2 = (double)ks[i][0] * ks[i][0] + ks[i][1] * ks[i][1] + ks[i][2] * ks[i][2];
+            const double a0 = hypot(r0, i0);
+            if (k2 == 0 || k2 >= (double)pl->four_cut * pl->four_cut) { if (hypot(r1 - r0, i1 - i0) > 6 * noise) bad_hi++; }
+            else if (a0 > 200 * noise) { nband++; const double qr = (r1 * r0 + i1 * i0) / (a0 * a0), qi = (i1 * r0 - r1 * i0) / (a0 * a0);
+                if (fabs(qr - g) > .02 * g || fabs(qi) > .02 * g) { bad_band++; fprintf(stderr, "fourier k (%d %d %d): ratio %.4f%+.4fi, gain %.4f\n", ks[i][0], ks[i][1], ks[i][2], qr, qi, g); } }
+        }
+        CHECK(!bad_hi, "fourier keeps DC and the band above the cut (bytes' rounding only)");
+        CHECK(nband >= 2 && !bad_band, "fourier scales the band's strong coefficients by the real gain (phase kept)");
+        /* the other ops draw as without it */
+        scan_aug_cfg a = one(-1, 1); a.p[SA_BLUR] = a.p[SA_NOISE] = a.p[SA_TONE] = 1; scan_aug_cfg b = a; b.p[SA_FOURIER] = .5f; b.fourier_cut = .2f;
+        scan_plan *pa = malloc(sizeof *pa), *pb = malloc(sizeof *pb); v1 = v0; v2 = v0;
+        scan_aug_plan(&a, seed, v1.ct, v1.tgt, NCHT, v1.ign, P, O, v1.cy, v1.cx, 1, CHUNK, 1, pa);
+        scan_aug_plan(&b, seed, v2.ct, v2.tgt, NCHT, v2.ign, P, O, v2.cy, v2.cx, 1, CHUNK, 1, pb);
+        pb->on &= ~(1u << SA_FOURIER); pb->four_K = 0; pb->four_cut = 0; memset(pb->four_a, 0, sizeof pb->four_a); pb->four_b = 0;
+        CHECK(!memcmp(pa, pb, sizeof *pa), "fourier on leaves the other ops' plan unchanged");
+        free(pa); free(pb); free(pl);
+    }
+}
 int main(void) {
-    test_identity(); test_ops(); test_seam(); test_operators(); test_generalisation_ops();
+    test_identity(); test_ops(); test_seam(); test_operators(); test_generalisation_ops(); test_fourier();
     if (failures) { fprintf(stderr, "scan augment: %d failure(s)\n", failures); return 1; }
     {   /* the per-axis operator chain at its widest (blur, sharpen, motion, lowres at per-op strength 3) stays within MAXTAP */
         for (uint64_t seed = 0; seed < 40; seed++) {

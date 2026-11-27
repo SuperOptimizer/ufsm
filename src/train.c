@@ -671,6 +671,7 @@ static void gpu_input_settle(sample_cfg *sc, int assume_mx, int slot_skip) {   /
         if (sample_gpu_lwarp_ok(&tc)) { g_gpu_aug = 2; if (!sc->pack_tm) fprintf(stderr, "--gpu-aug 2 without packed targets: the unpacked targets are never read (slot_skip 4)\n"); } else fprintf(stderr, "--gpu-aug 2: the labels' warp needs packed targets and no sheet / pmask / gap / distill / cond / band / aux labels; --gpu-aug 1 (here: pack_tm %d sheet %d pap_head %d emb %d cond %d band %d aux %d)\n",
                                                                    sc->pack_tm, sc->sheet != nullptr, sc->pap_head != nullptr, sc->emb_ch, sc->cond, sc->band, sc->aux); }
     sc->gpu_aug = g_gpu_aug;
+    if (sc->augment && sc->scan.p[SA_FOURIER] > 0 && !g_gpu_aug) { fprintf(stderr, "--aug-fourier-p: needs the device augmentation (--gpu-aug >= 1 and its conditions; the CPU op is the tests' reference only)\n"); exit(2); }
     sc->w4_dev = g_w4dev_want && g_gpu_aug == 2 && sc->wind4 && g_w4n > 0;
     if (sc->w4_dev) { w4dev_init(g_w4devs, g_w4n); fprintf(stderr, "input: the winding mod 4 labels' runs and codes on the GPU, its union-find on the host (--gpu-aug 3; the same bytes as --gpu-aug 2)\n"); }
     if (g_gpu_aug) fprintf(stderr, "input: the scanner augmentation, z-score, symmetry / warp and jitter of the CT channel on the GPU (--gpu-aug 0: on the CPU)\n");
@@ -4145,6 +4146,18 @@ int cmd_train(int argc, char **argv) {
         if (hf && !strcmp(g_aug_name,"all") && !all && !opt(argc,argv,"--aug-hist-p",nullptr)) sc.scan.p[SA_HIST]=.15f;   /* the preset's, when targets are given */
         if (sc.scan.p[SA_HIST]>0 && !sc.scan.nhist) { fprintf(stderr,"--aug-hist-p needs --aug-hist FILE\n"); return 2; }
         for (int i=0;i<SA_N;i++) if (!isfinite(sc.scan.s[i]) || sc.scan.s[i]<0 || sc.scan.s[i]>3) { fprintf(stderr,"--aug-%s-s: 0..3\n",scan_aug_names[i]); return 2; }
+        /* --aug-fourier-p P --aug-fourier-cut C (inkaug 11-27, scan_augment.h SA_FOURIER): the 3-D DFT amplitude below C cycles per voxel
+           scaled at random, phase and the band above C kept; the device runs it (the CPU op is the test reference: P^3 K double MACs) */
+        sc.scan.fourier_cut=(float)opt_atof("--aug-fourier-cut",opt(argc,argv,"--aug-fourier-cut","0.03"));
+        if (!(sc.scan.fourier_cut>0 && sc.scan.fourier_cut<.25f)) { fprintf(stderr,"--aug-fourier-cut: cycles per voxel in (0, 0.25)\n"); return 2; }
+        if (sc.scan.p[SA_FOURIER]>0) {
+            const double cI=sc.scan.fourier_cut*(double)sc.P;
+            if (cI<1) { fprintf(stderr,"--aug-fourier-cut %g at P %d: no frequency below the cut (cut P >= 1)\n",sc.scan.fourier_cut,sc.P); return 2; }
+            if (cI>SA_FOURIER_KMAX+1) UFSM_DEFAULTED("--aug-fourier-cut %g at P %d: the band capped at %d cycles per window (%.4f cycles per voxel)",sc.scan.fourier_cut,sc.P,SA_FOURIER_KMAX+1,(SA_FOURIER_KMAX+1.0)/sc.P);
+            const int K=(int)floor(fmin(cI,SA_FOURIER_KMAX+1.0))<SA_FOURIER_KMAX?(int)floor(fmin(cI,SA_FOURIER_KMAX+1.0)):SA_FOURIER_KMAX;
+            nn_aug_fourier_reserve(sc.P,K);
+            fprintf(stderr,"aug: fourier p %.3g, the amplitude below %.4f cycles per voxel (%d of %d per axis), phase kept\n",sc.scan.p[SA_FOURIER],sc.scan.fourier_cut,K,sc.P);
+        }
     }
     sc.affine_p=(float)optd(argc,argv,"--aug-affine-p",sc.affine_p);
     sc.affine_aniso=(float)optd(argc,argv,"--aug-aniso",sc.affine_aniso);
