@@ -810,6 +810,28 @@ and R1 last. E0 / S2 / E2D2 stay within .006 of each other. The 50 um band lifts
 
 Files: /vesuvius/ufsm/inkeval/{prep.sh (rows), table.sh, band.sh, leaks.tsv, table*.out, strat*.tsv, rows/}.
 
+**Addendum (11-27 afternoon): lossless vs volcomp q8 CT per scroll.** No new predicts. The rows are pullct's dev A/B (ab2d / ab2e: reader3
+ctx r8 median; E0-avg vox) and inksdk's PICKS3 amendment 1 (1447 / 0841), paired by crop with ink-strat (inkeval/ll.sh, ll-*.out).
+B − A ± SE (crops up / n):
+
+| scroll (read) | reader3 lossless − q8 | E0 lossless − q8 |
+|---|---|---|
+| 1447 (8.64 um L0) | **+.035 ± .009** (25/28) | E2D2-t8: **+.027 ± .008** (24/28) |
+| 0139 (9.36 um L0) | +.013 ± .003 (23/40) | +.001 ± .012 |
+| 0009B h116 (8.64 um L0) | +.010 ± .003 (41/48) | +.021 ± .006 |
+| 0343 (8.64 um L0) | +.002 ± .002 (ceiling .998) | +.030 ± .025 |
+| 0172 (7.91 um, 53 keV, L0) | −.002 ± .004 | +.015 ± .008 |
+| 0841 (2.403 um read at L2) | −.000 ± .003 | E2D2-t8: +.002 ± .004 |
+| HOLD 1667 / P4 (R1 at L2 of 1.129 um) | −.000 ± .009 / +.009 ± .006 (pullct ab3, ink-audit pairs) | |
+
+- **The gain is real on 1.2 m coarse scans read at native L0** (1447, 0139, 0009B).
+- **It is nil where the read is pooled.** The mirror is q 8 / 4 / 2 / 1 by level, so an L2 read is already q2.
+- **q2 is enough.** pullct's dev mean4: q8 → q2 +.0054 ± .0013, then q2 → lossless +.0004 ± .0004.
+- **Cost of the coarse L0 levels** (31 scans, 34.2 Tvox; the q8 mirror's L0 is 260 GB = .0076 B/vox):
+  - q2 ≈ 2.8x q8 ≈ 0.73 TB; lossless ≈ 19-23x ≈ 5-6 TB (pullct rate: material boxes .031 B/vox at q8, .086 at q2, .61-.79 at q0);
+  - built from S3 at the measured ~55 Mvox/s (65 s per 3.6 Gvox): about 1 week single-stream for all L0, or ~6 h per scan;
+  - a surface shell (pullct's context boxes: all 147 dev crops in 33 GB lossless) scales with the inked area, not with the scan.
+
 ## ufsm umbilicus: the umbilicus by sheet-normal voting, a villa vc_gen_umbilicus port (2026-11-27, branch axisfind-20261127, axisfind)
 
 `ufsm umbilicus OUT.json --um0 UM (--ct-root R --ct-key K --level L | --fields DIR)` (src/umbfind.c) ports villa's
