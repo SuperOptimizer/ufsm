@@ -231,9 +231,10 @@ static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int 
 /* the phase of codes cz at rmax rm (owned); behind the derived-array cache when key names the codes (meshes): "cache_dir" (default
    $UFSM_DERIVED_CACHE / ~/.cache/ufsm/derived), "cache_mb" (1024) */
 /* c1 (owned; "pair_coarse": 1): the same codes one level coarser, the two-level pair rule (band_onfly.h phase_onfly_open2, level-0 tiles
-   with a halo of "pair_h0" voxels, default 32; w24 2026-11-27: the 2.4 um rung's rmax 160 halo made the onfly labels ~30 s a window) */
+   with a halo of "pair_h0" voxels, default 12: a 536^3 tile, one 512^3 dcache cell, fits 3072 MB; w24 2026-11-27: the 2.4 um rung's rmax
+   160 halo made the onfly labels ~30 s a window; vs the level-0 rule within 2 codes on >= 99.87 % of the voxels, DESIGN.md) */
 static z3 *onfly_phase_of(z3 *cz, z3 *c1, float rm, const char *key_, const json *of) {
-    const int h0 = (int)json_num(json_get(of, "pair_h0"), 32);
+    const int h0 = (int)json_num(json_get(of, "pair_h0"), 12);
     z3 *z = c1 ? phase_onfly_open2(cz, c1, rm, h0) : phase_onfly_open(cz, rm);
     if (!z) { z3_close(cz); return nullptr; }
     char key[1100];   /* (the two-level rule: its own dcache key) */
