@@ -100,6 +100,19 @@ Ideas weighed (estimates from the planner's terms):
   8/16-wide level 0 and excludes head_ext with half_res.
 - One card at P 1024 is out of reach (~8.7 GB short of 12.6 even with all of the above); P 896 needs hs_z 8 + #4. P 1024 is the 2-GPU split's.
 
+Head slab z 8 (UFSM_HEAD_SLAB_Z=8, gpudec off, onfly 1536, 10.81 GB free): plan 9.54 GB at P 768 (fits), 13.85 at 896, 19.57 at 1024
+(z 32: 11.49 / 16.51 / 23.05). The 2-GPU split at P 1024: 12.04 GB per card at z 8 (15.52 at z 32) against ~10.3 free on a real card
+(the planner's --gpus 0,0 run on one card printed 7.68 "free per GPU": both ranks on one card). Slabs --Pz 128: 13.47 GB at P 1152,
+16.58 at 1280, 24.45 at 1536 (the task term).
+
+#4 built as UFSM_LAT_XSLAB=1 (opt-in): the full-resolution CT channel lives in the level-0 gradient buffer (lean 2 with the split upload:
+the input goes up after the backward, upload_tail, and is read only by the skip tiles and the input conversion); nn_aug_ct also copies the
+scanned source bytes, record and z-score aside (nn_aug_keep, 1 B/vox), and every head slab writes its planes plus a one-plane halo again
+(nn_aug_rewrite: aug_write_k over the slab's voxels) for the fine stem / guide kernels. Validation's host-built windows read the whole channel
+(no backward overwrites it); a host-built training window stops the run. test_lat_xslab (P 128, level 0 256 wide, scanner + geometry aug, fstem,
+rv / ink / fibre heads, 8-plane slabs, --det): 7 steps + 21 validation lines equal to the run without it; UFSM_LAT_XSLAB=check: 0 of 140 M
+rewritten slab bytes differ from the uploaded channel. Plan: -1.07 GB at P 1024, -0.70 at 896, -0.45 at 768.
+
 2-GPU split (--split z with --lat 4, g_lsplit): scratch2 ran P 1024 at 11.59 GB/card with hs_z 8 and onfly 768; halo +3-6 % compute,
 GPUs ~92 % busy, staged peer copies 14-17 GB/s.
 
