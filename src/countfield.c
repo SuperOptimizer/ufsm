@@ -662,6 +662,12 @@ int cmd_count_field(int argc, char **argv) {
        fields' merge-flag plane), so the counts route around merged sheets */
     const double mfw = opt_atof("--mf-w", cf_opt(argc, argv, "--mf-w", "0"));
     if (mfw > 0) { char mp[1400]; snprintf(mp, sizeof mp, "%s/mf/zarr.json", in); if (access(mp, F_OK)) { fprintf(stderr, "count-field: --mf-w needs %s (ufsm merge-flag)\n", mp); return 2; } fit_fields_mf_weight(mfw); }
+    {   /* --dv-w K --dv-ref S (2026-11-27 densvar): the density evidence of a cell x min(1, e^(-K (s - S))), s its learned log-variance (predict --fit-dv) */
+        const double dvw = opt_atof("--dv-w", cf_opt(argc, argv, "--dv-w", "0")), dvr = opt_atof("--dv-ref", cf_opt(argc, argv, "--dv-ref", "-6"));
+        if (dvw < 0) { fprintf(stderr, "count-field: --dv-w K >= 0\n"); return 2; }
+        if (dvw > 0) { char mp[1400]; snprintf(mp, sizeof mp, "%s/dv/zarr.json", in); if (access(mp, F_OK)) { fprintf(stderr, "count-field: --dv-w needs %s (predict --fit-dv 1)\n", mp); return 2; }
+                       fit_fields_dv_weight(dvw, dvr); fprintf(stderr, "count-field: density weights x min(1, e^(-%g (s - %g))) from the dv plane\n", dvw, dvr); }
+    }
     fit_fields_buf g; if (fit_fields_load(in, 0, 0, 0, &g)) { fprintf(stderr, "count-field: cannot load %s\n", in); return 1; }   /* geometry + the axis table */
     const int D = g.shape[0], H = g.shape[1], W = g.shape[2], na = (int)(D * g.h) + 1; const size_t n = (size_t)D * H * W, HW = (size_t)H * W;
     const double h = g.h;

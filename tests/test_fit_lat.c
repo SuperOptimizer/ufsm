@@ -3,7 +3,8 @@
    (task unwrap2: phase 0-1, normal 2-7, density 8, winding mod 4 9-10, d 16), field cells of 8, 4 and 2 (--fit-h 2: audit unroll #9). A 96^3 window (24^3 cells, cout 144 =
    16 + 128 sub-cell outputs), halo 16, the box at window offsets on and off the cell grid; with and without the stem and the sub-cell
    term. Pass: the 12 + 9 accumulator planes bit for bit, for nn_fit_accum_lat and for nn_fit_accum_lat_w4p (the winding pass from the
-   pair's fp16 planes, predict's UFSM_PRED_FIT_W4P default; its 9 winding planes non-empty where the plane path's are). UFSM_TEST_BENCH=1:
+   pair's fp16 planes, predict's UFSM_PRED_FIT_W4P default; its 9 winding planes non-empty where the plane path's are), and for the latter
+   on held cell planes [2, 24) at a padded channel stride (nn_fit_accum_lat_planes: predict's per-chunk head under the fused kernel). UFSM_TEST_BENCH=1:
    timings of a 256^3 window. Usage: test_fit_lat */
 #include "nn.h"
 #include "fit.h"
@@ -38,7 +39,8 @@ int main(void) {
         const int FH = FHS[fi]; if (o == 3 && FH != 2) continue;
         const int tz = OFF[o][0], ty = OFF[o][1], tx = OFF[o][2], box[3] = {WW + 8, WW - 8, WW}, F[3] = {(box[0] + FH - 1) / FH, (box[1] + FH - 1) / FH, (box[2] + FH - 1) / FH};
         const size_t nf = (size_t)F[0] * F[1] * F[2];
-        float *a0 = nn_malloc(12 * nf * 4), *a1 = nn_malloc(12 * nf * 4), *b0 = nn_malloc(9 * nf * 4), *b1 = nn_malloc(9 * nf * 4), *a2 = nn_malloc(12 * nf * 4), *b2 = nn_malloc(9 * nf * 4);
+        float *a0 = nn_malloc(12 * nf * 4), *a1 = nn_malloc(12 * nf * 4), *b0 = nn_malloc(9 * nf * 4), *b1 = nn_malloc(9 * nf * 4), *a2 = nn_malloc(12 * nf * 4), *b2 = nn_malloc(9 * nf * 4), *a3 = nn_malloc(12 * nf * 4), *b3 = nn_malloc(9 * nf * 4);
+        nn_zero(a3, 12 * nf * 4); nn_zero(b3, 9 * nf * 4);
         nn_zero(a0, 12 * nf * 4); nn_zero(a1, 12 * nf * 4); nn_zero(b0, 9 * nf * 4); nn_zero(b1, 9 * nf * 4); nn_zero(a2, 12 * nf * 4); nn_zero(b2, 9 * nf * 4);
         nn_lat_up_slab(lgd, 1, 11, CW, CW, CW, 0, WW, pl);
         if (sb) nn_lat_shuffle(lgd, 1, CW, CW, CW, NB, 2, 0, WW, pl);
@@ -51,7 +53,19 @@ int main(void) {
             void *wl = nn_malloc((size_t)2 * (WW - HALO) * WW * WW * 2); nn_zero(wl, (size_t)2 * (WW - HALO) * WW * WW * 2);
             if (nn_fit_accum_lat_w4p(lgd, 1, CW, CW, CW, sb ? NB : -1, st ? pd : nullptr, C, so, ctd, ctd, nullptr, mean, isd, HALO, HALO, tz, ty, tx, box, FH, F,
                                      -1, 0, 2, 8, dscale, 0, a2, 9, DD, b2, wl, HALO, WW - HALO)) { fprintf(stderr, "nn_fit_accum_lat_w4p refused the configuration\n"); return 1; }
-            nn_sync(); nn_free(wl);
+            nn_sync();
+            /* held cell planes (predict's per-chunk head, nn_fit_accum_lat_planes): only planes [HQ0, CW) of every channel, a padded channel stride */
+            enum { HQ0 = 2, HQD = CW - HQ0 }; const size_t hcs = (size_t)(HQD + 1) * CW * CW;
+            uint16_t *hl = calloc(COUT * hcs, 2);
+            for (int c = 0; c < COUT; c++) memcpy(hl + c * hcs, lg + c * cv + (size_t)HQ0 * CW * CW, (size_t)HQD * CW * CW * 2);
+            void *hld = nn_malloc(COUT * hcs * 2); nn_h2d(hld, hl, COUT * hcs * 2); free(hl);
+            nn_zero(wl, (size_t)2 * (WW - HALO) * WW * WW * 2);
+            nn_fit_accum_lat_planes(HQ0, HQD, hcs);
+            const int hr = nn_fit_accum_lat_w4p(hld, 1, CW, CW, CW, sb ? NB : -1, st ? pd : nullptr, C, so, ctd, ctd, nullptr, mean, isd, HALO, HALO, tz, ty, tx, box, FH, F,
+                                                -1, 0, 2, 8, dscale, 0, a3, 9, DD, b3, wl, HALO, WW - HALO);
+            nn_fit_accum_lat_planes(0, 0, 0);
+            if (hr) { fprintf(stderr, "nn_fit_accum_lat_w4p (held planes) refused the configuration\n"); return 1; }
+            nn_sync(); nn_free(wl); nn_free(hld);
         }
         nn_sync();
         if (o == 0 && sb == 0 && FH == 8) {   /* (diagnosis: the per-voxel logits of the fused kernel against the planes) */
@@ -71,19 +85,22 @@ int main(void) {
                                 first / (WW * WW), first / WW % WW, first % WW, (double)(float)f, (double)hd[(size_t)k * w3 + first]); } }
             free(hd); free(hp); nn_free(dg);
         }
-        uint32_t *h0 = malloc(12 * nf * 4), *h1 = malloc(12 * nf * 4), *g0 = malloc(9 * nf * 4), *g1 = malloc(9 * nf * 4), *h2 = malloc(12 * nf * 4), *g2 = malloc(9 * nf * 4);
+        uint32_t *h0 = malloc(12 * nf * 4), *h1 = malloc(12 * nf * 4), *g0 = malloc(9 * nf * 4), *g1 = malloc(9 * nf * 4), *h2 = malloc(12 * nf * 4), *g2 = malloc(9 * nf * 4), *h3 = malloc(12 * nf * 4), *g3 = malloc(9 * nf * 4);
+        nn_d2h(h3, a3, 12 * nf * 4); nn_d2h(g3, b3, 9 * nf * 4);
         nn_d2h(h0, a0, 12 * nf * 4); nn_d2h(h1, a1, 12 * nf * 4); nn_d2h(g0, b0, 9 * nf * 4); nn_d2h(g1, b1, 9 * nf * 4); nn_d2h(h2, a2, 12 * nf * 4); nn_d2h(g2, b2, 9 * nf * 4);
-        size_t nd[21] = {0}, nset = 0, np = 0, npw = 0, nw = 0;
+        size_t nd[21] = {0}, nset = 0, np = 0, npw = 0, nw = 0, nh = 0;
+        for (size_t i = 0; i < 12 * nf; i++) nh += h3[i] != h2[i];
+        for (size_t i = 0; i < 9 * nf; i++) nh += g3[i] != g2[i];
         for (int k = 0; k < 12; k++) for (size_t i = 0; i < nf; i++) { nd[k] += h0[k * nf + i] != h1[k * nf + i]; np += h0[k * nf + i] != h2[k * nf + i]; }
         for (int k = 0; k < 9; k++) for (size_t i = 0; i < nf; i++) { nd[12 + k] += g0[k * nf + i] != g1[k * nf + i]; npw += g0[k * nf + i] != g2[k * nf + i]; }
         for (size_t i = 0; i < nf; i++) { nset += h0[nf + i] != 0; nw += g0[2 * nf + i] != 0; }
         size_t tot = 0; for (int k = 0; k < 21; k++) tot += nd[k];
-        const int bad = tot != 0 || np != 0 || npw != 0 || nset < nf / 4 || nw < nf / 8;   /* (nw: the winding pairs counted, a non-empty check) */
+        const int bad = tot != 0 || np != 0 || npw != 0 || nh != 0 || nset < nf / 4 || nw < nf / 8;   /* (nw: the winding pairs counted, a non-empty check) */
         printf("%s h %d stem %d sub-cell %d window at %3d %3d %3d: %zu of %zu cells with material, %zu accumulator values differ", bad ? "FAIL" : "ok  ", FH, st, sb, tz, ty, tx, nset, nf, tot);
         if (tot) { printf(" (planes:"); for (int k = 0; k < 21; k++) if (nd[k]) printf(" %d:%zu", k, nd[k]); printf(")"); }
-        printf("; w4 planes mode: %zu + %zu differ (%zu cells with pairs)%s\n", np, npw, nw, bad ? "  <--" : "");
+        printf("; w4 planes mode: %zu + %zu differ (%zu cells with pairs); held planes %zu differ%s\n", np, npw, nw, nh, bad ? "  <--" : "");
         fails += bad;
-        free(h0); free(h1); free(g0); free(g1); free(h2); free(g2); nn_free(a0); nn_free(a1); nn_free(b0); nn_free(b1); nn_free(a2); nn_free(b2);
+        free(h0); free(h1); free(g0); free(g1); free(h2); free(g2); free(h3); free(g3); nn_free(a3); nn_free(b3); nn_free(a0); nn_free(a1); nn_free(b0); nn_free(b1); nn_free(a2); nn_free(b2);
     }
     if (getenv("UFSM_TEST_BENCH")) for (int fi = 0; fi < 3; fi += 2) {   /* timing: a 256^3 window (the stem and the sub-cell term on), the plane path against the fused kernel, h 8 and 2 */
         const int FH = FHS[fi];
