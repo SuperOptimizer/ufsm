@@ -192,6 +192,7 @@ struct unet {
                                                 buffer holds the input since a backward (a repeated backward re-runs dec[0].c2) */
     size_t xin_bytes; void *h_xin, *ev_xin[4];
     unet_input_hook in_hook; void *in_hook_ctx;   /* unet_set_input_hook (train --lat-direct-p) */
+    const void *cond_d; int cond_g[3];   /* cfg.cond_ch: the conditioning planes of the next forwards (unet_set_cond_input; nullptr: zeros) */
     float *lat_bas, *lat_gain, lat_step, lat_run_step, lat_hb[29 * 64], lat_hg[29]; int lat_C;   /* unet_set_lat_basis: the learned cell transform of a latent-grid net (cfg.cin = lat_C + 3) */
     const void *rad_aux;                     /* unet_set_input_aux (train --aux-input with --gpu-input): the coarse aux boxes (nn.h nn_aux_hdr) */
     const void *rad;                         /* unet_set_input_rad (train --gpu-input): the 16-bit input is the CT alone, these radial records
@@ -429,7 +430,7 @@ static void gfilm_bwd(unet *u, long S) {
 size_t unet_fstem_off(const unet *u) { return u->fstem_off; }
 size_t unet_latdec_off(const unet *u) { return u->ld_off; }
 static size_t fstem_np(const unet_cfg *c) { return c->fstem ? (size_t)c->fstem * 64 + c->fstem + (size_t)c->fstem_out * c->fstem : 0; }
-static int latdec_cl(const unet_cfg *c) { return c->lat_dec_raw ? 64 : c->cin - 3; }
+static int latdec_cl(const unet_cfg *c) { return c->lat_dec_raw ? 64 : c->cin - unet_cond_cin(c) - 3; }
 static size_t latdec_np(const unet_cfg *c) { const size_t H = (size_t)c->lat_dec; return c->lat_dec ? H * c->widths[0] + H + (size_t)latdec_cl(c) * 27 * H + (size_t)64 * c->lat_dec_ng * H : 0; }
 size_t unet_gfilm_off(const unet *u) { return u->gf_off; }
 void unet_set_gfilm_reduce(unet *u, void (*fn)(void *ctx, float *dg, int K), void *ctx, int top, int dedup) { u->gf_red = fn; u->gf_redc = ctx; u->gf_top = top; u->gf_dedup = dedup; }
@@ -1839,12 +1840,13 @@ int unet_logits_in_gx(const unet *u) { return u->built && u->train && u->logits 
 void unet_set_input_rad(unet *u, const void *rec) { u->rad = rec; }
 void unet_set_input_aux(unet *u, const void *aux) { u->rad_aux = aux; }
 void unet_set_lat_basis(unet *u, const float *bas, const float *gain, int C, float step) {
-    if (C < 1 || C > 29 || u->cfg.cin != C + 3) { fprintf(stderr, "unet: the cell transform has %d channels, the network %d inputs (C + 3)\n", C, u->cfg.cin); abort(); }
+    if (C < 1 || C > 29 || u->cfg.cin - unet_cond_cin(&u->cfg) != C + 3) { fprintf(stderr, "unet: the cell transform has %d channels, the network %d inputs (C + 3)\n", C, u->cfg.cin); abort(); }
     memcpy(u->lat_hb, bas, (size_t)C * 64 * 4); memcpy(u->lat_hg, gain, (size_t)C * 4); u->lat_C = C; u->lat_step = step;
     if (!u->lat_bas) { u->lat_bas = nn_malloc(29 * 64 * 4); u->lat_gain = nn_malloc(29 * 4); }
     nn_h2d(u->lat_bas, u->lat_hb, (size_t)C * 64 * 4); nn_h2d(u->lat_gain, u->lat_hg, (size_t)C * 4);
 }
 void unet_set_input_hook(unet *u, unet_input_hook fn, void *ctx) { u->in_hook = fn; u->in_hook_ctx = ctx; }
+void unet_set_cond_input(unet *u, const void *cd, int gd, int gh, int gw) { u->cond_d = cd; u->cond_g[0] = gd; u->cond_g[1] = gh; u->cond_g[2] = gw; }
 void unet_set_lat_step(unet *u, float step) { u->lat_run_step = step; }   /* this forward's quantiser step (training jitter); 0: the transform's own */
 float unet_get_lat_step(const unet *u) { return u->lat_run_step; }
 const float *unet_lat_basis_host(const unet *u) { return u->lat_C ? u->lat_hb : nullptr; }
@@ -2916,6 +2918,7 @@ const float *unet_forward_x(unet *u, const void *xv, shape5 xs, int train, int x
         if (!u->xin) u->xin = dalloc_input(u, xs);
         if (u->rad && u->cfg.half_res == 2) nn_input_rad_pack(x, xs, u->rad, u->xin);   /* --half-res pack: x is the full-resolution CT channel */
         else if (u->rad && u->cfg.half_res == 3 && u->lat_C) { nn_input_latc(x, xs, u->rad, u->lat_bas, u->lat_gain, u->lat_C, u->lat_run_step > 0.f ? u->lat_run_step : u->lat_step, u->xin);
+                                                                        if (u->cfg.cond_ch) nn_cond_mx(u->xin, xs, u->cond_d, u->cfg.cond_ch, u->cond_g[0], u->cond_g[1], u->cond_g[2]);
                                                                         if (u->in_hook) u->in_hook(u->in_hook_ctx, u->xin, xs, x, u->rad, u->lat_gain, u->lat_C); nn_ptick("input pool"); }   /* --lat-basis: the learned cell channels */
         else if (u->rad && u->cfg.half_res == 3) { nn_input_lat(x, xs, u->rad, u->xin); nn_ptick("input pool"); }   /* train --lat 4: the 4^3 cell means, x the full-resolution CT channel */
         else if (u->rad && u->l0rx) { u->l0x_ct = x; for (int k = 0; k < 16; k++) u->l0x_held[k] = -1; }   /* (stage S4: per slab in the stream, l0x_need) */
@@ -5594,6 +5597,7 @@ int unet_save(const unet *u, const char *path, int step, const char *extra) {
     { int any = 0; for (int i = 0; i < u->cfg.nlev; i++) any |= u->cfg.enc_blocks[i] != 0;
       if (any) { fputs(",\"enc_blocks\":[", f); for (int i = 0; i < u->cfg.nlev; i++) fprintf(f, "%s%d", i ? "," : "", u->cfg.enc_blocks[i]); fputc(']', f); } }
     if (u->cfg.half_res) fprintf(f, ",\"half_res\":%d", u->cfg.half_res);
+    if (u->cfg.cond_ch) fprintf(f, ",\"cond_ch\":%d", u->cfg.cond_ch);   /* (only when on: older readers see the old header) */
     if (u->cfg.lat_guide) fprintf(f, ",\"lat_guide\":%d", u->cfg.lat_guide);
     if (u->cfg.lat_nsub) { fputs(",\"lat_sub\":[", f); for (int k = 0; k < u->cfg.lat_nsub; k++) fprintf(f, "%s%d", k ? "," : "", u->cfg.lat_sub[k]); fputc(']', f); }   /* (only when set: older readers see the old header) */
     if (u->lat_C) {   /* the cell transform: rows of 64 weights, the gains, the step */
@@ -5724,6 +5728,7 @@ static int read_header(FILE *f, unet_cfg *cfg, int *step, size_t *np) {
     cfg->emb_lev = (p = strstr(line, "\"emb_lev\":")) ? atoi(p + 10) : 0;
     cfg->emb_ch = (p = strstr(line, "\"emb_ch\":")) ? atoi(p + 9) : 0;
     cfg->film = (p = strstr(line, "\"film\":")) ? atoi(p + 7) : 0;
+    cfg->cond_ch = (p = strstr(line, "\"cond_ch\":")) ? atoi(p + 10) : 0;
     cfg->lat_dec = cfg->lat_dec_raw = cfg->lat_dec_ng = cfg->lat_dec_wq = 0; if ((p = strstr(line, "\"lat_dec\":["))) sscanf(p + 11, "%d,%d,%d,%d", &cfg->lat_dec, &cfg->lat_dec_raw, &cfg->lat_dec_ng, &cfg->lat_dec_wq);
     cfg->fstem = cfg->fstem_out = 0; if ((p = strstr(line, "\"fstem\":["))) { cfg->fstem = atoi(p + 9); const char *q = strchr(p + 9, ','); cfg->fstem_out = q ? atoi(q + 1) : 0; }
     if ((p = strstr(line, "\"attn_blocks\":"))) cfg->attn_blocks = atoi(p + 14);
@@ -5878,7 +5883,7 @@ int unet_load(unet *u, const char *path) {
     u->ad_kap_nload = g_loaded_adkap_n; memcpy(u->ad_kap_load, g_loaded_adkap, (size_t)g_loaded_adkap_n * sizeof(double));
     u->ad_cool_nload = g_loaded_adcool_n; memcpy(u->ad_cool_load, g_loaded_adcool, (size_t)g_loaded_adcool_n * sizeof(double));
     u->ninh = 0; for (int i = 0; i < g_loaded_ninh; i++) inh_add(u, g_loaded_inh[2 * i], g_loaded_inh[2 * i + 1]);   /* (none: all fresh) */
-    if (g_loaded_lat_c && u->cfg.cin == g_loaded_lat_c + 3) unet_set_lat_basis(u, g_loaded_lat_bas, g_loaded_lat_gain, g_loaded_lat_c, g_loaded_lat_step);
+    if (g_loaded_lat_c && u->cfg.cin - unet_cond_cin(&u->cfg) == g_loaded_lat_c + 3) unet_set_lat_basis(u, g_loaded_lat_bas, g_loaded_lat_gain, g_loaded_lat_c, g_loaded_lat_step);
     if (g_loaded_sparse) { unet_set_sparse24_levels(u, g_loaded_sp24_lv); unet_set_sparse24(u, g_loaded_sparse); unet_set_sparse24_ramp(u, g_loaded_sp24_r, g_loaded_sp24_hard); }   /* (the mode: 1 = the element-wise 2:4 of older checkpoints) */
     if (g_loaded_wq) unet_set_wq(u, g_loaded_wq);
     if (u->cfg.l0_norm == 2) {   /* the running statistics (a checkpoint without them: a fresh warm-up) */

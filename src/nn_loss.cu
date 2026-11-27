@@ -9,6 +9,10 @@ extern "C" int nn_get_loss_tol(void) { return g_tol; }
 static int g_unit_ch7 = -1;   /* nn_set_loss_unit_ch7: in 7-channel losses (task unwrap: n n^T 6 + density) this channel's mask weight counts as 0 / 1 */
 extern "C" void nn_set_loss_unit_ch7(int c) { g_unit_ch7 = c; }
 #define UNITC(C) ((C) == 7 ? g_unit_ch7 : -1)
+/* nn_set_loss_dgap (train --density-min-gap-um): the next nn_loss_stats_acc_e / nn_loss_grad_only_s calls drop channel c's voxels whose
+   target code is >= thr (the density code of the minimum labelled gap: no density supervision across tighter gaps); thr 0 / c -1 off */
+static thread_local int g_dgap_c = -1, g_dgap_t = 0;
+extern "C" void nn_set_loss_dgap(int c, int thr) { g_dgap_c = thr > 0 ? c : -1; g_dgap_t = thr > 0 ? thr : 0; }
 extern "C" void nn_loss_cfg_get(float *pw, float *rec_w, int *unit7);
 thread_local int g_logits_h16 = 0;   /* the logits the losses read are fp16 (unet_logits_h16: lean training with the logit gradient beside them) */
 extern "C" void nn_set_logits_h16(int on) { g_logits_h16 = on; }
@@ -20,8 +24,8 @@ __device__ __forceinline__ float tgt_entropy(unsigned t) {
     const float p = t * (1.f / 255.f); return -(p * logf(p) + (1.f - p) * logf(1.f - p));
 }
 template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int C, size_t S, double *ds, float pw,
-                                                   int tol, uint8_t *code, int D, int H, int W, int unit_c = -1, double *ent = nullptr) {
-    int nc = blockIdx.x, slab = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c;
+                                                   int tol, uint8_t *code, int D, int H, int W, int unit_c = -1, double *ent = nullptr, int gap_c = -1, int gap_t = 0) {
+    int nc = blockIdx.x, slab = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c, gap = nc % C == gap_c;
     float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;   /* per-thread fp32 partials, fp64 block reduction; a5: ent's sum mw H(p) */
     if (w[nc]) {
         const LT *l = lg + (size_t)nc * S; const uint8_t *tp = t + (size_t)nc * S, *mp = m + (size_t)n * S;
@@ -36,7 +40,7 @@ template <typename LT> __global__ void loss_stats_k(const LT *lg, const uint8_t 
             for (int k = 0; k < LS_V; k++) {
                 const size_t i = i0 + (size_t)k * blockDim.x;
                 mb[k] = i < hi ? mp[i] : 0u; if (unit && mb[k]) mb[k] = 1u; tb[k] = 0u; xl[k] = 0.f;
-                if (mb[k]) { xl[k] = lgv(l, i); tb[k] = tp[i]; }
+                if (mb[k]) { xl[k] = lgv(l, i); tb[k] = tp[i]; if (gap && (int)tb[k] >= gap_t) { mb[k] = 0u; tb[k] = 0u; xl[k] = 0.f; } }
             }
 #pragma unroll
             for (int k = 0; k < LS_V; k++) {
@@ -268,8 +272,8 @@ extern "C" void nn_loss_stats_acc(const void *logits, const uint8_t *t, const ui
 /* nn_loss_stats_acc + the targets' entropy: ent[n c] += sum mw H(t / 255) over the slab (ent: s.n s.c doubles, zeroed by the caller) */
 extern "C" void nn_loss_stats_acc_e(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, double *ds, double *ent) {
     const size_t S = shape_spatial(s); const int NC = s.n * s.c, slabs = NC >= 16 ? KSLAB : 512 / NC;
-    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent);
-    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent);
+    if (g_logits_h16) loss_stats_k<f16><<<dim3(NC, slabs), 256>>>((const f16 *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent, g_dgap_c, g_dgap_t);
+    else loss_stats_k<float><<<dim3(NC, slabs), 256>>>((const float *)logits, t, m, w, s.c, S, ds, g_posw, 0, nullptr, s.d, s.h, s.w, UNITC(s.c), ent, g_dgap_c, g_dgap_t);
     KCHECK();
 }
 /* the entropy alone (a group whose statistics another kernel sums: the fused normal / density group), C channels of S voxels, one mask */
@@ -354,12 +358,12 @@ extern "C" void nn_loss_grad_only_s(const void *logits, const uint8_t *t, const 
     const float *fin = scratch + (size_t)5 * s.n * s.c;
     if (g_logits_h16) {
         const f16 *l16 = (const f16 *)logits;
-        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
-        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
-    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c));
-    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
-    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP);
+        if (!g_loss_g16) loss_grad_k<float, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), nullptr, g_dgap_c, g_dgap_t);
+        else if (g_h16) loss_grad_k<f16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP, g_dgap_c, g_dgap_t);
+        else loss_grad_k<bf16, f16><<<lg_grid(S, s.n * s.c), 256>>>(l16, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP, g_dgap_c, g_dgap_t);
+    } else if (!g_loss_g16) loss_grad_k<float><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (float *)gl, g_posw, gs1, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), nullptr, g_dgap_c, g_dgap_t);
+    else if (g_h16) loss_grad_k<f16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (f16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP, g_dgap_c, g_dgap_t);
+    else loss_grad_k<bf16><<<lg_grid(S, s.n * s.c), 256>>>((const float *)logits, t, m, w, s.n, s.c, S, scratch, dice_w, fin, (bf16 *)gl, g_posw, gsh, 0, nullptr, s.d, s.h, s.w, g_recall, UNITC(s.c), GSHP, g_dgap_c, g_dgap_t);
     KCHECK();
 }
 extern "C" void nn_loss_grad_only(const void *logits, const uint8_t *t, const uint8_t *m, const uint8_t *w, shape5 s, float dice_w, void *gl, const float *scratch) {
@@ -1181,6 +1185,100 @@ extern "C" void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const 
     if (!g_loss_g16) { fprintf(stderr, "nn_pgrad_apply: needs 16-bit logit gradients (head slabs)\n"); abort(); }
     if (g_h16) pgrad_apply_k<f16><<<nblk(ns, 256), 256>>>((f16 *)gc, (f16 *)gs, acc, ns, sums, lambda * GSH);   /* (hgs_choose keeps s 1 with pgrad on) */
     else pgrad_apply_k<bf16><<<nblk(ns, 256), 256>>>((bf16 *)gc, (bf16 *)gs, acc, ns, sums, lambda * GSH);
+    KCHECK();
+}
+/* ---- topology (wrap-count) loss (train --topo-lambda, topoloss 2026-11-27) ----
+   A sheet is a phase-0 crossing, so along the sheet normal the number of sheets between two points is the number of turns the phase
+   makes between them. One ray per lattice voxel (every k-th voxel on each axis, the lattice shifted by off per window) with a labelled
+   phase: the label's phase gradient (central code differences over +-s, as pgrad) is the normal, the ray takes up to len unit steps
+   each way (nearest voxels: lrint of the voxel + t n, IEEE ops so the host reference rounds alike) while its voxels stay in the slab,
+   labelled and in the mask (wm > 0: holdout / clipped voxels end a ray), and counts only with >= len steps in all. The label's turns
+   Tg = sum |wrapped code step| / 252 and the prediction's Tp = sum |angle(b conj(a))| / (2 pi) over the same steps (a, b the phasors
+   2 sigmoid(logit) - 1): the phase's total variation, so an extra sheet (an extra turn) and a phase dithering across 0 (extra
+   0-crossings, no net turn) both raise Tp, a missed sheet lowers it. Loss per ray huber(Tp - Tg) (delta 1 turn), weighted by the
+   centre's mask weight, mean over the rays. The angle carries no confidence (a blurred phasor is not cheaper); its gradient is
+   tangential, 1 / |a|, with |a|^2 floored at 0.05 (r 0.22; below it the gradient of a damped surrogate).
+   sums (device doubles, pgrad's layout so nn_pgrad_apply scales by sums[1]): [0] sum w loss, [1] sum w, [2] sum w over the rays off by
+   more than half a turn (a count error), [3] sum w (Tp - Tg). lc = ls = nullptr: [1] only (the training stats pass, no logits read);
+   acc (2 x slab floats, nullptr: statistics only): the logit gradient of sum w loss (float atomics: not bit-deterministic). ---- */
+typedef struct { int len, k, zl0, yl0, xl0, nzl, nyl, nxl; } topo_cfg;
+__device__ __forceinline__ long topo_at(int z, int y, int x, const float *n, int t, int z0, int z1, int H, int W) {
+    const int zz = (int)lrintf(__fadd_rn((float)z, __fmul_rn((float)t, n[0]))), yy = (int)lrintf(__fadd_rn((float)y, __fmul_rn((float)t, n[1]))),
+              xx = (int)lrintf(__fadd_rn((float)x, __fmul_rn((float)t, n[2])));
+    if (zz < z0 || zz >= z1 || yy < 0 || yy >= H || xx < 0 || xx >= W) return -1;
+    return ((long)(zz - z0) * H + yy) * W + xx;
+}
+template <typename LT> __global__ void topo_k(const LT *lc, const LT *ls, const uint8_t *ph, const uint8_t *wm, int D, int H, int W, int z0, int z1,
+                                              int s, topo_cfg c, double *sums, float *acc) {
+    const size_t HW = (size_t)H * W, ns = (size_t)(z1 - z0) * HW, nr = (size_t)c.nzl * c.nyl * c.nxl;
+    const uint8_t *const sp = ph + (size_t)z0 * HW;   /* (the slab's codes, by local index) */
+    const size_t r = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    float sl = 0.f, sw = 0.f, se = 0.f, sd = 0.f;
+    if (r < nr) do {
+        const int z = c.zl0 + c.k * (int)(r / ((size_t)c.nyl * c.nxl)), y = c.yl0 + c.k * (int)(r / c.nxl % c.nyl), x = c.xl0 + c.k * (int)(r % c.nxl);
+        const size_t li = (size_t)(z - z0) * HW + (size_t)y * W + x;
+        const float w = wm[li]; if (w <= 0.f || sp[li] >= 252) break;
+        if (z < s || z >= D - s || y < s || y >= H - s || x < s || x >= W - s) break;
+        const size_t gi = (size_t)z0 * HW + li, sz = (size_t)s * HW, sy = (size_t)s * W;
+        const int a6[6] = {ph[gi + sz], ph[gi - sz], ph[gi + sy], ph[gi - sy], ph[gi + s], ph[gi - s]};
+        int ok = 1; for (int q = 0; q < 6; q++) ok &= a6[q] < 252; if (!ok) break;
+        const int i0 = cnt_pdiff(a6[0], a6[1]), i1 = cnt_pdiff(a6[2], a6[3]), i2 = cnt_pdiff(a6[4], a6[5]);
+        if (!i0 && !i1 && !i2) break;
+        const float gn = __fsqrt_rn((float)(i0 * i0 + i1 * i1 + i2 * i2)), n[3] = {__fdiv_rn((float)i0, gn), __fdiv_rn((float)i1, gn), __fdiv_rn((float)i2, gn)};
+        int nb = 0, nf = 0;
+        for (int t = 1; t <= c.len; t++) { const long q = topo_at(z, y, x, n, -t, z0, z1, H, W); if (q < 0 || !wm[q] || sp[q] >= 252) break; nb = t; }
+        for (int t = 1; t <= c.len; t++) { const long q = topo_at(z, y, x, n, t, z0, z1, H, W); if (q < 0 || !wm[q] || sp[q] >= 252) break; nf = t; }
+        if (nb + nf < c.len) break;
+        int tg = 0, pv = sp[topo_at(z, y, x, n, -nb, z0, z1, H, W)];
+        for (int t = -nb + 1; t <= nf; t++) { const int v = sp[topo_at(z, y, x, n, t, z0, z1, H, W)]; tg += abs(cnt_pdiff(v, pv)); pv = v; }
+        sw += w;
+        if (!lc) break;
+        const float Tg = (float)tg * (1.f / 252.f);
+        float Tp = 0.f, ar, ai;
+        { const long q = topo_at(z, y, x, n, -nb, z0, z1, H, W); ar = 2.f / (1.f + __expf(-lgv(lc, q))) - 1.f; ai = 2.f / (1.f + __expf(-lgv(ls, q))) - 1.f; }
+        for (int t = -nb + 1; t <= nf; t++) {
+            const long q = topo_at(z, y, x, n, t, z0, z1, H, W);
+            const float br = 2.f / (1.f + __expf(-lgv(lc, q))) - 1.f, bi = 2.f / (1.f + __expf(-lgv(ls, q))) - 1.f;
+            Tp += fabsf(atan2f(ar * bi - ai * br, ar * br + ai * bi)); ar = br; ai = bi;
+        }
+        Tp *= 0.15915494309189535f;
+        const float dT = Tp - Tg, ad = fabsf(dT);
+        sl += w * (ad <= 1.f ? 0.5f * dT * dT : ad - 0.5f); se += ad > 0.5f ? w : 0.f; sd += w * dT;
+        if (!acc) break;
+        const float cf = w * fminf(fmaxf(dT, -1.f), 1.f) * 0.15915494309189535f;   /* d loss / d |angle step| */
+        /* per sample: its two steps' angle gradients (as the step's b, then as its a), one atomic per channel */
+        float pr = 0.f, pi_ = 0.f, qr, qi, qsc, qss, mr = 0.f, mi = 0.f, msc = 0.f, mss = 0.f;
+        long lq = topo_at(z, y, x, n, -nb, z0, z1, H, W);
+        qsc = 1.f / (1.f + __expf(-lgv(lc, lq))); qss = 1.f / (1.f + __expf(-lgv(ls, lq))); qr = 2.f * qsc - 1.f; qi = 2.f * qss - 1.f;
+        for (int t = -nb; t <= nf; t++) {
+            long lm = -1;
+            if (t < nf) { lm = topo_at(z, y, x, n, t + 1, z0, z1, H, W); msc = 1.f / (1.f + __expf(-lgv(lc, lm))); mss = 1.f / (1.f + __expf(-lgv(ls, lm))); mr = 2.f * msc - 1.f; mi = 2.f * mss - 1.f; }
+            const float e = fmaxf(qr * qr + qi * qi, 0.05f);
+            float gr = 0.f, gi_ = 0.f;
+            if (t > -nb) { const float cr = pr * qi - pi_ * qr, sg = (float)((cr > 0.f) - (cr < 0.f)); gr -= sg * qi / e; gi_ += sg * qr / e; }   /* d angle(q conj(p)) / dq = (-q_i, q_r) / |q|^2 */
+            if (t < nf) { const float cr = qr * mi - qi * mr, sg = (float)((cr > 0.f) - (cr < 0.f)); gr += sg * qi / e; gi_ -= sg * qr / e; }    /* d angle(m conj(q)) / dq = (q_i, -q_r) / |q|^2 */
+            if (gr != 0.f || gi_ != 0.f) { atomicAdd(&acc[lq], cf * gr * 2.f * qsc * (1.f - qsc)); atomicAdd(&acc[ns + lq], cf * gi_ * 2.f * qss * (1.f - qss)); }
+            pr = qr; pi_ = qi; qr = mr; qi = mi; qsc = msc; qss = mss; lq = lm;
+        }
+    } while (0);
+    for (int o = 16; o; o >>= 1) { sl += __shfl_down_sync(0xffffffffu, sl, o); sw += __shfl_down_sync(0xffffffffu, sw, o); se += __shfl_down_sync(0xffffffffu, se, o); sd += __shfl_down_sync(0xffffffffu, sd, o); }
+    __shared__ float sh[4][32];
+    if ((threadIdx.x & 31) == 0) { sh[0][threadIdx.x >> 5] = sl; sh[1][threadIdx.x >> 5] = sw; sh[2][threadIdx.x >> 5] = se; sh[3][threadIdx.x >> 5] = sd; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double a[4] = {0, 0, 0, 0}; for (int k = 0; k < (int)(blockDim.x >> 5); k++) for (int j = 0; j < 4; j++) a[j] += sh[j][k];
+        if (a[1] > 0) for (int j = 0; j < 4; j++) atomicAdd(&sums[j], a[j]);
+    }
+}
+extern "C" void nn_topo_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, int len, int k,
+                             unsigned off, double *sums, float *acc) {
+    if (k < 1) k = 1;
+    const int oz = (int)(off % (unsigned)k), oy = (int)(off / (unsigned)k % (unsigned)k), ox = (int)(off / (unsigned)k / (unsigned)k % (unsigned)k);
+    topo_cfg c = {len, k, z0 + (k - (z0 + oz) % k) % k, (k - oy) % k, (k - ox) % k, 0, 0, 0};
+    c.nzl = c.zl0 < z1 ? (z1 - 1 - c.zl0) / k + 1 : 0; c.nyl = c.yl0 < h ? (h - 1 - c.yl0) / k + 1 : 0; c.nxl = c.xl0 < w ? (w - 1 - c.xl0) / k + 1 : 0;
+    const size_t nr = (size_t)c.nzl * c.nyl * c.nxl; if (!nr) return;
+    if (g_logits_h16) topo_k<f16><<<nblk(nr, 256), 256>>>((const f16 *)lc, (const f16 *)ls, phase, wm, d, h, w, z0, z1, s, c, sums, acc);
+    else topo_k<float><<<nblk(nr, 256), 256>>>((const float *)lc, (const float *)ls, phase, wm, d, h, w, z0, z1, s, c, sums, acc);
     KCHECK();
 }
 /* ---- train --fib-normal-lambda: the normal head orthogonal to fibres ----

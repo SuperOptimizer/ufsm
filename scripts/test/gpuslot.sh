@@ -6,7 +6,8 @@
 #   gpuslot.sh add REF [REGEX]      queue REF (a commit of this clone) for the next slot: its touched fast-tier tests (run_suite -c against
 #                                   its merge base with origin/master), or only the tests matching REGEX. Prints the ticket.
 #   gpuslot.sh rm TICKET...         drop queued requests (a stale / superseded head), logged in results.txt
-#   gpuslot.sh prep [-b N]        build every queued commit not built yet (ROOT/<sha>: release + verify, lowprio, -j N, default 4)
+#   gpuslot.sh prep [-b N]          build every queued commit not built yet (ROOT/<sha>: release + verify, -j N, default 4); build [-b N]
+#                                   SHA...: only those (one per parallel builder). Per-sha lock; .prebuilt dirs (hand builds) are skipped
 #   gpuslot.sh drain [-g GPU] [-m MIN] [-x S] [-w MIN2]
 #                                   the slot: first takes gpu<GPU>.excl SHARED, waiting up to MIN2 minutes (default 10) for a job that
 #                                   holds it exclusively, and keeps it for the slot, so no exclusive job (an unroll, a trainer) starts on
@@ -49,20 +50,44 @@ add)
   qline >> "$Q"
   echo "gpuslot: queued $T: $REF = ${SHA:0:12} ($( [ -n "$RX" ] && echo "tests matching $RX" || echo "touched tests vs ${BASE:0:12}"))"
   ;;
-prep)
-  BJ=4; [ "${1:-}" = -b ] && BJ=$2
-  [ -s "$Q" ] || { echo "gpuslot: queue empty"; exit 0; }
-  declare -A seen
-  while IFS= read -r l; do [ -z "$l" ] && continue; qparse "$l"
-    S=${SHA:0:12}; W=$ROOT/$S; [ -n "${seen[$S]+x}" ] && continue; seen[$S]=1; built "$SHA" && continue
-    [ -f "$W/build.failed" ] && continue   # (a failed build is not retried every prep)
+prep|build)
+  # prep [-b N] builds every queued request not built yet, one after the other; build [-b N] SHA... builds those (parallel builders run one
+  # `build` each). Safe beside other builders (lead 11-27: three sha dirs were wiped mid-build that day, the last one mccdecl's prebuild):
+  #  - a per-sha flock (ROOT/.locks/<sha12>.lock, non-blocking): a sha another builder holds is skipped, never touched;
+  #  - a dir with .prebuilt (an agent building it by hand: touch ROOT/<sha12>/.prebuilt first) is skipped, never removed;
+  #  - a dir without a lock holder whose build.log changed in the last 15 min (an old prep / a hand build without the lock) is skipped;
+  #  - only then is a stale partial dir removed and rebuilt in place (in place, not tmp + rename: the verify binaries find their .ptxz
+  #    sidecars by absolute path and run only where they were built).
+  # A failed build leaves build.failed: not rebuilt by prep (rm it, or queue a new head), and drain keeps the ticket queued with a note.
+  BJ=4; [ "${1:-}" = -b ] && { BJ=$2; shift 2; }
+  BCMD=${GPUSLOT_BUILD_CMD:-}   # (tests: a stand-in for the cmake steps, run in the sha dir)
+  mkdir -p "$ROOT/.locks"
+  build1() {   # SHA REF TICKET
+    local SHA=$1 REF=$2 T=$3 S=${1:0:12} W=$ROOT/${1:0:12}
+    built "$SHA" && return 0
+    [ -f "$W/.prebuilt" ] && { echo "gpuslot: $S ($REF) is prebuilt by hand (.prebuilt): skip"; return 0; }
+    [ -f "$W/build.failed" ] && return 0   # (a failed build is not retried every prep)
+    exec 6> "$ROOT/.locks/$S.lock"
+    flock -n 6 || { echo "gpuslot: $S ($REF) is being built by another builder: skip"; exec 6>&-; return 0; }
+    if [ -f "$W/build.log" ] && [ -n "$(find "$W/build.log" -mmin -15 2> /dev/null)" ] && ! built "$SHA"; then
+      echo "gpuslot: $S ($REF): build.log changed in the last 15 min without a lock holder: skip"; exec 6>&-; return 0; fi
     echo "gpuslot: building $S ($REF)"
     rm -rf -- "${ROOT:?}/$S"
-    mkdir -p "$W" && git -C "$ROOT/repo.git" archive "$SHA" | tar -x -C "$W" || continue
-    ( cd "$W" && { cmake --preset release && cmake --preset verify; } > build.log 2>&1 &&
+    mkdir -p "$W" && git -C "$ROOT/repo.git" archive "$SHA" | tar -x -C "$W" || { exec 6>&-; return 1; }
+    if [ -n "$BCMD" ]; then ( cd "$W" && bash -c "$BCMD" > build.log 2>&1 )
+    else ( cd "$W" && { cmake --preset release && cmake --preset verify; } > build.log 2>&1 &&
       nice -n 19 cmake --build build -j "$BJ" --target ufsm test_sheet make_pipeline_fixture test_http_reader test_sampler_safety test_formats >> build.log 2>&1 &&
-      nice -n 19 cmake --build build-verify -j "$BJ" --target suite-bins >> build.log 2>&1 ) && touch "$W/.built" ||
+      nice -n 19 cmake --build build-verify -j "$BJ" --target suite-bins >> build.log 2>&1 ); fi && touch "$W/.built" ||
       { touch "$W/build.failed"; printf '%s %s %-28s BUILD FAILED %s\n' "$(date '+%m-%d %H:%M')" "$T" "$REF" "$W/build.log" | tee -a "$RES"; }
+    exec 6>&-
+  }
+  [ -s "$Q" ] || { echo "gpuslot: queue empty"; exit 0; }
+  declare -A seen want; for s in "$@"; do want[${s:0:12}]=1; done
+  [ "$cmd" = build ] && [ $# -eq 0 ] && { echo "usage: gpuslot.sh build [-b N] SHA..."; exit 2; }
+  while IFS= read -r l; do [ -z "$l" ] && continue; qparse "$l"
+    S=${SHA:0:12}; [ -n "${seen[$S]+x}" ] && continue; seen[$S]=1
+    [ "$cmd" = build ] && [ -z "${want[$S]+x}" ] && continue
+    build1 "$SHA" "$REF" "$T"
   done < "$Q"
   ;;
 drain)
@@ -95,7 +120,12 @@ drain)
     [ -z "$l" ] && continue; qparse "$l"
     S=${SHA:0:12}; W=$ROOT/$S; left=$(( END - $(date +%s) )); age=$(tage "$T")
     if [ "$age" -ge "$EXPH" ]; then printf '%s %s %-28s EXPIRED after %s h in the queue\n' "$(date '+%m-%d %H:%M')" "$T" "$REF" "$age" | tee -a "$RES"; continue; fi
-    [ -f "$W/build.failed" ] && { printf '%s %s %-28s dropped: build failed %s\n' "$(date '+%m-%d %H:%M')" "$T" "$REF" "$W/build.log" | tee -a "$RES"; continue; }
+    # a failed build keeps its ticket (lead 11-27: a clobbered build is not the branch's failure); one note, then it waits for a rebuild
+    # (rm ROOT/<sha12>/build.failed), a gpuslot rm, or the expiry
+    if [ -f "$W/build.failed" ]; then
+      [ -f "$W/build.failed.noted" ] || { printf '%s %s %-28s build failed, kept queued (rm %s/build.failed to rebuild, or gpuslot rm %s) %s\n' \
+        "$(date '+%m-%d %H:%M')" "$T" "$REF" "$W" "$T" "$W/build.log" | tee -a "$RES"; touch "$W/build.failed.noted"; }
+      qline >> "$Q.left"; continue; fi
     if ! built "$SHA" || [ $left -lt 60 ]; then qline >> "$Q.left"; continue; fi
     O=$W/slot-$T; rm -rf -- "$O"
     # the request's tests: REGEX, or the touched ones (-c needs git: the sha dir is an archive, so its selection runs on a scratch clone)
@@ -138,5 +168,5 @@ rm)   # gpuslot.sh rm TICKET... : drop queued requests (stale / superseded heads
   done < "$Q"
   mv -f "$Q.rm" "$Q"; [ $nrm = $# ] || { echo "gpuslot: removed $nrm of $# (unknown tickets ignored)"; exit 1; }
   ;;
-*) sed -n '2,21p' "$0"; exit 2;;
+*) sed -n '2,22p' "$0"; exit 2;;
 esac

@@ -108,7 +108,11 @@ extern thread_local cudaError_t g_err;
 extern "C" const char *lp_check(void);
 extern thread_local const char *g_err_file, *g_err_what; extern thread_local int g_err_line;   /* the call site of the latched g_err (nn_check_site) */
 extern "C" void nn_err_post(int e, const char *file, int line, const char *what);
-#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = #x; nn_err_post((int)e_, __FILE__, __LINE__, #x); if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
+/* a kernel that cannot be loaded (no image for this device, PTX the driver rejects, a device function nothing defines): a build error,
+   never latched for a later nn_check, the process stops at the call (nn_core.cu nn_err_load_fatal; 11-27 four_tab_k) */
+#define NN_LOAD_ERR(e) ((e) == 98 || (e) == 200 || (e) == 209 || (e) == 218 || (e) == 221 || (e) == 222 || (e) == 300 || (e) == 302)
+extern "C" void nn_err_load_fatal(int e, const char *file, int line, const char *what);
+#define CK(x) do { cudaError_t e_ = (x); if (NN_LOAD_ERR((int)e_)) nn_err_load_fatal((int)e_, __FILE__, __LINE__, #x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = #x; nn_err_post((int)e_, __FILE__, __LINE__, #x); if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
 #define KCHECK() CK(cudaGetLastError())
 
 extern "C" int nn_init(int device);
@@ -2249,9 +2253,9 @@ template <typename GT, typename LT> __device__ __forceinline__ GT loss_grad_v(co
 static inline dim3 lg_grid(size_t S, int NC) { return dim3((unsigned)((S + 256 * LG_V - 1) / (256 * LG_V)), (unsigned)NC); }
 template <typename GT, typename LT = float> __global__ void __launch_bounds__(256) loss_grad_k(const LT *lg, const uint8_t *t, const uint8_t *m, const uint8_t *w, int N,
                             int C, size_t S, const float *st, float dice_w, const float *fin, GT *gl, float pw, float gscale, int tol, const uint8_t *code, int D, int H,
-                            int W, float rec_w = 0.f, int unit_c = -1, const float *hp = nullptr) {   /* unit_c: the channel whose mask weight counts as 0 / 1 (nn_set_loss_unit_ch7); hp: GSHP */
+                            int W, float rec_w = 0.f, int unit_c = -1, const float *hp = nullptr, int gap_c = -1, int gap_t = 0) {   /* unit_c: the channel whose mask weight counts as 0 / 1 (nn_set_loss_unit_ch7); hp: GSHP; gap_c / gap_t: nn_set_loss_dgap */
     gscale = hgs_mul(gscale, hp);
-    const int nc = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c;
+    const int nc = blockIdx.y, n = nc / C; const bool unit = nc % C == unit_c, gap = nc % C == gap_c;
     const size_t v0 = (size_t)blockIdx.x * (256 * LG_V) + threadIdx.x, b0 = (size_t)nc * S;
     const bool on = w[nc] != 0;
     float x[LG_V]; unsigned tb[LG_V], mb[LG_V];
@@ -2259,7 +2263,7 @@ template <typename GT, typename LT = float> __global__ void __launch_bounds__(25
     for (int k = 0; k < LG_V; k++) {
         const size_t v = v0 + 256 * k;
         x[k] = 0.f; tb[k] = 0u; mb[k] = 0u;
-        if (v < S && on) { mb[k] = m[(size_t)n * S + v]; if (unit && mb[k]) mb[k] = 1u; if (mb[k]) { x[k] = lgv(lg, b0 + v); tb[k] = t[b0 + v]; } }
+        if (v < S && on) { mb[k] = m[(size_t)n * S + v]; if (unit && mb[k]) mb[k] = 1u; if (mb[k]) { x[k] = lgv(lg, b0 + v); tb[k] = t[b0 + v]; if (gap && (int)tb[k] >= gap_t) { mb[k] = 0u; tb[k] = 0u; x[k] = 0.f; } } }
     }
 #pragma unroll
     for (int k = 0; k < LG_V; k++) {

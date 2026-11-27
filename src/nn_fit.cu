@@ -407,6 +407,44 @@ extern "C" void nn_fit_finalize_ct(const float *acc, size_t nf, int h, uint8_t *
     fit_finalize_ct_k<<<nblk(nf, 256), 256>>>(acc, acc + 12 * nf, acc + 13 * nf, nf, h, oct, ocs); KCHECK();
 }
 
+/* predict --fit-dv 1 (train --density-nll checkpoints, 2026-11-27 densvar): the density's learned log-variance s (channel ch, the logit,
+   clamped to [-12, 6]) summed over each cell's material voxels in the window interior (the voxels of nn_fit_accum's material plane 1)
+   into acc_dv; nn_fit_finalize_dv: dv = round((mean s + 12) x 255 / 18) where the cell has material, else 0 */
+template <typename LT>
+__global__ void fit_accum_dv_k(const LT *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, int bz, int by, int bx, int h,
+                               int fz0, int fy0, int fx0, int nfz, int nfy, int nfx, int F1, int F2, int ch, float *acc) {
+    const size_t ci = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (ci >= (size_t)nfz * nfy * nfx) return;
+    const int fz = fz0 + (int)(ci / ((size_t)nfy * nfx)), fy = fy0 + (int)(ci / nfx % nfy), fx = fx0 + (int)(ci % nfx);
+    const size_t w3 = (size_t)D * W * W; float v = 0.f; int any = 0;
+    for (int t = 0; t < h * h * h; t++) {
+        const int lz = t / (h * h), ly = (t / h) % h, lx = t % h;
+        const int gz = fz * h + lz, gy = fy * h + ly, gx = fx * h + lx, wz = gz - tz, wy = gy - ty, wx = gx - tx;
+        if (gz >= bz || gy >= by || gx >= bx || wz < hz || wz >= D - hz || wy < halo || wy >= W - halo || wx < halo || wx >= W - halo) continue;
+        const size_t i = ((size_t)wz * W + wy) * W + wx;
+        if (!(bits ? (bits[i >> 5] >> (i & 31)) & 1u : ct[i])) continue;
+        v += fminf(6.f, fmaxf(-12.f, lgv(lg, (size_t)ch * w3 + i))); any = 1;
+    }
+    if (any) atomicAdd(&acc[((size_t)fz * F1 + fy) * F2 + fx], v);
+}
+extern "C" void nn_fit_accum_dv(const float *lg, const uint8_t *ct, const uint32_t *bits, int D, int W, int hz, int halo, int tz, int ty, int tx, const int box[3], int h, const int F[3], int ch, float *acc_dv) {
+    int f0[3], f1[3];
+    const int t[3] = {tz, ty, tx}, wn[3] = {D, W, W}, hn[3] = {hz, halo, halo};
+    for (int d = 0; d < 3; d++) {
+        int lo = t[d] + hn[d], hi = t[d] + wn[d] - hn[d]; if (lo < 0) lo = 0; if (hi > box[d]) hi = box[d];
+        f0[d] = lo / h; f1[d] = (hi + h - 1) / h; if (f1[d] > F[d]) f1[d] = F[d];
+        if (f1[d] <= f0[d]) return;
+    }
+    const int nfz = f1[0] - f0[0], nfy = f1[1] - f0[1], nfx = f1[2] - f0[2];
+    if (g_logits_h16) fit_accum_dv_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>((const f16 *)lg, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfz, nfy, nfx, F[1], F[2], ch, acc_dv);
+    else fit_accum_dv_k<<<nblk((size_t)nfz * nfy * nfx, 128), 128>>>(lg, ct, bits, D, W, hz, halo, tz, ty, tx, box[0], box[1], box[2], h, f0[0], f0[1], f0[2], nfz, nfy, nfx, F[1], F[2], ch, acc_dv);
+    KCHECK();
+}
+__global__ void fit_finalize_dv_k(const float *mat, const float *sum, size_t nf, uint8_t *o) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; if (i >= nf) return;
+    o[i] = mat[i] > 0.f ? (uint8_t)fminf(255.f, fmaxf(0.f, lroundf((__fdiv_rn(sum[i], mat[i]) + 12.f) * (255.f / 18.f)))) : 0;
+}
+extern "C" void nn_fit_finalize_dv(const float *acc, size_t nf, int kdv, uint8_t *odv) { fit_finalize_dv_k<<<nblk(nf, 256), 256>>>(acc + nf, acc + (size_t)kdv * nf, nf, odv); KCHECK(); }
+
 /* predict --fit-fields of a task unwrap2 checkpoint: the winding mod 4 head as gauge-free relative planes. Per field cell and axis a
    (z, y, x) the material-voxel sums of p(v + d e_a) conj p(v), p = (2 sigma - 1) of the cos / sin channels (ch_w4, ch_w4 + 1): the
    predicted W difference mod 4 over d voxels, inside one window (one gauge). acc: 9 planes of nf cells (re, im, count per axis);
@@ -498,9 +536,12 @@ struct fl_args {
     int nsl, so[FL_MAXS], wso[2];                 /* region 0's slots -> stem outputs; regions 1-3: slot u = the winding channel u's output wso[u] (-1 none) */
     float *dbg;                                   /* (test_fit_lat: region 0's logits of the in-window voxels, [nch][D H W] fp32) */
     __half *wl; int wz0, wnz;                     /* the winding pair's plane mode (nn_fit_accum_lat_w4p): region 0's pair logits of window planes [wz0, wz0 + wnz) into wl [2][wnz][H][W] */
+    int lq0; size_t lcs;                          /* lg holds cell planes [lq0, ...) of the window, channel stride lcs cells (nn_fit_accum_lat_planes; whole window: 0, d h w) */
 };
 static float *g_fl_dbg;
 extern "C" void nn_fit_accum_lat_debug(float *planes) { g_fl_dbg = planes; }
+static thread_local int g_fl_q0, g_fl_qd; static thread_local size_t g_fl_cs;   /* (the calling thread's next calls: one predict thread per GPU) */
+extern "C" void nn_fit_accum_lat_planes(int q0, int qd, size_t cstride) { g_fl_q0 = q0; g_fl_qd = qd; g_fl_cs = cstride; }
 template <typename T>
 __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg, const float *__restrict__ sp, const uint8_t *__restrict__ ctx, const uint8_t *__restrict__ ct,
                                                        const uint32_t *__restrict__ bits, fl_args A, float *acc, float *acc4) {
@@ -512,7 +553,7 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
     const int nreg = A.ch_w4 >= 0 && !A.wl ? 4 : 1, C = A.C;   /* (plane mode: no partner regions, fit_w4_plane_k reads the pair from wl) */
     int org[4][3];
     for (int r = 0; r < 4; r++) { org[r][0] = bz0 - A.tz; org[r][1] = by0 - A.ty; org[r][2] = bx0 - A.tx; if (r) org[r][r - 1] += A.dd; }
-    const size_t cv = (size_t)A.d * A.h * A.w, hw = (size_t)A.H * A.W;
+    const size_t cv = A.lcs, hw = (size_t)A.H * A.W;
     /* the coarse neighbourhoods: staged cell q of a region = the clamped cell (o >> 2) - 1 + (q >> 4, q >> 2 & 3, q & 3) */
     {
         const int n0 = A.nch * 64, nt = n0 + (nreg - 1) * 2 * 64;
@@ -520,7 +561,7 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
             const int r = k < n0 ? 0 : 1 + (k - n0) / 128, cc = k < n0 ? k >> 6 : (k - n0) >> 6 & 1, q = k & 63;
             const int c = r ? A.ch[A.ndm + cc] : A.ch[cc];
             const int cz = min(max((org[r][0] >> 2) - 1 + (q >> 4), 0), A.d - 1), cy = min(max((org[r][1] >> 2) - 1 + (q >> 2 & 3), 0), A.h - 1), cx = min(max((org[r][2] >> 2) - 1 + (q & 3), 0), A.w - 1);
-            const float v = ldv(lg, (size_t)c * cv + ((size_t)cz * A.h + cy) * A.w + cx);
+            const float v = ldv(lg, (size_t)c * cv + ((size_t)(cz - A.lq0) * A.h + cy) * A.w + cx);
             if (r) csw[r - 1][cc][q] = v; else cs0[cc][q] = v;
         }
     }
@@ -596,7 +637,7 @@ __global__ void __launch_bounds__(FL_T) fit_accum_lat_k(const T *__restrict__ lg
         float a = __half2float(r ? U.L.lw[r - 1][k - A.ndm][tid] : U.L.l0[k][tid]);
         const int c = A.ch[k];
         if (!r && A.sbase >= 0 && c < 2)
-            a = fl_h(a + ldv(lg, (size_t)(A.sbase + 64 * c + sub) * cv + ((size_t)((org[0][0] + lz) >> 2) * A.h + ((org[0][1] + ly) >> 2)) * A.w + ((org[0][2] + lx) >> 2)));
+            a = fl_h(a + ldv(lg, (size_t)(A.sbase + 64 * c + sub) * cv + ((size_t)(((org[0][0] + lz) >> 2) - A.lq0) * A.h + ((org[0][1] + ly) >> 2)) * A.w + ((org[0][2] + lx) >> 2)));
         const int sl = r ? (A.wso[k - A.ndm] >= 0 ? k - A.ndm : -1) : A.slot[k];
         if (C && sl >= 0) a = fl_h(a + sst[r][blk][sl]);
         return a;
@@ -791,6 +832,14 @@ static int fit_accum_lat_go(const void *lg, int lh16, int d, int h, int w, int s
     A.fz0 = f0[0]; A.fy0 = f0[1]; A.fx0 = f0[2]; A.nfy = e1[1] - f0[1]; A.nfx = e1[2] - f0[2];
     const size_t nb = (size_t)(e1[0] - f0[0]) * A.nfy * A.nfx;
     if (nb > 0x7fffffff) return 1;
+    A.lq0 = 0; A.lcs = (size_t)d * h * w;
+    if (g_fl_qd) {   /* held cell planes (predict's per-chunk head): every staged cell plane (the blocks' clamped (o >> 2) - 1 .. + 2, the partners' + dd) inside them */
+        const int nreg = ch_w4 >= 0 && !A.wl ? 4 : 1, zlo = (A.oz + f0[0] * 8 - tz) >> 2, zhi = ((A.oz + (e1[0] - 1) * 8 - tz + (nreg > 1 ? dd : 0)) >> 2) + 2;
+        const int c0 = zlo - 1 < 0 ? 0 : zlo - 1, c1 = zhi > d - 1 ? d - 1 : zhi;
+        if (c0 < g_fl_q0 || c1 >= g_fl_q0 + g_fl_qd || g_fl_cs < (size_t)g_fl_qd * h * w) {
+            fprintf(stderr, "nn_fit_accum_lat: cell planes [%d, %d] outside the held [%d, %d)\n", c0, c1, g_fl_q0, g_fl_q0 + g_fl_qd); abort(); }
+        A.lq0 = g_fl_q0; A.lcs = g_fl_cs;
+    }
     if (lh16) fit_accum_lat_k<f16><<<(unsigned)nb, FL_T>>>((const f16 *)lg, stem, ctx, ct, bits, A, acc, acc4);
     else fit_accum_lat_k<float><<<(unsigned)nb, FL_T>>>((const float *)lg, stem, ctx, ct, bits, A, acc, acc4);
     KCHECK();

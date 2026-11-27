@@ -244,6 +244,28 @@ static void cf_cg_run(void *a, long z0, long z1, int t) {
     }
     L->part[t][0] = s0; L->part[t][1] = s1;
 }
+/* --cf-robust K (globwind 2026-11-27): the count edges' least squares made robust by K IRLS passes per level. Each edge's weight
+   becomes w0 x psi(r) / r for the residual r = U_j - U_i - t (turns per solve cell), Huber: psi = r up to delta, then delta. With a
+   small delta (default 0.02 turn, against ~0.1-0.5 turn per edge) this is the L1 integration of the count field (convex; the L1 phase
+   unwrapping of Ghiglia & Romero). L2 spreads a merge's missing turns over everything around it; L1 leaves them on the few edges
+   through the merge, so the count is carried around it (along z, around the turn) by the consistent majority of edges.
+   (A redescending Cauchy weight was tried on the test lens: unstable, it broke the defect-free cases at delta 0.01; not kept.) */
+typedef struct { cf_lvl *L; float *w0[3]; double delta; double bad[CF_MAXT], wsum[CF_MAXT]; } cf_rob;
+static void cf_rob_run(void *a, long z0, long z1, int t) {
+    cf_rob *R = a; cf_lvl *L = R->L; const size_t st[3] = {(size_t)L->hh * L->w, (size_t)L->w, 1}; const int dm[3] = {L->d, L->hh, L->w};
+    double bad = 0, ws = 0;
+    for (long z = z0; z < z1; z++) for (int y = 0; y < L->hh; y++) for (int x = 0; x < L->w; x++) {
+        const size_t i = ((size_t)z * L->hh + y) * L->w + x; const int c0[3] = {(int)z, y, x};
+        for (int ax = 0; ax < 3; ax++) {
+            if (c0[ax] + 1 >= dm[ax]) continue;
+            const double w0 = R->w0[ax][i], r = fabs((double)L->U[i + st[ax]] - L->U[i] - L->tg[ax][i]);
+            ws += w0; if (r > 0.5) bad += w0;
+            const double f = r > R->delta ? R->delta / r : 1;
+            L->wt[ax][i] = (float)(w0 * f);
+        }
+    }
+    R->bad[t] = bad; R->wsum[t] = ws;
+}
 typedef struct { cf_pairs *R; const float *u; } cf_pq;
 static void cf_pairs_q_run(void *a, long p0, long p1, int t_) {
     cf_pq *Q = a; cf_pairs *R = Q->R;
@@ -640,6 +662,12 @@ int cmd_count_field(int argc, char **argv) {
        fields' merge-flag plane), so the counts route around merged sheets */
     const double mfw = opt_atof("--mf-w", cf_opt(argc, argv, "--mf-w", "0"));
     if (mfw > 0) { char mp[1400]; snprintf(mp, sizeof mp, "%s/mf/zarr.json", in); if (access(mp, F_OK)) { fprintf(stderr, "count-field: --mf-w needs %s (ufsm merge-flag)\n", mp); return 2; } fit_fields_mf_weight(mfw); }
+    {   /* --dv-w K --dv-ref S (2026-11-27 densvar): the density evidence of a cell x min(1, e^(-K (s - S))), s its learned log-variance (predict --fit-dv) */
+        const double dvw = opt_atof("--dv-w", cf_opt(argc, argv, "--dv-w", "0")), dvr = opt_atof("--dv-ref", cf_opt(argc, argv, "--dv-ref", "-6"));
+        if (dvw < 0) { fprintf(stderr, "count-field: --dv-w K >= 0\n"); return 2; }
+        if (dvw > 0) { char mp[1400]; snprintf(mp, sizeof mp, "%s/dv/zarr.json", in); if (access(mp, F_OK)) { fprintf(stderr, "count-field: --dv-w needs %s (predict --fit-dv 1)\n", mp); return 2; }
+                       fit_fields_dv_weight(dvw, dvr); fprintf(stderr, "count-field: density weights x min(1, e^(-%g (s - %g))) from the dv plane\n", dvw, dvr); }
+    }
     fit_fields_buf g; if (fit_fields_load(in, 0, 0, 0, &g)) { fprintf(stderr, "count-field: cannot load %s\n", in); return 1; }   /* geometry + the axis table */
     const int D = g.shape[0], H = g.shape[1], W = g.shape[2], na = (int)(D * g.h) + 1; const size_t n = (size_t)D * H * W, HW = (size_t)H * W;
     const double h = g.h;
@@ -1016,6 +1044,9 @@ int cmd_count_field(int argc, char **argv) {
         }
     }
     const double fhub = opt_atof("--cf-fib-huber", cf_opt(argc, argv, "--cf-fib-huber", "0.25")); const int firls = opt_atoi("--cf-fib-irls", cf_opt(argc, argv, "--cf-fib-irls", "3"));
+    const int rob_k = opt_atoi("--cf-robust", cf_opt(argc, argv, "--cf-robust", "0")), rob_all = opt_atoi("--cf-robust-all", cf_opt(argc, argv, "--cf-robust-all", "1"));
+    const double rob_d = opt_atof("--cf-robust-delta", cf_opt(argc, argv, "--cf-robust-delta", "0.02"));
+    if (rob_k > 0 && !(rob_d > 0)) { fprintf(stderr, "count-field: --cf-robust-delta %g: must be > 0\n", rob_d); return 2; }
     float *Sfine = Sl[0], *Gfine[3] = {Gl[0][0], Gl[0][1], Gl[0][2]}; const double tst1 = cf_now();
     for (int l = nl - 1; l >= 0; l--) {
         cf_lvl *L = &lv[l]; const int q = L->P; float *S = Sl[l], **G = Gl[l];
@@ -1058,6 +1089,20 @@ int cmd_count_field(int argc, char **argv) {
                 const int it2 = cf_cg_solve(L, iters, 1e-5, &rr);
                 fprintf(stderr, "count-field: IRLS %d (Huber %.2f): before %.4f off by > 0.5; %d CG iterations, residual %.2e -> %.4f\n", k + 1, fhub, bad, it2, rr, cf_pairs_reweight(L->pr, L->U, fhub, 0));
             }
+        }
+        if (rob_k > 0 && (l == 0 || rob_all)) {   /* --cf-robust: IRLS on the count edges (cf_rob_run) */
+            cf_rob RB = {L, {nullptr, nullptr, nullptr}, rob_d, {0}, {0}};
+            for (int k = 0; k < 3; k++) { RB.w0[k] = malloc(L->n * sizeof(float)); if (!RB.w0[k]) { fprintf(stderr, "count-field: out of memory (--cf-robust)\n"); return 1; } memcpy(RB.w0[k], L->wt[k], L->n * sizeof(float)); }
+            for (int k = 0; k <= rob_k; k++) {
+                cf_par(L->d, cf_rob_run, &RB); double bad = 0, ws = 0; for (int t = 0; t < CF_MAXT; t++) { bad += RB.bad[t]; ws += RB.wsum[t]; }
+                if (k == rob_k) { fprintf(stderr, "count-field: level %d robust (L1, Huber %.3f): edge weight off by > 0.5 turn %.4f after %d IRLS passes\n", l, rob_d, ws > 0 ? bad / ws : 0, rob_k); break; }
+                if (L->pr) cf_pairs_q(L->pr, L->U);
+                cf_par(L->d, cf_rhs_run, &RH); int it2 = -1;
+                if (gpu && !L->pr) { const float *wt3[3] = {L->wt[0], L->wt[1], L->wt[2]}; it2 = cf_gpu_cg(L->d, L->hh, L->w, L->lam, wt3, L->b, L->diag, L->U, iters, 1e-5, &rr); }
+                if (it2 < 0) it2 = cf_cg_solve(L, iters, 1e-5, &rr);
+                if (k == 0 || k + 1 == rob_k) fprintf(stderr, "count-field: level %d robust IRLS %d: before %.4f of the edge weight off by > 0.5 turn; %d CG iterations, residual %.2e\n", l, k + 1, ws > 0 ? bad / ws : 0, it2, rr);
+            }
+            for (int k = 0; k < 3; k++) free(RB.w0[k]);
         }
         if (l + 1 < nl) { cf_lvl *C = &lv[l + 1]; cf_pairs_free(C->pr); C->pr = nullptr; free(C->b); free(C->diag); free(C->r); free(C->p); free(C->Ap); for (int k = 0; k < 3; k++) { free(C->wt[k]); free(C->tg[k]); } C->b = C->diag = C->r = C->p = C->Ap = nullptr; for (int k = 0; k < 3; k++) C->wt[k] = C->tg[k] = nullptr; }
     }

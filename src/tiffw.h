@@ -14,6 +14,10 @@ int tiffw_write(const char *path, int w, int h, int fmt, const void *data, int d
    area_vx2 (valid quads x step^2), area_cm2, voxel_size_um, winding, source. */
 int tifxyz_write(const char *dir, int w, int h, const float *x, const float *y, const float *z, double step, double voxel_um, int winding,
                  const char *source);
+/* the same with extra meta.json members: `extra` is a JSON member list without braces (e.g. "\"scan\": \"S\", \"scroll\": \"P\""),
+   appended after "source" (nullptr / "": none). The meta stays under 4 KB. */
+int tifxyz_write_ex(const char *dir, int w, int h, const float *x, const float *y, const float *z, double step, double voxel_um, int winding,
+                    const char *source, const char *extra);
 
 /* Surface-compressor (.sfc) wraps (user 10-21: per-box wraps stored as .sfc, read directly). src/tfx.c installs the hooks when it is
    linked (the ufsm binary); without it they stay null and only plain tifxyz directories exist.

@@ -249,6 +249,20 @@ extern "C" void nn_err_post(int e, const char *file, int line, const char *what)
     pthread_mutex_unlock(&g_errp_mu);
 }
 extern "C" void nn_err_worker(int on) { g_err_worker = on; }
+/* CK / LPCK on a kernel that cannot be loaded (NN_LOAD_ERR): the launch fails every time, so latching it let a caller that reads
+   nn_check late (or never: test_gpu_aug) go on with unwritten buffers (11-27: four_tab_k's sincospi, no double sinpi in mcc's device
+   library; mcudahw now stops there itself). UFSM_CUDA_LOAD_SOFT=1 latches it as before, with a DEFAULTED line. */
+extern "C" void nn_err_load_fatal(int e, const char *file, int line, const char *what) {
+    if (ufsm_env_on("UFSM_CUDA_LOAD_SOFT")) {
+        static int said;   /* mgpu: debug (one DEFAULTED line; a race prints it twice) */
+        if (!said) { said = 1; fprintf(stderr, "DEFAULTED: UFSM_CUDA_LOAD_SOFT: a kernel that cannot be loaded (CUDA %d at %s:%d, %s) is latched, not fatal\n", e, file, line, what); }
+        return;
+    }
+    fprintf(stderr, "FATAL: CUDA error %d (%s) at %s:%d (%s): a kernel that cannot be loaded (build / toolchain error); stopping (UFSM_CUDA_LOAD_SOFT=1: latch it)\n",
+            e, cudaGetErrorString((cudaError_t)e), file, line, what);
+    fflush(stderr);
+    abort();
+}
 #define CKR(x) do { const int had_ = g_err != cudaSuccess; CK(x); if (!had_ && g_err != cudaSuccess) g_err_ra = __builtin_return_address(0); } while (0)
 extern "C" const char *nn_check_site(void) { return g_err_site; }
 /* logical devices (src/ufsm_dev.cuh, ops audit #8): set once before the GPU threads start (mgpu: process) */
@@ -772,7 +786,7 @@ static const char *const g_ws_name[NN_WS_N] = {
     "lp_buf f16 slot 0", "lp_buf f16 slot 1", "lp_buf f16 slot 2", "lp_buf f16 slot 3", "lp_buf f16 slot 4", "lp_buf f16 slot 5",
     "lp_buf bf16 slot 0", "lp_buf bf16 slot 1", "lp_buf bf16 slot 2", "lp_buf bf16 slot 3", "lp_buf bf16 slot 4", "lp_buf bf16 slot 5",
     "fp4 GroupNorm input copy (prenorm)", "fine stem partial sums", "tc weight copy (16-bit)", "tc weight scales", "s2b gy overlap copy", "s2 fp8 GroupNorm input copy (prenorm)"};
-static void *g_ws[8][NN_WS_N]; static size_t g_ws_cap[8][NN_WS_N], g_ws_lim[8][NN_WS_N]; static int g_ws_sealed[8];   /* mgpu: per-device */
+static void *g_ws[8][NN_WS_N]; static size_t g_ws_cap[8][NN_WS_N], g_ws_lim[8][NN_WS_N], g_ws_keep[8]; static int g_ws_sealed[8];   /* mgpu: per-device */
 static pthread_mutex_t g_ws_mu = PTHREAD_MUTEX_INITIALIZER;   /* (the late-grow report and the totals; the slots themselves are per device) */
 static int ws_dev(void) { int d = 0; cudaGetDevice(&d); return d & 7; }
 static int ws_grow(int d, int id, size_t bytes) {
@@ -787,6 +801,10 @@ extern "C" void *nn_ws(int id, size_t bytes) {
     if (id < 0 || id >= NN_WS_N) return nullptr;
     const int d = ws_dev();
     if (bytes <= g_ws_cap[d][id]) return g_ws[d][id];
+    if (g_ws_keep[d] && (id == NN_WS_F4PRE || id == NN_WS_S2PRE)) {   /* (nn_ws_keep_free: the optional prenorm copies, which have same-bits fallbacks) */
+        size_t fr = 0, tot = 0; cudaMemGetInfo(&fr, &tot);
+        if (fr + g_ws_cap[d][id] < bytes + g_ws_keep[d]) return nullptr;
+    }
     if (g_ws_sealed[d]) {
         if (g_ws_lim[d][id] && bytes > g_ws_lim[d][id]) return nullptr;   /* (a soft limit: the caller's fallback) */
         pthread_mutex_lock(&g_ws_mu);
@@ -802,6 +820,7 @@ extern "C" int nn_ws_reserve(int id, size_t bytes) {   /* the current device's w
     return bytes <= g_ws_cap[d][id] ? 0 : ws_grow(d, id, bytes);
 }
 extern "C" void nn_ws_limit(int id, size_t bytes) { if (id >= 0 && id < NN_WS_N) g_ws_lim[ws_dev()][id] = bytes; }   /* 0: none */
+extern "C" void nn_ws_keep_free(size_t bytes) { g_ws_keep[ws_dev()] = bytes; }
 extern "C" void nn_ws_seal(int on) { g_ws_sealed[ws_dev()] = on; }
 extern "C" int nn_ws_sealed(void) { return g_ws_sealed[ws_dev()]; }   /* (1: the trainer's plan holds: optional workspaces stay out) */
 extern "C" size_t nn_ws_bytes(int id) { const int d = ws_dev(); if (id >= 0) return id < NN_WS_N ? g_ws_cap[d][id] : 0; size_t t = 0; for (int i = 0; i < NN_WS_N; i++) t += g_ws_cap[d][i]; return t; }

@@ -74,6 +74,634 @@ Runs: A, the coarse dev crops (inksdk/dev/crops, 7.9-9.4 um, 7 scans, 91 tiles);
 the control, F adds `--aug-fourier-p .3 --aug-fourier-cut .03`, G sets `--aug-gin-p 0`, B sets `--aug-blur-s 0.8` (G / B change the
 argv's own value: opt() takes the first occurrence). inkeval's ab.sh scores 1447 / 0841 per scroll, F − A paired by crop
 (LEVEL_0841 2, PWIN 288). Results will be added here.
+## ATLAS-15k as extra labels: import, inventory, CPU quality audit; 58 % of its area passes a gate (2026-11-27, branch atlas-20261127, atlas)
+
+**Dataset.** huggingface.co/datasets/Qualzz20/ATLAS-15k (rev ac4b982a, CC BY-NC 4.0): 14,678 recto patches on 28 scrolls, 2,306 cm².
+- Each patch is an x / y / z float32 node grid at a 2-voxel spacing, -1 = no node. The mean grid is 221 x 221 nodes (~440 voxels).
+- The patches sit on the public 8.64 / 9.362 / 9.366 um level-0 scans.
+- 18 Parquet files, 8,608,185,540 bytes, at /vesuvius/ufsm/atlas/raw. Download and import were each ~7 min.
+- None is on PHerc1667, Paris 4 or 0500P2. The related upstream model (atlas-mini-h) is not used.
+
+**Import.** `ufsm atlas-import OUT FILE.parquet...` writes OUT/<scroll>/<id>.tifxyz and OUT/index.tsv. The tifxyz layout is the one
+the `meshes` onfly sources read. The meta records scale 1/2, voxel_size_um, scroll, scan (the .zarr name), scan_url, atlas_id and
+license. The reader is a minimal C Parquet reader (src/parquet.c):
+- the Thrift-compact footer;
+- v1 and v2 data pages and dictionary pages;
+- snappy, gzip and zstd;
+- PLAIN and RLE_DICTIONARY encodings, and Dremel levels for nested lists.
+
+The files are pyarrow 20, one row group each, snappy, PLAIN floats. test_atlas writes such a file in C, covering every path the reader
+claims. Checks on the full set:
+
+| check | result |
+|---|---|
+| rows written | 14,678 / 14,678 |
+| nodes with -1 on one axis only | 0 |
+| the dataset's box_min / box_max_xyz equal the nodes' floor / ceil bbox (within 1 voxel) | 14,678 / 14,678 |
+| our quad area vs its area_cm2 | 2,297.8 vs 2,305.7 cm², max per-patch difference 0.056 cm² |
+
+Output: /vesuvius/ufsm/atlas/surf, 5.6 GB.
+
+**Audit.** `ufsm atlas-audit INDEX --ref DIR... [--value q.tif] [--holdouts H]...` is CPU only.
+- Each ATLAS node is matched to the nearest reference vertex within 20 voxels.
+- We measure its tangent-plane distance and the reference's sheet label: the GT q (one gauge per set), or our wrap id.
+- Grid neighbours on the sheet (≤ 4 voxels) whose labels differ by ≥ 0.5 are switch edges.
+- "big" is the largest sheet's share of the patch's on-sheet nodes. Components are joined across gaps when their labels agree.
+- Holdout boxes are matched by CT basename with a 16-voxel guard.
+- Whole-scroll wrap sets keep only vertices near patch nodes. Without that filter, 1203's set OOMed at 16 GB; with it, 54.6 M vertices.
+- `--tile T` splits a long surface into patch-sized calibration rows.
+
+`wrap-align` (share of mesh normals within 0.9 cos of the CT lamination, level 0, every 4th node) ran on every patch.
+Kit: /vesuvius/ufsm/atlas/{import,audit,align,table}.sh. Tables are in audit/.
+
+**Calibration** (what each reference can measure):
+
+| surface | reference | p50 plane dist (vox) | tiles single-sheet (big ≥ 0.95) | big |
+|---|---|---|---|---|
+| ATLAS, 812 patches on 1203 | our -p wraps (try9 era) | 2.04 (median) | 6.6 % | median 0.61 |
+| HercUeNet's approved VC3D sheet on 1203, cut into 41 ATLAS-sized tiles | our -p wraps | 3.2 (mean) | 7.3 % | mean 0.59 |
+| ATLAS, 435 patches on 0139 covered by GT | GT qA / qB | 1.65 (median) | 70 % | median 0.995 |
+
+- **Our wraps cannot judge sheet identity.** A human-approved single sheet "switches" our wraps exactly as often as ATLAS does: at
+  ~440 voxels our level sets cross sheets. On the pod-era wraps of 21 other scrolls ATLAS shows the same pattern (single-sheet
+  0-6 %). So off GT the audit gives only the distance: is the patch on a sheet our fit sees.
+- **CT alignment.** ATLAS aligns better than our own meshes on every scroll checked:
+
+  | scroll | ATLAS mean | our wraps (3 each) | GT meshes |
+  |---|---|---|---|
+  | 0125 | 0.59 | 0.41-0.50 | |
+  | 0175A | 0.85 | 0.37-0.75 | |
+  | 0009B | 0.64 | 0.50-0.57 | |
+  | 1203 | 0.78 | 0.13-0.65 | |
+  | 0139 | 0.92 | | 0.88 (21 meshes with samples) |
+
+  The low scrolls are low for our meshes too, so a gate at 0.8 would reject low-contrast scans, not bad patches. The gate uses 0.6.
+- GT itself is noisy: 0139 boxes 1-4 / 6-8 and all 0814 boxes are wbench label-noise (ceiling < 0.8). The 0139 "multi-sheet 28 %" is
+  therefore an upper bound on ATLAS switches. On 0814 only 17 patches touch GT, at p50 7.0 voxels: 0814's GT is not usable as a judge.
+
+**Per scroll.** Columns:
+- held: patches touching a holdout box (holdouts-w24 ∪ holdouts-J1);
+- dist p50 / le4: vs GT on 0139 / 0814, vs our wraps elsewhere; le4 is the share of matched nodes ≤ 4 voxels;
+- pass: the gate (no holdout box, le4 ≥ 0.7, align ≥ 0.6, plus p50 ≤ 2 and big ≥ 0.95 where GT covers the patch).
+
+CT is local at level 0 (/vesuvius/ufsm/v2/ct) for all 28 scans, and on ~/nas2/volcomp levels 0-5.
+
+| scroll | um | patches | cm² | held | ours already on the scroll | ref | p50 / le4 | align ≥ 0.6 | pass | pass cm² |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0800 | 8.64 | 2022 | 301.3 | 0 | none | wraps | 2.03 / 0.84 | 0.92 | 1728 | 260.2 |
+| 1447 | 8.64 | 1477 | 218.5 | 35 | fib; ink holdout | wraps | 1.80 / 0.86 | 0.98 | 1312 | 194.5 |
+| 0139 | 9.362 | 1178 | 200.5 | 452 | GT qA/qB, good, u2ink/hf (2.4 twin) | GT (435) | 2.70 / 0.76 | 1.00 | 164 | 28.5 |
+| 0175A | 8.64 | 1323 | 192.5 | 0 | good, fib | wraps | 2.15 / 0.81 | 1.00 | 1139 | 166.8 |
+| 0125 | 9.362 | 1038 | 174.0 | 246 | fib | wraps | 2.33 / 0.80 | 0.49 | 326 | 54.7 |
+| 0306B | 8.64 | 1131 | 163.6 | 0 | none | wraps | 2.12 / 0.81 | 0.92 | 888 | 129.2 |
+| 1203 | 9.362 | 812 | 135.3 | 0 | our unroll only (prize scroll: local only) | -p wraps | 2.09 / 0.82 | 0.94 | 689 | 114.9 |
+| 1545 | 9.362 | 685 | 112.1 | 0 | none | wraps | 2.26 / 0.80 | 0.79 | 447 | 73.7 |
+| 1218 | 8.64 | 739 | 104.9 | 0 | b3 (weight 0) | none | - | 0.78 | 0 | 0 |
+| 0826 | 9.362 | 618 | 103.3 | 0 | none | wraps | 2.48 / 0.75 | 0.98 | 402 | 67.5 |
+| 0814 | 9.362 | 614 | 102.0 | 28 | GT qs (w24), u2ink (2.4) | GT (17) | 7.00 / 0.48 | 0.99 | 4 | 0.6 |
+| 0813 | 9.362 | 580 | 96.1 | 0 | none | wraps | 2.73 / 0.70 | 0.99 | 294 | 48.6 |
+| 0846A | 9.362 | 581 | 95.7 | 0 | none | wraps | 2.50 / 0.77 | 0.60 | 255 | 41.7 |
+| 0841 | 9.366 | 541 | 89.0 | 0 | u2ink (2.4); ink holdout | wraps | 2.19 / 0.80 | 1.00 | 472 | 77.6 |
+| 0846B | 9.362 | 504 | 83.4 | 0 | none | none | - | 0.60 | 0 | 0 |
+| 0009B | 8.64 | 189 | 27.5 | 0 | good, u2ink (2.4) | wraps | 2.76 / 0.72 | 0.59 | 84 | 12.4 |
+| 12 small scrolls (0175B 0191 0211 0257 0268 0343 0358 0483A/B 0490A/B 1451) | | 646 | 98.2 | 0 | 1451 hf (2.4) | wraps (not 0268 / 0490B) | 2.0-3.6 / 0.69-0.85 | 0.29-1.00 | 409 | 63.0 |
+
+Totals:
+
+| | patches | cm² |
+|---|---|---|
+| pass the gate | 8,613 | 1,334 (58 %) |
+| pass, without 0841 / 1447 (ink holdouts, kept out for now) | 6,829 | 1,062 |
+
+1218 / 0846B / 0268 / 0490B have no wraps of ours (no reference), so they fail the gate. An align-only gate would pass 0.78 / 0.60 /
+0.64 / 0.29 of them.
+
+Overlap:
+- Holdout boxes: 0139 452 patches (slab z7936, 139-1/2/3/4/7/8, three mapped ink crops), 0125 246 (slab z11776), 1447 35 (1447-HOLD),
+  0814 28 (814-7).
+- 18 of the 28 scrolls carry no label of ours.
+
+**Proposal: a short fine-tune A/B (not run).**
+1. Labels:
+   - The recto side and the normal: the ATLAS sheet is the recto face, so the rv / normal / density heads get the patch band.
+   - Phase only where a patch has a q:
+     - 0139 GT-covered patches take q from the GT gauge;
+     - elsewhere `wind-assign` against the try9 count field, which makes the patches a `meshes` onfly set (q.tif) for the pair rule.
+     - An isolated patch gives phase only near itself, so phase waits for those q sets.
+2. Sources: one source per scroll from the gated list.
+   - Exclude 0841 and 1447, and every patch touching a holdout box.
+   - `holdout_file` = holdouts-w24 ∪ J1, `holdout_mode` mask, `holdout_strict` 1.
+   - Keep 10 % of each scroll's ATLAS patches (one z slab) out of training as an ATLAS eval set.
+   - Total ATLAS weight 0.15, per scroll ∝ passing area, capped at 0.03.
+   - 1203 is included; its data stays local.
+3. Arms: both init from try9 with try9's sources. B adds the ATLAS sources. 3000 steps each on one card in a desk window, paired.
+4. Score:
+   - wbench BOXES=holdout, paired B - A;
+   - rv p1667;
+   - on the held ATLAS slab, the distance of B's predicted recto to the patches (atlas-audit with the predicted wraps as --ref).
+5. Gate: wbench p05x Δ ≥ -0.01 (CI) and the ATLAS-holdout distance improves. Otherwise ATLAS stays out.
+
+### Gate as a filter, labels, A/B set-up, atlas-mini-h baseline (2026-11-27 afternoon)
+
+User decision: train recto detection with ATLAS. `scripts/atlas/gate.sh` runs `atlas-audit --allow --write-q` per scroll against our old
+wraps (gate-scrolls.tsv; 0814 / 1218 / 0846B via the NAS wraps_src), thresholds calibrated on HercUeNet's approved 1203 sheets
+(big ≥ 0.271 = their p10, amb ≤ 0.052 = their p90, le4 ≥ 0.7), after CT alignment ≥ 0.6 and a holdout check (patch bbox + 16 voxels
+touches no box of holdouts-atlas.json: every wbench box, holdouts-20261114, J1, two ATLAS eval slabs 0800 z11136+640 / 0306B z8704+896).
+Excluded scrolls: 0841 / 1447 (ink holdouts), 0139 (rv p139 scroll; GT calibration), 0268 (no wrap meshes), 0490B (no axis).
+
+| stage (first failed) | patches |
+|---|---|
+| in the 23 gated scrolls | 11,422 |
+| held (holdout box) | 1,097 |
+| dropped: CT alignment < 0.6 | 1,555 |
+| nocover (matched < 0.3) | 56 |
+| fail (off-sheet le4 < 0.7: 1,318; switch big < 0.271: 1,266; merge amb > 0.052: 446; overlapping) | 2,505 |
+| **kept** (q.tif written) | **6,209 (960 cm²)** |
+
+Largest kept: 0175A 159 cm², 0800 150, 1203 112, 0306B 96, 1218 66, 1545 65, 0814 64.
+
+Labels: each kept patch gets q = K + θ/2π about the scroll axis, K the median wrap id of its matched nodes (the old wraps' gauge), as a
+`meshes` onfly set; the pair rule gives the phase where two consecutive q sheets are within rmax (41 / 44 cells), and --rv 2 derives the
+recto / verso target from that phase (same target as try9's rv head). Sources (`scripts/atlas/mksources.sh`): one per scroll, level 0,
+scope local, heads rv + normal (phase / density / wind4 off: the gauge is ours, not ATLAS's), weight 0.15 by kept area (cap 0.03),
+holdout_file only where the scan has boxes (holdout_strict: a file without a box is fatal).
+
+CPU sampler-only pass (UFSM_SAMPLER_ONLY, every device flag -1, --strict-sources 1): 92 windows over the 23 ATLAS sources, **0 DEFAULTED**,
+every source built windows; phase known 0.3-5.7 % of material per window (sparse patches). Phase rises outward on ≥ 0.97 of the aligned
+gradient samples on 19 sources, but 0009B 0.00 (inverted gauge) and 0483A 0.47: both removed from B (weight 0.002). B (try9's 32 sources
++ 21 ATLAS, ATLAS weight 0.148): strict load, 0 DEFAULTED over 20 batches (then the 16 G dev cap; try9's ink cache).
+
+A/B (`/vesuvius/ufsm/atlas/ab/ab.sh`, card 0 slot): from try9cool cooled-33333 (production rv), try9's flags, seed 3, 80 steps
+(~41 s / step at accum 10: ~55 min) per arm, A = try9's sources, B = + ATLAS. Score (scripts/rv/eval.sh's count fields are gone since
+11-17): `ufsm atlas-rvscore` on predict --heads rv of base / A / B: (1) balanced recto / verso accuracy on the papyrus of 4 held GT boxes
+(139-5, Paris4 HOLD, 1667 C2 / C10; GT side = GT pair-rule phase < 1/2 turn), (2) on 60 held ATLAS patches in 3 slab boxes (0800, 0306B
+x2): the share of nodes whose outer side (+2 voxels along the normal away from the axis) reads recto and inner side not.
+
+atlas-mini-h baseline (measurement only, NC licence, isolated venv /vesuvius/ufsm/atlas/mini, pins in PINS.txt): 128³ tiles, F1 of the
+surface band within 2 voxels of the GT sheets over the known-phase region, best threshold: 139-5 (0139 in ATLAS: in-distribution) 0.78,
+Paris4 HOLD 0.69, 1667 C2 0.67, C10 0.59. Peak 2.4 GB per window, 75-126 s per box on card 1. Its from_pretrained pulls unpinned weights;
+run offline from the pinned local files.
+
+## Density uncertainty and the min-gap rule from upstream villa: opt-in train / predict / count-field paths (2026-11-27, branch densvar-20261127, densvar)
+
+This ports idea 2 of the villa scan (/vesuvius/ufsm/research/villa.md; upstream `winding_targets.density_loss`, `density_supervision_mask`).
+All of it is opt-in. With the flags off every path runs the same calls as before.
+
+- **`train --density-nll L`** (task unwrap2, head slabs): one more output channel, the density's learned log-variance s.
+  - Its logit is s, clamped to [-12, 6], with no gradient outside the clamp.
+  - The loss is the beta-NLL 0.5 (e^-s r^2 + s) x e^(beta s) (the last factor detached), with r = sigmoid(z_density) - t / 255 in the
+    density code space. The mean NLL over the supervised voxels is multiplied by L x the source's density weight.
+  - `--density-nll-beta` (0.5, upstream's value).
+  - `--density-nll-mean 1`: the density BCE gradient is also scaled per voxel by a / mean(a), a = e^-(1-beta) s (the beta-NLL attenuation,
+    renormalised over the window). The default 0 leaves the mean's BCE unchanged.
+  - The kernels are in src/nn_dvar.cu. The log line gets `dvnll` and the mean s; runtime json `density_nll` gives the channel.
+- **Checkpoint layout.** In a `--fib-head` net (w24) the channel takes the first pad slot (23), so the net keeps 32 outputs and w24
+  checkpoints load unchanged. Without pads it is appended last. It is not in the fine-stem list, so the stem's parameters keep their shape.
+- **`train --density-min-gap-um G`.** No density supervision (BCE and NLL) on voxels whose labelled spacing is under G um.
+  - Upstream's `density_min_gap_wv` is 4 voxels at 9.6 um = 38.4 um. In our code it drops the density targets whose code is >= the code
+    of spacing G at the window's voxel size: `nn_set_loss_dgap`, a thread-local hook in the slab stats / grad loss kernels for channel 6.
+  - It is the alternative to `--packed-weight 8`, so the A/B arm adds `--density-packed 0`; the normal planes keep the packed weight.
+- **Restrictions.** Both training flags need the unfused head chain: the fused latent kernel has no variance or gap terms. With them
+  g_lat_fuse is off and the trainer says so; the arithmetic is the same, only slower. No `--split`, `--single` or `--count-lambda`.
+- **`predict --fit-dv 1`** writes the fit-field plane `dv` = (mean s over the cell's material + 12) x 255 / 18.
+  - It uses the plane path, not the fused fit kernel (whose other planes are byte-identical, per test_fit_lat).
+  - No `--tta` and no `--fit-ct` with it.
+- **`count-field --dv-w K --dv-ref S`.** Every field load scales w by min(1, e^-K(s - S)), keeping w >= 1 on material, as `--mf-w` does.
+  In count-field the magnitude of w enters only the density evidence's weight (cf_pool c = w / 255 x ramps).
+- **test_dvar** (gpu) covers:
+  - the NLL sums against the host;
+  - the s gradient against the host formula and a central difference;
+  - the mean factors and their scaling;
+  - the gap hook: planes 0..5 bit-identical, plane 6 equal to the masked 1-plane loss, the off setting bit-identical to unset;
+  - the dv plane against the host pooled mean.
+
+Validation (pending):
+- Shared card-0 slot n2 with topoloss: arms from w24 snap/4000 to 5000, UFSM_LAT_FUSE=0: (A) control, (B) topo, (C) `--density-nll 1`,
+  (D) `--density-min-gap-um 38.4 --density-packed 0`.
+- Then wbench ids / ids0 / p05x of C and D against A, and count-field `--dv-w` on C's fields (seed models into the wbench fit).
+
+## Predict at WIN 1152 / 1280 on 16 GB: the per-chunk head under the fused fit kernel, one head buffer, the input in the net's scratch (2026-11-27, branch vram-20261127, vramperf)
+
+w24 (native 2.4 um, latent grid --lat 4, lat_guide 64, 160 head outputs) context test: WIN 1152 asked one 15.29 GB cudaMalloc. That was the
+whole window's fp32 cell logits (160 x 288^3 x 4 B). wbench's DLV -2 sets --fit-h 8, so predict took the fused fit kernel (nn_fit_accum_lat),
+and the per-chunk head (unet_head_fwd_z32, 11-17) was only wired into the plane path.
+
+| change | device GB at WIN 1152 | numbers |
+|---|---|---|
+| chunk head under the fused kernel: `nn_fit_accum_lat_planes(q0, qd, stride)` makes it read the held cell planes | 15.29 -> 2 x 1.38 | the head's bits (see below) |
+| one chunk-head buffer; the held overlap moves down plane by plane, ascending, stream-ordered | -1.38 | byte-identical |
+| the 32-channel cell input x2 in the net's a1 scratch (unet_input_scratch; only the input conversion reads it) | -1.53 | byte-identical |
+| next-window CT prefetch allocated at window 2, only with w3 + 0.5 GB free (else a DEFAULTED line, plain uploads) | -1.53 | byte-identical |
+| chunk head + winding-pair planes allocated before the first forward; `nn_ws_keep_free` (UFSM_PRED_WS_KEEP_MB, default 1024): the fp4 / s2 prenorm copies stop growing at 1 GB free | 1280 ran out after window 1 without it (the copy had taken 2.37 GB, 0 MB left) | smaller prenorm slabs: same bits |
+
+What remains at 1152: the net's build 8.8 GB (two level-0 tensors of 3.25 GB), CT window + its fstem copy (ctcp) 1.53 each, the chunk head 1.38,
+FiLM 0.42, prenorm ~1.1, mask 0.19. Free after window 1: 1.15 GB at 1152, 1.14 at 1280 (the 1280 build holds one 4.46 GB level-0 tensor).
+
+Gate (card 1, the 2000-step snapshot, 1667 level 0, a 1024^3 box at the C10 corner):
+- WIN 640 with UFSM_HEAD_TC_R=0 (the FFMA head, bit-equal to the whole-window head): the 13 field arrays are byte-identical to master (diff -r).
+- With the default TC head the fields differ slightly, as the plane path's have since the 11-17 head change: the first window's fp16 logits
+  are ~1 ulp off (max 0.006) at ~60 % of the voxels; pc mean 104.56 vs 104.59, Pearson 1.0000. Before this change, fit-h 8 ran the whole-window
+  FFMA head, so DLV -2 fields move by that much.
+- test_fit_lat: the held-planes case (planes [2, 24) at a padded channel stride) matches the whole-window kernel bit for bit at h 8 / 4 / 2,
+  with and without the stem and the sub-cell term.
+
+Time, 1024 x 2048^2 box, window seconds: master 640 18 s; branch 640 17, 1152 20, 1280 26. The box is small: at 1152 / 1280 the 4 windows
+mostly compute halo.
+
+## Wrap-count (topology) loss `--topo-lambda` and the phase-near component filter (2026-11-27, branch topoloss-20261127, topoloss)
+
+**Why.** w24 puts confident extra sheets into packed 1667 boxes: at phase-near conf > 0.6, C10 pred → GT is 19.8 um vs 4.8 for try9, with
+3-4x try9's sheet voxels on C10 / C12. The per-voxel phase BCE pays only the few voxels of a slip, but a slip costs a whole winding id.
+
+**The loss** (`nn_topo_slab`, src/nn_loss.cu; opt-in, off = no kernel runs):
+- A sheet is a phase-0 crossing, so the sheet count between two points along the normal equals the turns the phase makes between them.
+- Rays start at every `--topo-stride` K-th voxel per axis (default 4). The lattice is shifted per training window, so every voxel serves as a
+  centre over K^3 windows.
+- Each ray follows the label's phase normal (central code differences, as pgrad) for up to `--topo-len` N unit steps each way (default 16:
+  ±38 um at 2.4 um, about one packed gap). It keeps a ray only if it has ≥ N steps inside the slab, all labelled and in the mask.
+  - Holdout / clipped voxels end a ray. Head-slab seams end it too.
+  - Scroll normals lie mostly in the slab plane, so the 32-plane slabs rarely cut rays.
+- Per ray: Tg = Σ |wrapped label step| / 252 and Tp = Σ |angle(b conj a)| / 2π over the same steps. Tp is the phase's total variation:
+  - an extra sheet adds about +1 turn;
+  - a phase dithering across 0 or folding back also adds rotation;
+  - a missed sheet (the phase standing still over a label turn) gives about −1.
+- Loss: huber(Tp − Tg, δ 1 turn), weighted by the centre's mask weight (packed ×8), mean over the rays, × λ × the source's phase weight.
+- It is angle-only: blurring the phasor buys nothing. The gradient is tangential, 1 / |a|, with |a|^2 floored at 0.05.
+- It is applied like pgrad: the stats pass sums the ray weights only, the gradient pass accumulates fp32 into 2 slab planes, then
+  `nn_pgrad_apply` scales by λ / Σw.
+  - hgs is off with it on, as with pgrad. Float atomics make it not bit-deterministic.
+- The latent stream and the fused gradient pass stay on.
+- Refused: --rv 1, --single, --split z, the fused guided side head.
+- Log: `topo L (count errors E, dT T turn)`, where E is the weight share of rays off by more than half a turn.
+
+**Tests.**
+
+| check | result |
+|---|---|
+| test_topo: device sums vs host reference (fp32 and fp16 logits) | Σw exact; loss / dT equal to 5 digits |
+| weight-only call; lattice offsets 0..7 at K 2 vs K 1 | exact |
+| 40 gradients vs central differences of the host loss | worst rel. error 0.0000 |
+| apply into fp16 gradients | worst rel. 3e-4, accumulator zeroed |
+| semantics: clean / extra turn / missed turn | count errors 0 / 0.17 / > 0.1, mean dT +0.0001 / +0.18 / < 0 |
+| test_topo_train (fixture, --det, latent w24 layout + plain) | λ 0 logs = no flag; λ 1 logs topo on 100 % of windows; --rv 1 refused |
+| branch vs master binary, the w24 latent layout, flag off | logged loss terms identical |
+
+**phase-near `--min-comp N[,N..]`.** The survey's first pick (topo.md #6) is a no-retraining post-filter. This option drops predicted sheet
+components (26-connected) smaller than N voxels before the distances. `--conf` takes a list too, giving one row per pair from one GT read.
+test_phase_near covers it: a spurious blob is counted, then dropped exactly. Numbers on C10 / C12 / C19 / C2: pending (the CPU pair rule
+for the GT exceeded 1 h per box; it reruns on a card).
+
+**A/B** (card-0 slot n2; /vesuvius/ufsm/topoloss/ab): the arms resume w24 snap/4000 → 5000 with w24's command and seed, UFSM_LAT_FUSE=0:
+A control, B `--topo-lambda 1`, C / D densvar's density arms, E hardspot's hard-spot sampling. Scoring: phase-near on C10 / C12 / C19 / C2
+and wb24's wbench ids. Pending.
+
+## w24 eval at step 2000, phase-near, and the w11 (1.1 um) prep (2026-11-27, branches phasenear-20261127 / w11prep-20261127, unrollperf)
+
+- w24 stopped at step 6000 by the user's call; the desk moved to validation (snap/6000 complete, then stop file + SIGTERM, no
+  relaunch; run dir and snapshots 1000-6000 kept in /vesuvius/ufsm/unrollperf/w24/runs/w24).
+- wb24 at snap/6000 (same 20 clean boxes, card 0): packed ids w24 - try9 -0.055 [-0.121, +0.015] (C19 +0.059, C21 -0.122, C22 -0.119,
+  C24 -0.039), control -0.143 [-0.223, -0.074]. Step 2000 was -0.122 / -0.168: better, still below try9 on both sets.
+- The winding mod 4 head at 2.4 um carries no relative winding (disagree: w24-2000's w4 off >= 0.5 turn on 0.946 of the checked cells,
+  try9 0.250). On a 64^3-cell C10 sub-box (dq >= 100):
+  - predict is not the cause: the default fused path, UFSM_PRED_FIT_W4P=0 and UFSM_PRED_FSUP=0 are byte-identical to the wbench set;
+  - mean |dW| is 0.20 turn at --fit-w4-d 32 (77 um) and 0.21 at 64 (154 um), where a real winding gradient doubles it; chained
+    samples grow as sqrt(k) (0.20, 0.32, 0.40, 0.46 at 77 .. 307 um), like independent noise; agreement with try9's 307 um planes 0.53;
+  - not the EMA weights: --ema 0 gives 0.200 / 0.207 at d 32 / 64 (w4ab2, /vesuvius/ufsm/unrollperf/w24/w4ab).
+  The training metric is fine (acc 0.838 at step 5000, try9 0.637) because the loss is gauge-free per tile of max(--wind4-tile 64,
+  P / 6) voxels: 107 voxels = 256 um at 2.4 um vs 614 um for try9 at 9.6 um, about one sheet pitch, so a near-constant output per
+  tile scores well. Nothing downstream reads the planes (fit --wind4-weight / --uw-rep-w4 default 0, count-field copies them, fblend
+  blends them unread), so wbench and the fusions are unaffected. For 2.4 um runs: --wind4-tile 256 (614 um); a fine-tune arm tests it.
+
+**wb24, step 2000** (w24 at DLV -2, native 2.4 um input, vs try9 at DLV 0; the same pinned fitter; 20 boxes clean for both):
+
+| set | ids Δ (w24 - try9) | 95 % CI |
+|---|---|---|
+| packed (C19 C21 C22 C24) | -0.122 | [-0.158, -0.086] |
+| controls (16) | -0.168 | [-0.255, -0.089] |
+
+All 4 packed boxes are negative. The worst controls are C10 -0.65, C12 -0.47 and C2 -0.32.
+
+**Context ladder** (snap 2000, C10 C12 C2 C19). Larger inference windows do not help:
+
+| box | WIN 640 | 768 | 896 |
+|---|---|---|---|
+| C10 | 0.294 | 0.288 | 0.254 |
+| C12 | 0.525 | 0.530 | 0.531 |
+| C2 | 0.605 | 0.589 | 0.576 |
+| C19 | 0.599 | 0.613 | 0.590 |
+
+- The halos were 128 / 192 / 256: `--fit-zarr` needs a stride of k x 512, and `--lat 4` needs WIN % 128 = 0.
+- WIN 1024 runs out of memory at DLV -2: the fused fit kernel holds the whole window's fp32 logits (vramperf).
+
+**ufsm phase-near.** It measures sheet position at native resolution, with no fitter:
+- a prediction's phase-0 voxels (an integer wrap between 6-neighbours) against the GT sheets (phase 0 of a sources file's level-0 phase);
+- both directions: pred → GT counts misplaced or extra sheets; GT → pred counts misplaced or missed ones;
+- fields of any level are upsampled.
+
+test_phase_near recovers known offsets of tilted planes within 0.5 voxel, at h 1 and at 4x coarser fields. Distances are voxel-quantised (±0.5 voxel).
+
+Centre 512^3 of the four boxes, um, p50:
+
+| box | pred → GT, w24 / try9 | GT → pred, w24 / try9 | pred sheet voxels, w24 / try9 |
+|---|---|---|---|
+| C19 | 11.3 / 6.8 | 12.2 / 12.0 | 265k / 221k |
+| C10 | 28.1 / 9.6 | 13.1 / 16.8 | 1.25M / 311k |
+| C12 | 37.9 / 12.0 | 15.4 / 19.8 | 949k / 229k |
+| C2 | 17.6 / 14.6 | 19.3 / 19.8 | 1.33M / 1.31M |
+
+- w24 lies slightly nearer the GT sheets, but it adds 3-4x extra wraps on C10 / C12.
+- The extra wraps are confident: at conf > 0.6, C10 pred → GT is 19.8 um vs 4.8 for try9.
+- w24's confidence is lower overall: C19 has no wraps above 0.6 (try9: 35k).
+
+**Two-level pair rule, generalised.** `"pair_coarse": L` (1..3) takes the codes L levels coarser:
+- L = 1 is the 2.4 um rule (w24, its dcache key unchanged);
+- L = 2 keeps a 384 um reach at 1.1 um in a 3 GB slot (rmax 340; the coarse tile at L 1 would be ~2 GB more);
+- test_band_pair checks L 1 and 2 against the level-0 rule.
+
+**phase-cmp --map REG.** A is on the map's fine scan; B is sampled at A's voxel centres (rmap_f2c, nearest).
+- A missing math.h made floor / ceil / llround implicit, so every mapped box collapsed to 0,0,0 ("known B 0.0000"). mcc gave no diagnostic; test_implicit_decl covers it since d9237c4c.
+- UFSM_PCMP_DUMP writes the first box's phases.
+
+**w11 prep** (native 1.129 um winding; not launched, init open):
+- Inventory:
+
+| | Paris 4 (20260608103018) | 1667 (20260323082859) |
+|---|---|---|
+| level 0 on the NAS | 59969 x 36006 x 32354 | 42209 x 22122 x 20276 |
+| footprint in the 2.4 frame (z) | 28079-56357 | 12504-32410 |
+| GT 512^3 tiles inside, with 1.1 CT | 36256 of 152245 (23.8 %) | 9149 of 18799 (48.7 %) |
+
+- Holdouts: 64 holdout-w24 boxes mapped into the 1.129 frames (affine, + 32).
+- `sources-w11.json` (/vesuvius/ufsm/unrollperf/w11, mksrc11.py) uses the w24 GT meshes through the published 2.4 → 1.129 reg.json, rmax 340, pair_coarse 2, pair_h0 12.
+- Mapped 1.1 labels vs the 2.4 labels (phase-cmp --map, 12 x 256^3):
+
+| source | lost | within 2 codes | within 6 codes |
+|---|---|---|---|
+| Paris 4 June | 1.3 % | 0.83 | 0.993 |
+| Paris 4 July | 1.0 % | 0.89 | 0.998 |
+| 1667 | 1.9 % | 0.94 | 0.995 |
+
+  6 codes is ~3 um at 150 um spacing: the ~1 um reg error plus the 2.4 grid's nearest sampling.
+- Hand check on a 1667 box: CT 63 on both label sets' sheets vs 40 in the gaps; z-shift profiles are identical, so the two frames have no offset.
+- Memory: P 640 plans (7.74 of 7.83 GB); P 768 does not fit.
+- CPU sampler-only: 1 window in 93 s.
+
+## Noisy ink labels: label smoothing exists, unlabelled-is-unknown negatives (--ink-neg-guard / --ink-neg-gate), an ADELE design (2026-11-27, branch inklabelfix-20261127, inklabelfix)
+
+What the ink head trains on today (checked in the code):
+
+- **Label smoothing** is already in: `--ink-smooth EPS` (nn_ink_targets_smooth, 2026-11-11). It smooths the voxel BCE target, the soft Dice
+  (same target plane) and the MIL ray label (ink_mil_fin's eps). The production ink and unrollperf recipes run 0.1, the paper's 3-D value;
+  the paper's 0.25 belongs to its 2.5-D nets. Nothing to add here; 0.25 could be one A/B arm.
+- **The mask.** inksplat writes prob254: 254 ink, 0 no ink, 255 unknown. A pixel outside the supervision mask, or one without an open
+  face, is unknown (the MIL rays cover the faceless ones). Inside the supervision mask every untraced pixel is a hard 0. So an untraced
+  letter inside a supervised region trains as "no ink", and so does the rim of a trace drawn a few pixels off the letter. `--ink-air S`
+  adds air voxels as 0 on an S-lattice; they are physics, not labels.
+
+**New, opt-in: unlabelled-is-unknown for the labelled negatives** (nn_ink_neg in nn_elem.cu; train.c head_slab_pass, both passes, training
+only: validation keeps every labelled negative, so val BCE stays comparable across arms). A known negative voxel (prob254 < 127; the
+air lattice reads 255 and is left alone) leaves the mask when:
+
+- `--ink-neg-guard R` (0..8 voxels at the window's level): a label positive (127..254) lies in the (2R + 1)^3 cube around it. This is
+  an explicit ignore band beyond the trace, for traces drawn up to R voxels off the letter. It looks at the labels only, so the net's
+  predictions cannot feed back into it.
+- `--ink-neg-gate T` (0 < T < 1): the ink head's current p > T at that voxel. The net already reads ink there, and the "no ink" label is
+  more likely a missing trace than a measurement. This is ADELE's correction step (below) in its mask form, applied online from the
+  same forward. It risks confirmation bias, so it starts at `--ink-neg-from STEP` (default 0; meant for fine-tunes from a trained net).
+- The log line gets ` inkneg guard F gate G`: the fractions of the known negatives dropped since the last log line (all GPUs).
+
+Both flags default to 0. Off, no kernel runs and no buffer is allocated, so the off path is byte-identical. Cost: one elementwise kernel
+per slab and pass. The guard reads the (2R + 1)^3 cube for known negatives only (R 2: 125 bytes, cached). test_ink_mil checks the
+masks and counts byte-exact against a host rule: five (R, T) cases with air-lattice voxels, a slab inside a 20 x 22 x 24 window.
+
+**ADELE (Liu et al., CVPR 2022, arXiv 2110.03740) on our ink head: the design.** ADELE tracks, per class, the IoU of the training
+predictions against the noisy labels. It fits y(t) = a (1 - exp(-b t^c)) to that curve. Once the slope falls to (1 - r) of its start
+(r 0.9), the net has fitted the clean labels and starts to memorise the noisy ones. From then on, ADELE replaces each label with the
+prediction where the prediction is confident (> 0.8), and adds a multi-scale consistency term so the corrected targets are stable.
+Mapped onto our losses:
+
+1. **Classes and grouping.** Two classes (ink, no ink) **per source**, not per scroll. Label quality differs by source: hand traces,
+   teacher pseudo-labels, HF labels, the atlas. Training IoU per source and class: device counters (tp, fp, fn at p > 0.5 over the known
+   voxels) in the ink loss-stats kernel, summed per window, read on the host at --log-every. The MIL rays get their own counters from
+   ink_mil_fin's pooled logit against the ray label, since the faceless pixels have no voxel IoU.
+2. **Onset detection on the host** (C, a new onset.c + test on synthetic curves): a Gauss-Newton fit of a, b, c on the series of each
+   (source, class) pair every log interval. Correction starts once the slope has fallen by r = 0.9 and at least 10 points exist. This
+   replaces `--ink-neg-from` with a per-source start step. A fine-tune from a trained net starts already saturated, so its onset is step
+   0 and the fixed-step gate built here covers it.
+3. **Correction, voxel targets.** For negatives, p > T masks the voxel (the gate above). Rewriting the target to p, as ADELE does,
+   would be a 2-line change in the same kernel (t := p x 255, m kept); the mask form is the conservative first arm. For positives
+   (`--ink-pos-gate`, to add), p < 1 - T masks the voxel. That covers band voxels off the true sheet and traces of letters that are not there.
+4. **Correction, MIL rays.** In ink_mil_fin, per ray from the pooled zr: label 0 with sigmoid(zr) > T, or label 1 with sigmoid(zr) <
+   1 - T, gets dL/dz = 0 (fin already writes each ray's dL/dz, so no extra pass). The ray label is what misses the depth offset. The MIL
+   max-pool absorbs the offset of a positive ray, so the positive half matters less here than in the voxel targets.
+5. **Onfly labels need no store.** ADELE keeps one corrected label per pixel across epochs. Ours are rebuilt per window, so the
+   correction is always the current net's, from the forward that computes the loss. That is the same rule applied online, at no
+   I/O cost.
+6. **Scale consistency.** ADELE's multi-scale term needs a second forward. Our cheap equivalent is to gate on an EMA or snapshot-averaged
+   net's prediction instead of the live one. That costs a second forward too, so we defer it until the plain gate shows a gain.
+7. **Guards.** The holdouts (0841, 1447, the HOLD boxes) see no correction (validation runs ungated). Per cycle, the gate must not lower
+   HOLD AUC; that is the confirmation-bias check from ink-labels.md #6.
+
+## ink-proto: prototype x teacher 3-D ink labels (arXiv 2606.29085 stage 2) with our own features lose to the teacher on HOLD (2026-11-27, branch inkproto-20261127, inkproto)
+
+**Idea.** The paper builds conservative 3-D labels as sigmoid(teacher) x minmax_chunk(cos(feature, ink prototype)) > 0.5, with air
+(CT < 50) masked. Its features come from an upstream DINO ViT, which we do not use. **Features:** the only per-voxel 3-D features of
+our own at ~2.4 um are our ink nets' trunk features. J1 died with no snapshot, the DINO2A ssl arm lost (−0.069), and dinovol is
+upstream. So this test uses R11P-12000's level-0 trunk output, the head's input (32 channels, `unet_head_feat_z`).
+
+**Code (opt-in; the off path is unchanged).**
+- `predict --proto-seed OUT.proto [--proto-thr 0.95]` sums the trunk features, raw and L2-normalised, over each window's interior
+  voxels whose own probability is >= thr.
+- `predict --proto P.proto [--proto-mean unit|raw]` replaces the output channel by 255 (1 + cos) / 2, CT-masked like any
+  probability.
+- `ufsm ink-proto label OUT --teacher .. --cos .. --ct ..` computes the per-chunk (`--chunk`, default 128) min-max of the cosine times
+  the teacher, masks CT < `--air` (default 50) and writes a score (1 + 254 s, 0 = masked) or a prob254 label (254 where s > `--thr`,
+  0 where not, 255 masked).
+- `ufsm ink-proto merge | show` handles the prototype files.
+- Kernels are in src/nn_proto.cu. tests/test_ink_proto.c checks the label chunk against a hand case and an independent loop, and
+  the kernels against host references.
+- predict refuses --tta, --channels, --heads, latent nets, --gpus, --feather and --seamless for the seed.
+
+**Seeds (no new clicks).** The 12 TRAIN 512^3 blocks per scroll with the most train ink and no val / hold voxels
+(/vesuvius/ufsm/inkproto/mkseed.sh), at teacher p >= 0.95.
+
+| | 1667 | P4 |
+|---|---|---|
+| seed voxels | 322 k | 1.32 M |
+| norm of the mean unit seed vector | 0.989 | 0.993 |
+
+The seed features are nearly collinear. The two scrolls' prototypes have cosine 0.989.
+
+**HOLD** (the tracker's 64 tiles per scroll; rung 2.2 = level 1 of the 1.129 um scans; w576 h32; `ink-audit --hold-only`; local CT
+copy /vesuvius/ufsm/inkperf/ctl/volcomp):
+
+| store | 1667 AUC | 1667 f1_128 | P4 AUC | P4 f1_128 |
+|---|---|---|---|---|
+| teacher R11P-12000 | .874 | .583 | .848 | .700 |
+| cosine alone | .793 | .669 | .823 | .723 |
+| score, chunk 128, air 50 | .831 | .561 | .837 | .681 |
+| score, no air mask | .830 | .562 | .839 | .682 |
+| score, chunk 64 | .843 | .558 | .828 | .681 |
+| score, chunk 256 | .855 | .561 | .846 | .680 |
+
+- **Paired** (FUSE, score − teacher ± region-jackknife SE): **1667 −0.043 ± 0.024** (63 regions), **P4 −0.011 ± 0.026** (64).
+- The binary label (s > 0.5, f1_128) is also below the teacher's, by −0.022 on 1667 and −0.020 on P4.
+- Labelled share: 7.9 % ink on 1667 and 10.4 % on P4. The air mask (CT < 50) drops 63 % / 43 % of the tiles' voxels.
+
+**Why it does not help here.** The prototype lies in the feature space of the teacher itself. The head is linear on those features,
+so the cosine only re-weights the teacher's own evidence. The per-chunk min-max then stretches the noise in chunks with little ink.
+The paper's gain comes from an independent representation (DINO trained on 10 scrolls).
+
+**Decision.** No student A/B. Repeat only with a feature extractor of our own that is independent of the teacher (a successful SSL
+or J1 trunk). The commands stay opt-in for that.
+
+## Global winding assignment: L1 count integration (count-field --cf-robust); no box gain over L2, the box gain is the ref snap itself (2026-11-27, branch globwind-20261127, globwind)
+
+Lead: solve the winding numbers jointly, under the topology constraint (one turn per revolution), instead of locally. What already exists:
+count-field integrates rho n into one single-valued U, so the turn per revolution holds by construction; its closing error measures
+the loop residues. fit --uw-repair is a PUMA L1 integer solve over phase pieces (l1pot) with geo / w4 / fibre votes. levelsolve
+(11-18) showed that piece integers cannot add turns the phase skips (PH1 oracle 0.222 -> 0.238). So the open lever is how the count
+reference is integrated. L2 smears a merge's missing turns over everything beyond it; L1 (the Ghiglia-Romero L1 unwrapping) cuts them
+inside the merge and carries the count around it.
+
+`count-field --cf-robust K [--cf-robust-delta 0.02]` runs K IRLS passes per level on the count edges. Each edge weight becomes
+w0 min(1, delta / |r|) for the edge residual r (turns per solve cell). With a small delta this is convex L1. It works on both the CPU
+and the GPU CG: on C19, with the unroll's ref recipe, |delta| p99 is 0.0011 turn and the snap integers agree on 0.99998 of cells.
+Default off; the off path is unchanged. A redescending Cauchy weight was unstable (at delta 0.01 it broke the defect-free lenses) and
+was dropped.
+
+**Synthetic** (test_countfield robust_lens: spiral, true phase, a bounded density defect lens at r 16..28 cells, theta 0.2..1.4; the
+table gives the share of sector cells beyond the lens > 0.5 turn off):
+
+| defect | L2 | --cf-robust 8 |
+|---|---|---|
+| 3 sheets merged (sp x 4) | 1.000 | 0.000 |
+| merged, sp x 2 | 0.000 | 0.000 |
+| extra sheets (sp x 0.5) | 1.000 | 0.000 |
+| one missed sheet (2-sheet lens, sp x 2) | 0.000 | 0.000 |
+
+Huber delta 0.25 or 0.05 does not reach L1: the lens deficit spreads over many edges, each below delta.
+
+**wbench boxes** (20 boxes PH1-3, HOLD, C2-C24; fixed fields; CPU fits, production flags; base = plain fit; snap = `--ref-model CF
+--ref-snap 1` with CF the box's own L2 count-field ref; rob02 = the same with `--cf-robust 8 --cf-robust-delta 0.02`). ids, paired
+box bootstrap 95 % CI:
+
+| fields | arm - base | all 20 | packed C19/21/22/24 | PH1-3 | 13 controls |
+|---|---|---|---|---|---|
+| try9 (bl-t9) | snap | +0.040 [+0.009, +0.082] | +0.054 [+0.012, +0.096] | +0.094 [+0.010, +0.140] | +0.023 [-0.008, +0.079] |
+| try9 | rob02 | +0.036 [+0.009, +0.075] | +0.044 [+0.013, +0.086] | +0.084 [+0.031, +0.130] | +0.022 [-0.007, +0.076] |
+| try9 | rob02 - snap | | -0.010 [-0.036, +0.004] | -0.010 [-0.047, +0.021] | -0.001 [-0.004, +0.001] |
+| w24-2000 | rob02 | -0.183 [-0.257, -0.107] | -0.125 [-0.371, +0.040] | +0.075 [+0.014, +0.181] | -0.260 [-0.343, -0.176] |
+| w24-2000 | snap | -0.176 [-0.250, -0.100] | | | |
+
+- try9 base / snap / rob02 means: 0.788 / 0.828 / 0.824 ids, p05x 0.814 / 0.833 / 0.832. The largest gains: C14 0.54 -> 0.89, PH1
+  0.23 -> 0.37, PH3 0.13 -> 0.27, C19 0.67 -> 0.76 (snap; rob02 0.71), C22 0.77 -> 0.87. The losses are small (C4 -0.03, C10 -0.01).
+- **The box gain is the ref snap, not L1.** The unroll already snaps its slab fits to the global count-field ref, so this finding is
+  about wbench's plain fit: it scores the fitter without the count reference the production unroll uses.
+- **L1 adds nothing over L2 inside a box.** Box merges are not bounded lenses with a consistent path around them in the box. Whether
+  L1 helps at region scale is unroll's arm C (1667 comparison unroll, REFX="--cf-robust 8 --cf-robust-delta 0.02",
+  /vesuvius/ufsm/unrollrun/cmp/PHerc1667-C/qa). Not a default.
+- **w24 (step 2000) fields lose under any ref snap.** Their count targets do not integrate: on C11 the count-field closing error is
+  0.167 turn mean with 17 % of 4x4 loops > 0.25 turn, against try9's 0.069 and 1.4 %. w24's phase carries its fits; its density /
+  normal count is not usable yet. A closing-error check (count-field prints it) tells, before the snap, whether a field set's count
+  can be trusted.
+- Not built: the layered optimal-surface min-cut (research/graph.md idea 1, sheets.md idea 3). It needs per-sheet costs that separate
+  touching sheets, which is the information the nets' fields lack in packed regions (pseudolab 11-18). With today's fields a
+  minimum-spacing arc would place sheets by the constraint, not by the evidence.
+- Scripts and rows: /vesuvius/ufsm/globwind (arm.sh, h1.sh, h2.sh, res/*.tsv, gpuchk.sh).
+- **wbench REFSNAP=1** (lead, same day; branch wbsnap-20261127): box rows scored the way the unroll fits. count-field (L2, CPU,
+  `--model-only 1`, CFX for extra flags) on the box's fields, then fit `--ref-model --ref-snap 1`; boxes only, its own fitter config
+  tag. Needs U = a build with count-field (the pinned b29b1bda predates it), and the plain arm scored with the same U. Smoke: C19
+  bl-t9 0.7617, the same as arm bl-t9.snap.
+
+## try9 + w24 at fit time: a phase mean helps the packed boxes; train --cond-fields for a try9-conditioned 2.4 um net (2026-11-27, branch condnet-20261127, condnet)
+
+w24 (native 2.4 um, P 640 = 1.5 mm field of view) loses wbench to try9 (9.6 um, 6.1 mm) at step 2000 (packed ids -0.122, controls -0.168).
+The idea under test: try9 counts the sheets and w24 places them.
+
+**Fit-time fusion** (`field-blend --plane-w GROUP=w1,w2:..`). The two kept field sets (bl-t9 at 9.6 um, w24-2000 at 2.4 um) lie on the same
+19.2 um cells, so fusing them needs no resampling. Per plane group (phase, normal, sp, w, w4, r) each input gets its own weight. An input of
+weight 0 is left out of the plane, also under `--weights` (before, a weight-0 input still counted in the material max). Winding mod 4 planes
+of another w4_d x um are left out with a DEFAULTED line. The output's w4_d is in the first input's voxels: 64 x 2.4 um becomes 16 x 9.6 um
+(test_fblend test_fuse). Scored with the pinned fitter on the same 20 clean boxes, paired against bl-t9. A - B [95 % CI]:
+
+| variant | packed ids (4) | packed p05x | control ids (16) | control p05x |
+|---|---|---|---|---|
+| fz-ph: w24 phase, the rest try9 | -0.003 [-0.048, +0.039] | -0.002 [-0.039, +0.028] | -0.054 [-0.125, +0.025] (15) | -0.017 [-0.031, +0.001] |
+| fz-phn: w24 phase + normals | -0.015 [-0.072, +0.030] | -0.015 [-0.056, +0.014] | -0.056 [-0.122, +0.019] | -0.028 [-0.044, -0.009] |
+| **fz-phb: phase = complex mean of both (resultant), the rest try9** | **+0.025 [+0.001, +0.065]** | **+0.015 [+0.003, +0.038]** | +0.007 [-0.042, +0.068] | -0.003 [-0.015, +0.012] |
+| fz-w24c: w24, winding mod 4 + spacing from try9 | -0.015 [-0.071, +0.030] | -0.015 [-0.056, +0.014] | -0.055 [-0.122, +0.020] | -0.027 [-0.044, -0.009] |
+| **fz-phbm: phase mean with --conf mean (the mean input confidence as the length), the rest try9 (box +0.032, region -0.033: not production)** | **+0.032 [+0.003, +0.078]** | **+0.023 [+0.005, +0.050]** | +0.020 [-0.006, +0.069] | -0.001 [-0.010, +0.013] |
+| fz-phbw: phase mean, weights try9 1 : w24 2 | +0.035 [+0.009, +0.064] | | -0.009 [-0.071, +0.064] (14 of 16) | |
+
+- fz-phb box by box:
+  - C14 0.543 -> 0.924 and C22 0.781 -> 0.866;
+  - C4 0.912 -> 0.695;
+  - the other boxes within +-0.02.
+  The resultant mean lowers the confidence where the two nets disagree. On C4 w24's phase is wrong (w24-phase-only 0.727), the confidence
+  cancels and the fitter loses the phase term there.
+- **fz-phbm: box +0.032, region -0.033: not production.** `ufsm field-blend OUT T9 W24 --weights 1,0 --plane-w phase=1,1 --conf mean`
+  keeps try9's confidence on the boxes: C4 holds (0.905), C14 0.543 -> 0.916, C22 0.781 -> 0.882, C24 0.924 -> 0.944; no box loses more
+  than 0.015 (C3). But at region scale it loses:
+  - The 1667 comparison unroll (unroll, arm B vs A, the same 16 GT boxes): ids right 0.786 vs try9's 0.819.
+  - Under the unroll's own fit (wbench box fit with the box's count-field ref, --ref-snap 1, globwind's arm.sh) it loses on the 20 boxes
+    too: mean ids -0.025 vs bl-t9.snap.
+  - Likely cause, from phase-near on the pn1 crops: the blend places GT sheets closer (GT -> pred p50 C10 16.8 -> 16.1, C12 19.8 -> 16.8
+    um) but keeps part of w24's extra wraps (sheet voxels C10 311k -> 436k, C12 229k -> 314k; pred -> GT within 1 voxel 0.26 -> 0.21 on
+    C10). The plain box fit forgives extra wraps; the count-field integration does not.
+- **Snap** (`field-blend --snap R`, fb_phase_snap, test_fblend test_snap; lead: "try9 counts the sheets, w24 places them"): in[0]'s phase
+  turned to in[1]'s where the two sheets lie within R um (|dphi| / 2 pi x in[0]'s spacing), else in[0]'s; in[0]'s confidence kept. It
+  cannot add a wrap. phase-near (unrollperf, pn1 / pn2) showed why that matters: w24 places GT sheets slightly closer (GT -> pred p50
+  13.1 vs 16.8 um on C10) but adds 3-4x the phase wraps, confidently (conf > 0.6 on C10: pred -> GT p50 19.8 um vs try9's 4.8).
+  No effect at any R (wbench A - B vs bl-t9, ids):
+
+  | R | packed ids | packed p05x | control ids |
+  |---|---|---|---|
+  | 4.8 um | -0.001 [-0.002, -0.000] | -0.000 | |
+  | 9.6 um | +0.000 [-0.003, +0.004] | +0.003 [+0.000, +0.007] | -0.005 [-0.015, +0.000] |
+  | 14.4 um | +0.000 [-0.005, +0.006] | | -0.005 [-0.015, +0.000] |
+
+  phase-near GT -> pred p50 (try9 -> R 14.4): C10 16.8 -> 15.2, C12 19.8 -> 17.6, C19 12.0 -> 12.0, C2 19.8 -> 19.3 um; pred -> GT
+  unchanged. Dropped (lead 11-27): the fusion line ends here; the conditioned net is the test.
+- w24's phase alone is broken on the Paris 4 PH1-3 boxes (ids 0.10-0.13, try9 0.12-0.21). It also fails C10 and C12 (0.29 / 0.53). Swapping
+  the phase therefore loses the controls.
+- Rows: /vesuvius/ufsm/wbench/res/fz-*.tsv. Kit: /vesuvius/ufsm/condnet/fuse.sh and wbfuse.sh.
+
+**try9-conditioned net** (`train --cond-fields 1 [--cond-drop 0.3]`, `predict --cond-fields DIR[,DIR..] | none`).
+- Input: another model's fit-field sets on the scan, a source's `"cond": {"fields": [DIR, ..]}`. They enter as a second 32-channel MX input
+  block of a latent net (unet_cfg.cond_ch = 12, cin 32 -> 64, header key "cond_ch").
+- The 12 channels (sample_cond.h):
+  - pc, ps;
+  - w, sp, dq;
+  - the three winding mod 4 differences as dq-weighted (cos, sin) per output axis, permuted and sine-negated under the window's cube symmetry.
+- Sampling: the sampler pulls them onto 8^3-voxel cells through the window's symmetry and warp, with the --distill cell coordinates.
+  `nn_cond_mx` upsamples them x2 trilinearly onto the latent cells and writes MX block 1. `nn_input_latc` writes block 0 into the 64-channel
+  tensor.
+- Missing data: a dropped window (probability --cond-drop), an echo / replay and cells outside the sets all read 0.
+- Warm start: init-from a net without the block zero-initialises the stem's new columns (copy_conv_in), so the donor's function is kept.
+- Presence (channel 11, lead: absence marked, not read as zero fields): the trilinear weight of the field cells that exist. A set's
+  cond_tiles.txt (the predict's tile list) limits it to its tiles, so unpredicted cells read presence 0, while a set's air is present
+  with zero planes. Dropped windows (--cond-drop, default 0.5: try9's fields are in-sample on part of 1667) are absent everywhere.
+- Predict: fills channels 32-63 of its 16-bit input (nn_cond_h16); there is no --tta.
+- Tests:
+  - test_gpu_input cond_check: the trainer chain equals predict's byte for byte, plus a host reference;
+  - test_cond_net: the warm-started net equals the donor bit for bit for random planes (MX-fp8 rn and the fp4 lean-2 preset), the new columns
+    get a gradient, and the header round-trips;
+  - test_sample_cond (CPU): positions, trilinear, the symmetry channel map, a second set.
+- Coverage: `ufsm occ-tiles` writes per-source predict tile lists near the sampler's labelled cells.
+
+| source | 512^3 tiles at 9.6 um (margin 64) | Gvox |
+|---|---|---|
+| Paris4 june / july (same CT) | 2334 / 3444 | 313 / 462 |
+| 1667 | 585 | 78 |
+| 0139 twin | 736 | 99 |
+| 0814 twin | 341 | 46 |
+
+- Cost: at ~19 Mvox/s for try9 fit fields (the wbench --boxes rate, 5060 Ti) that is 6-10 h of card time.
+- Disk: ~18 GB at 19.2 um cells with q8 phase.
+- Scope (lead / user 11-27, validation only): try9 fields for PHerc1667 only (67.5 Gvox, ~1 h of card 1, cpred1.sh), then a
+  1667-only fine-tune from w24 snap/4000, cond vs base, ~1 h (800 steps) per arm (ft.sh), scored on the 1667 wbench boxes and
+  phase-near. 0814 / 0139 / Paris4 only if that is positive.
 
 ## Hard-spot sampling: a share of the draws from merge-flagged / id-change cells (2026-11-27, branch hardspot-20261127, hardspot)
 
@@ -199,6 +827,45 @@ and R1 last. E0 / S2 / E2D2 stay within .006 of each other. The 50 um band lifts
 
 Files: /vesuvius/ufsm/inkeval/{prep.sh (rows), table.sh, band.sh, leaks.tsv, table*.out, strat*.tsv, rows/}.
 
+## ufsm umbilicus: the umbilicus by sheet-normal voting, a villa vc_gen_umbilicus port (2026-11-27, branch axisfind-20261127, axisfind)
+
+`ufsm umbilicus OUT.json --um0 UM (--ct-root R --ct-key K --level L | --fields DIR)` (src/umbfind.c) ports villa's
+`vc_gen_umbilicus` (`align_and_extract_umbilicus` + `fit_umbilicus_along_z`, origin/main a7d4f88; research/villa.md idea 3).
+- Per xy slice (every `--dz-mm 1`, 4 input rows averaged): 10k points drawn by weight, 1k random candidates scored by sum cos^2
+  (radial direction vs sheet normal), the best hill-climbed on villa's weighted sum cos^2 / max(0.94 mm, d); optional un-crush
+  (villa's cell-balanced normal tensor, beta `--uncrush`, default 1.5). Then villa's robust LOWESS along z (half width 4.7 mm,
+  3 bisquare rounds). Seeded per slice, so any thread count repeats exactly.
+- Normals: the CT's 2-D structure tensor (sigma 1 / 3 px, every 4th pixel with coherence >= 0.2, weight = coherence), or the fit
+  fields' in-plane n n^T block (t1 t2 t5, w-weighted, pooled 4 cells). No net fields are needed: the CT path is the default input.
+- `--ref AXIS` prints vote + zfit / vote per slice / CT>0 centroid (ufsm axis's estimator, same slices) against a reference;
+  `ufsm axis-diff A B --um0 U [--z0 --z1]` compares two axis files. Same json as `ufsm axis` (control_points z, y, x, level-0).
+- test_umbfind: rendered spirals (pitch 24 voxels, 12 turns, noise) around a tilted + bowed axis: fitted median 0.84 / max 1.66
+  voxels; crushed x0.6: 0.98 / 1.28 (uncrush 0), 0.95 / 1.54 (1.5); LOWESS exact on a line and rejects a 400-voxel outlier.
+
+Per-z distance from the reference, mm (median / p90 / max; CPU, 6 threads, 1-3 min per scroll at level 3-4):
+
+| scroll (input) | reference | vote, uncrush 1.5 | vote, uncrush 0 | CT centroid |
+|---|---|---|---|---|
+| PHerc1667 (CT L3) | upstream umbilicus | 1.04 / 2.29 / 3.15 | 1.13 / 2.28 / 2.56 | **0.87** / 2.16 / 4.65 |
+| PHercParis4 (CT L3) | teacher/axis-0 | **0.70** / 2.65 / 6.48 | 0.78 / 2.69 / 5.87 | 3.75 / 6.65 / 10.61 |
+| PHerc1203 (CT L2) | hand, all z | 2.01 / 4.21 / 5.90 | 1.83 / 4.37 / 6.67 | 3.11 / 5.78 / 6.45 |
+| PHerc1203 (CT L2) | hand, clear core z 11264-14336 | **0.73** / 1.45 / 1.55 | 0.91 / 1.52 / 1.62 | 4.05 / 5.60 / 5.99 (corpus axis.json) |
+| PHerc1203 (fit fields lat) | hand, all z / clear core | - | 2.19 / 4.71 / 6.75; 0.97 / 1.59 / 1.84 | - |
+| PHercParis3 (CT L4) | hand, all z | **3.24** / 10.2 / 11.7 | 4.34 / 9.42 / 12.7 | 6.55 / 12.3 / 13.6 |
+| PHercParis3 (CT L4) | hand, clear core z 28672-47360 | **2.48** / 7.87 / 10.3 | 2.64 / 7.03 / 7.73 | 11.2 / 13.4 / 13.6 (corpus axis.json) |
+
+- The vote beats the centroid on every scroll but 1667, where the centroid's median is 0.17 mm lower but its max 1.5 mm higher
+  (1667 is round and centred: the centroid's best case). Where the hand axis is clear, the vote sits 0.7 mm (1203) and 2.5 mm
+  (Paris3) from it against 4.1 / 11.2 mm for the centroid axes in use. The hand axes are weak between their few clicks (1203: 6
+  points), so the all-z rows mostly measure the references.
+- The fit fields gave no gain over the CT on 1203 (0.97 vs 0.91 mm clear core), so CT-only is enough; no GPU needed.
+- Adopted (lead 11-27) as the auto axis for scrolls without a hand / trusted json: scripts/unroll/auto_axis.sh (unroll.sh prep and
+  corpus desk.sh "auto"): `ufsm umbilicus --level auto` (the finest existing level of >= 18 um: 2.4 um scans L3, 9.362 um L2).
+  An existing axis.json is kept byte for byte (AXIS_REDO=1 rebuilds); AXIS_METHOD=centroid is the old `ufsm axis`; the json's
+  "method" key and the log name the method. Check on 1667: auto picks L3, 1.02 / 2.30 / 3.29 mm vs the centroid's 0.85 / 2.21 /
+  4.80: on round, centred 1667 the centroid stays slightly better on median, the vote on max.
+  Outputs: /vesuvius/ufsm/axisfind/out/*.json (PHerc1203 stays local).
+
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)
 
 - Why: under -std=c23, phasecmp.c called floor / ceil / llround without <math.h> (fixed in b32c16ca). mcc took them as int f()
@@ -221,6 +888,96 @@ Files: /vesuvius/ufsm/inkeval/{prep.sh (rows), table.sh, band.sh, leaks.tsv, tab
   - The merges 26fd525 (jitpin), 7989bd1 (csetdev), 086574d (f4pdev), ce9ba2f (mvexit) and 92ce831 (mvpin).
   - Their PTX differs from the pin in 117 of the 132 units (every lp_*, most nn_*).
   - 285d308 itself has been in the pin since before 01873d0 (an ancestor). Only the note asking for its review is outside.
+
+## Model disagreement as a labelling query: `ufsm field-disagree`, checked against the GT; a labelling worklist (2026-11-27, branch disagree-20261127, disagree)
+
+Idea (lead): human sheet labels are scarce, and we have several winding models. Label where they disagree (query by committee;
+/vesuvius/ufsm/research/active.md idea 2).
+
+**Tool.** `ufsm field-disagree OUT FIELDS1 FIELDS2 ..` (src/fielddis.c). The first set is the grid; the others are sampled at its cell centres in physical um (any level or --fit-h: try9 9.6 um, w24 2.4 um). Per cell:
+- pos: the largest pairwise circular phase difference (sheet position, turns).
+- cnt: each model's unwrapped phase change along the reference normal over ±100 um, on the stretch where every model is valid (the wrap count along the normal).
+- w4: winding mod 4 from the dz / dy / dx planes. Different baselines (try9 32 x 9.6 = 307 um, w24 32 x 2.4 = 77 um) are compared mod 4 over the longer one, with the shorter set's planes chained 4 times along the axis. Scaling the gradient instead would multiply a 1-turn error into 4, which is invisible mod 4 (test_fielddis catches it).
+- dis = max(pos / 0.25, cnt / 0.5, w4 / 0.5) over `--metrics`, so dis >= 128 means some metric is past its threshold.
+
+Outputs: zarr arrays dis / pos / cnt / w4 / flag. `regions.tsv` lists `--region` boxes (frame voxels of `--frame-um`, on a grid anchored at 0), ranked by score = dis share x (1 - labelled share) x (0.5 + 0.5 min(1, labelled share of the 26 neighbours / 0.1)). The labelled shares come from a GT phase raster (`--labelled`).
+
+`--gt ORACLE` checks the flags against oracle fields (fields-oracle --fill none). A model is wrong at a cell if |phase - GT| > 0.25 turn or its count differs from the GT's on the same ray by >= 0.5. w4 is checked against the GT phase unwrapped along each axis over the longest baseline (all three axes or none).
+
+test_fielddis (CPU, 9.6 / 2.4 um synthetic sheets) checks:
+- agreement after the resolution mapping;
+- a half-turn shift flags pos only in its quarter, precision and recall > 0.95 against the GT;
+- denser sheets flag cnt;
+- a 1-turn w4 error in a one-baseline slab is flagged at the same baseline and when chained;
+- the command's arrays, and that the shifted regions rank first.
+
+**GT.** The 11-14 phase rasters had been deleted; gtphase.sh rebuilt them on the CPU (~40 s a box):
+- `phase-raster`, pair rule, gs 4, radius 160;
+- 1667 from codes 4.798, Paris 4 from q-9p6 (--codes-grid 1).
+
+Fields: the kept wbench fields bl-t9 (try9) and w24-2000 (w24 snap 2000, DLV -2) on the 20 boxes both cover (16 1667, HOLD, PH1-3), 19.2 um cells.
+
+**Cell level, try9 vs w24** (140 M cells with valid phase and GT). Base: some model wrong 15.7 %; try9 6.3 %, w24 13.8 %, both 4.4 %.
+
+| flag | flagged | precision (someone wrong) | recall | lift |
+|---|---|---|---|---|
+| pos > 0.25 turn | 6.6 % | 0.793 | 0.334 | 5.1 |
+| cnt >= 0.5 turn | 2.8 % | 0.742 | 0.134 | 4.7 |
+| w4 >= 0.5 turn | 94.4 % | 0.157 | 0.943 | 1.0 |
+| dis (pos + cnt) | 8.2 % | 0.752 | 0.391 | 4.8 |
+
+- 1667 vs Paris 4, pos: precision 0.80 / 0.76, recall 0.36 / 0.18. PH1-3 are bad for both nets (both wrong on 9.1 % of 19.6 %), and disagreement cannot see an error both share.
+- w4 is noise for w24. Its dz / dy / dx are mostly ~0 (UFSM_FDIS_DEBUG raw values), and it is off from the GT phase on 97 % of the scored cells (try9 33 %, part of which is the proxy: 19.2 um phase unwrapped over 307 um). The worklist uses pos + cnt.
+
+**Region and box level.** 512^3 level-0 regions with GT on >= 20 % of their cells (926), dis share of the material cells vs the GT wrong share:
+- Spearman 0.56;
+- wrong share 0.227 in the top quarter by dis vs 0.094 in the bottom quarter.
+
+Per box (16 1667 boxes), Spearman of the dis share against 1 - wbench ids is 0.65 for w24 and 0.48 for try9. C10, the worst w24 box (ids 0.29), has the highest dis share.
+
+**Other committees** (stride 2):
+
+| committee | dis precision | recall | both / all wrong | region Spearman |
+|---|---|---|---|---|
+| try9 vs wz896 (both 9.6 um, pos) | 0.84 | 0.10 | 7.8 % of 14.3 % | 0.04 |
+| try9 + w24 + wz896 (pos + cnt) | 0.66 | 0.48 | 3.1 % of 16.2 % | 0.59 |
+
+Two 9.6 um nets with the same data share most of their errors. Disagreement is precise but finds only a tenth of the errors, and it does not rank regions. The 2.4 um net makes the committee useful: its errors are different. try9 vs wz on w4: precision 0.81 (lift 1.7), so w4 can carry signal between same-baseline nets.
+
+**Against a random choice at equal labelled volume** (lead, nnActive 2025; randbase.awk). Pick the top K % of the GT regions by dis share and count the GT-wrong cells found per region cell, against the mean over all regions (a uniform random pick of as many equal-volume regions):
+
+| committee | top 5 % | top 10 % | top 25 % | top 50 % |
+|---|---|---|---|---|
+| try9 vs w24 (pos + cnt) | 1.53x | 1.54x | 1.39x | 1.23x |
+| try9 + w24 + wz896 | 1.55x | 1.56x | 1.43x | 1.27x |
+| try9 vs wz896 | 1.29x | 1.21x | 1.08x | 1.04x |
+
+So the region-level gain is real but modest: about 1.5x random in the top tenth, against a cell-level lift of 5. Most wrong cells are spread through every region.
+
+**What disagreement cannot find** (GT-wrong cells where every model is wrong, as a share of all GT-wrong cells):
+
+| committee | share |
+|---|---|
+| try9 vs w24 | 28 % (4.4 of 15.7 %) |
+| try9 + w24 + wz896 | 19 % (3.1 of 16.2 %) |
+| try9 vs wz896 | 55 % (7.8 of 14.3 %) |
+
+The nets share training data. A random share of the labelling budget (e.g. 1 region in 4) keeps those shared errors reachable and gives the unbiased check.
+
+**Labelling format** (research/active.md idea 1, Gotkowski et al. 2025, arXiv 2403.12834): sparse traces trained with a partial-label loss (the loss only on annotated voxels) match dense labels in 3-D segmentation. So a worklist region needs a few traced sheets with their winding, not a dense label. Our on-the-fly labels from meshes already train only where the pair rule knows the phase.
+
+**Worklist** (/vesuvius/ufsm/disagree/worklist.tsv).
+- Candidate boxes (pick.awk): 2048^3 level-0 boxes richest in unlabelled tiles next to GT tiles (unrollperf/w11 tiles-*.txt).
+- Paris 4's frontier boxes were air: its GT covers its papyrus. Its boxes are therefore picked at gaps between GT tiles along an axis (pick2.awk GAP=3).
+- try9 and w24 were predicted on card 1 in ~25 min (wbench production arguments). GT phase around the boxes for lab / near.
+- Rows kept: no GT tile, labelled share <= 0.02, material >= 0.3. Each row is a 512^3 box in the native zarr frame of the scan's 2.4 um volume.
+- Result: 474 regions, all on 1667 (32 candidate boxes; 15 with material).
+  - Top 50: dis on 16.4 % of the material cells (material 0.89), from 11 boxes. All 474: 8.6 %.
+  - By the eval, about 0.75 of the flagged cells are cells where some model is wrong.
+- Paris 4 gives no rows. Its gap boxes are mostly air or masked: the 31 regions with material >= 0.3 are labelled (lab 0.6-0.9). No labels were made.
+- Caveats: the GT check is at 19.2 um cells. try9 and w24 share 4.4 % of the errors (28 % of try9's), and the worklist cannot point at those.
+
+Scripts and rows: /vesuvius/ufsm/disagree (gtphase.sh, eval.sh, summ.awk, regsumm.awk, pick*.awk, candpred*.sh, p4g.sh, worklist.sh; ev/*/eval.tsv).
 
 ## Two-level pair rule for the 2.4 um labels (option 3) and the w24 trainer memory fixes (2026-11-27, branch opt3-20261127, unrollperf)
 
@@ -542,7 +1299,8 @@ at w320).
   HOLD at rung 1.1, w832 h160 − w768 h32, paired: 1667 .903 vs .896 = +0.006 ± 0.010, P4 .895 vs .891 = +0.003 ± 0.006
   (predict 136 vs 105 s). The CT for this HOLD check is a local copy re-staged for it (r11/ctl/stage3.sh, 39 GB).
 - **Verdict:** a larger halo is AUC-neutral and cuts the seam ~4x, but `--seamless 2` is ~10x lower again at 1.3x the time.
-  Seamless 2 stays the seam fix; no predict default changed.
+  Seamless 2 stays the seam fix. Decision (lead): `--seamless 2` is the default of the production ink renders (scripts/unroll/unroll.sh's predict
+  ink pass, INKSEAM=2; INKSEAM=0 = the old --feather pass); window / halo unchanged. Unroll's R11P section reads (sect24*) already ran it.
 - A first run of this A/B on an old branch build (before perf's blend-region fix f7478578) showed seamless 2 at off256 7.64, i.e.
   pass b's own seams. That was the stale binary, not a current bug.
 
