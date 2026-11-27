@@ -437,3 +437,221 @@ int cmd_field_disagree(int argc, char **argv) {
     if (gtd) fit_fields_free(&G);
     return 0;
 }
+
+/* ---- ufsm field-label (fielddis.h) ---- */
+
+typedef struct {
+    const fit_fields_buf *A, *B, *G; const fdl_cfg *c; float *pa, *pb, *cons, *cw; uint8_t *cls; uint8_t *phase, *conf, *kind; fdl_stat *st;
+} fdl_job;
+static void fdl_cellp(const fit_fields_buf *A, int z, int y, int x, double p[3]) {
+    const int ix[3] = {z, y, x}; for (int d = 0; d < 3; d++) p[d] = ((double)A->origin[d] + A->h * (ix[d] + 0.5)) * A->um;
+}
+static uint8_t fdl_code(double ph) { double t = ph - floor(ph); int k = (int)lround(t * 252); return (uint8_t)(k >= 252 ? 0 : k); }
+static void fdl_pass1(void *ctx, int z0, int z1, int t) {
+    fdl_job *J = ctx; const fit_fields_buf *A = J->A; const int H = A->shape[1], W = A->shape[2]; (void)t;
+    for (int z = z0; z < z1; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        const size_t i = ((size_t)z * H + y) * W + x; double p[3], a, b; fdl_cellp(A, z, y, x, p);
+        J->cons[i] = NAN; J->cw[i] = 0; J->cls[i] = 0;
+        if (!fd_phase(A, p, J->c->conf, &a) || !fd_phase(J->B, p, J->c->conf, &b)) continue;
+        J->pa[i] = (float)a; J->pb[i] = (float)b; const double d = fabs(fd_wrap(a - b));
+        if (d <= J->c->agree) {
+            const double ca = hypot((A->f.pc[i] - 128) / 127.0, (A->f.ps[i] - 128) / 127.0); double q[3]; fd_cc(J->B, p, q); const size_t j = fd_near(J->B, q);
+            const double cb = hypot((J->B->f.pc[j] - 128) / 127.0, (J->B->f.ps[j] - 128) / 127.0);
+            J->cons[i] = (float)(atan2(sin(2 * M_PI * a) + sin(2 * M_PI * b), cos(2 * M_PI * a) + cos(2 * M_PI * b)) / (2 * M_PI)); J->cw[i] = (float)fmin(1, fmin(ca, cb)); J->cls[i] = 1;
+        } else J->cls[i] = d > 0.25 ? 2 : 5;
+    }
+}
+static void fdl_pass2(void *ctx, int z0, int z1, int t) {
+    fdl_job *J = ctx; const fit_fields_buf *A = J->A; const fdl_cfg *c = J->c; const int D = A->shape[0], H = A->shape[1], W = A->shape[2]; fdl_stat *S = &J->st[t];
+    const int nr = (c->rmax - c->rmin) / 2 + 1, ring = nr * c->nang;
+    for (int z = z0; z < z1; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        const size_t i = ((size_t)z * H + y) * W + x; double p[3]; fdl_cellp(A, z, y, x, p);
+        J->phase[i] = 255; J->conf[i] = 0; J->kind[i] = J->cls[i] == 1 ? 1 : J->cls[i] == 5 ? 5 : 0;
+        double g = 0; const int hg = J->G && fd_phase(J->G, p, 0.3, &g);
+        if (J->cls[i] == 1) {
+            J->phase[i] = fdl_code(J->cons[i]); J->conf[i] = fd_u8(J->cw[i] * 255);
+            if (hg) { const int ok = fabs(fd_wrap(J->cons[i] - g)) <= 0.25, b = (int)fmin(9, J->cw[i] * 10); S->nagree++; S->agree_ok += ok; S->agree_bin_n[b]++; S->agree_bin_ok[b] += ok; }
+            continue;
+        }
+        if (J->cls[i] != 2) continue;
+        double v[3], t1[3], t2[3], sc = 0, ss = 0, sw = 0; int ns = 0;
+        if (fd_normal(A, p, v)) {
+            const int ax = fabs(v[0]) <= fabs(v[1]) && fabs(v[0]) <= fabs(v[2]) ? 0 : fabs(v[1]) <= fabs(v[2]) ? 1 : 2; double e[3] = {0, 0, 0}; e[ax] = 1;
+            t1[0] = v[1] * e[2] - v[2] * e[1]; t1[1] = v[2] * e[0] - v[0] * e[2]; t1[2] = v[0] * e[1] - v[1] * e[0];
+            const double l = sqrt(t1[0] * t1[0] + t1[1] * t1[1] + t1[2] * t1[2]); for (int d = 0; d < 3; d++) t1[d] /= l;
+            t2[0] = v[1] * t1[2] - v[2] * t1[1]; t2[1] = v[2] * t1[0] - v[0] * t1[2]; t2[2] = v[0] * t1[1] - v[1] * t1[0];
+            for (int r = c->rmin; r <= c->rmax; r += 2) for (int k = 0; k < c->nang; k++) {
+                const double an = 2 * M_PI * k / c->nang, ca = cos(an), sa = sin(an); int q[3]; const int ix[3] = {z, y, x}, lim[3] = {D, H, W}, in = 1;
+                int ok = in; for (int d = 0; d < 3 && ok; d++) { q[d] = (int)lround(ix[d] + r * (ca * t1[d] + sa * t2[d])); ok = q[d] >= 0 && q[d] < lim[d]; }
+                if (!ok) continue;
+                const size_t j = ((size_t)q[0] * H + q[1]) * W + q[2]; if (J->cls[j] != 1) continue;
+                sc += J->cw[j] * cos(2 * M_PI * J->cons[j]); ss += J->cw[j] * sin(2 * M_PI * J->cons[j]); sw += J->cw[j]; ns++;
+            }
+        }
+        int pick = -1; double cf = 0;
+        if (ns >= c->min_samp && sw > 0) {
+            const double R = hypot(sc, ss) / sw, e = atan2(ss, sc) / (2 * M_PI), ea = fabs(fd_wrap(J->pa[i] - e)), eb = fabs(fd_wrap(J->pb[i] - e));
+            const double ek = fmin(ea, eb), m = fabs(ea - eb);
+            if (R >= 0.3 && ek <= c->max_err && m >= c->min_margin) { pick = ea <= eb ? 0 : 1; cf = R * fmin(1, m / 0.5) * fmin(1, (double)ns / (ring / 2.0)); }
+        }
+        if (pick < 0) J->kind[i] = 4;
+        else { J->kind[i] = (uint8_t)(2 + pick); J->phase[i] = fdl_code(pick ? J->pb[i] : J->pa[i]); J->conf[i] = fd_u8(cf * 255); if (!J->conf[i]) J->conf[i] = 1; }
+        if (hg) {
+            const int ra = fabs(fd_wrap(J->pa[i] - g)) <= 0.25, rb = fabs(fd_wrap(J->pb[i] - g)) <= 0.25;
+            S->ndis++; S->base_a += ra; S->base_b += rb; S->any_right += ra || rb; S->nAwrong_Bright += !ra && rb; S->nAwrong_Bright_pickB += !ra && rb && pick == 1; S->nB_ok += pick == 1 && rb;
+            if (pick >= 0) { const int ok = pick ? rb : ra, b = (int)fmin(9, cf * 10); S->nlab++; S->ncorrect += ok; S->nA += !pick; S->nB += pick; S->bin_n[b]++; S->bin_ok[b] += ok; S->bin_a[b] += ra; }
+        }
+    }
+}
+int fdis_label(const fit_fields_buf *A, const fit_fields_buf *B, const fit_fields_buf *gt, const fdl_cfg *c, uint8_t *phase, uint8_t *conf, uint8_t *kind, fdl_stat *st) {
+    memset(st, 0, sizeof *st);
+    if (c->rmin < 1 || c->rmax < c->rmin || c->nang < 4) return -2;
+    const size_t N = (size_t)A->shape[0] * A->shape[1] * A->shape[2]; const int nt = fit_par_threads(A->shape[0]);
+    fdl_job J = {A, B, gt, c, malloc(N * 4), malloc(N * 4), malloc(N * 4), malloc(N * 4), malloc(N), phase, conf, kind, calloc((size_t)nt + 1, sizeof(fdl_stat))};
+    int rc = 0;
+    if (!J.pa || !J.pb || !J.cons || !J.cw || !J.cls || !J.st) rc = -1;
+    else {
+        fit_par(A->shape[0], fdl_pass1, &J); const int n2 = fit_par(A->shape[0], fdl_pass2, &J);
+        for (int t = 0; t < n2; t++) {
+            const fdl_stat *s = &J.st[t];
+            st->ndis += s->ndis; st->nlab += s->nlab; st->ncorrect += s->ncorrect; st->nA += s->nA; st->nB += s->nB; st->nB_ok += s->nB_ok; st->nAwrong_Bright += s->nAwrong_Bright; st->nAwrong_Bright_pickB += s->nAwrong_Bright_pickB; st->base_a += s->base_a; st->base_b += s->base_b; st->any_right += s->any_right;
+            st->nagree += s->nagree; st->agree_ok += s->agree_ok;
+            for (int b = 0; b < 10; b++) { st->bin_n[b] += s->bin_n[b]; st->bin_ok[b] += s->bin_ok[b]; st->bin_a[b] += s->bin_a[b]; st->agree_bin_n[b] += s->agree_bin_n[b]; st->agree_bin_ok[b] += s->agree_bin_ok[b]; }
+        }
+    }
+    free(J.pa); free(J.pb); free(J.cons); free(J.cw); free(J.cls); free(J.st);
+    return rc;
+}
+static int fdl_write(const char *out, const char *name, const fit_fields_buf *A, const uint8_t *a, const char *attrs) {
+    fdis_out o; memset(&o, 0, sizeof o); o.D = A->shape[0]; o.H = A->shape[1]; o.W = A->shape[2];
+    return fd_write(out, name, &o, a, attrs);
+}
+/* ufsm field-label OUT FIELDS-A FIELDS-B [--gt ORACLE] [--conf 0.2] [--agree 0.1] [--rmin 2] [--rmax 8] [--nang 12] [--min-samp 8]
+   [--max-err 0.2] [--min-margin 0.1] [--tag T] [--threads 6]: OUT/{phase,conf,kind} zarr arrays on A's cells (fielddis.h); with --gt
+   one row per confidence cut on stdout (and OUT/gt.tsv) */
+int cmd_field_label(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: ufsm field-label OUT FIELDS-A FIELDS-B [--gt ORACLE] [--conf 0.2] [--agree 0.1] [--rmin 2] [--rmax 8] [--nang 12] [--min-samp 8] [--max-err 0.2] [--min-margin 0.1] [--tag T] [--threads 6]\n"
+                                    "  labels for the cells where two models disagree, from the sheet continuity of the agreeing cells (src/fielddis.h)\n"); return 2; }
+    const char *out = argv[2], *gtd = fd_opt(argc, argv, "--gt", nullptr), *tag = fd_opt(argc, argv, "--tag", out);
+    fdl_cfg c = {.conf = opt_atof("--conf", fd_opt(argc, argv, "--conf", "0.2")), .agree = opt_atof("--agree", fd_opt(argc, argv, "--agree", "0.1")),
+                 .max_err = opt_atof("--max-err", fd_opt(argc, argv, "--max-err", "0.2")), .min_margin = opt_atof("--min-margin", fd_opt(argc, argv, "--min-margin", "0.1")),
+                 .rmin = opt_atoi("--rmin", fd_opt(argc, argv, "--rmin", "2")), .rmax = opt_atoi("--rmax", fd_opt(argc, argv, "--rmax", "8")),
+                 .nang = opt_atoi("--nang", fd_opt(argc, argv, "--nang", "12")), .min_samp = opt_atoi("--min-samp", fd_opt(argc, argv, "--min-samp", "8"))};
+    fit_set_threads(ufsm_threads(opt_atoi("--threads", fd_opt(argc, argv, "--threads", "6")), 6));
+    store_global_init();
+    fit_fields_buf A, B, G; memset(&A, 0, sizeof A); memset(&B, 0, sizeof B); memset(&G, 0, sizeof G);
+    if (fit_fields_load(argv[3], 0, 0, 1, &A) || fit_fields_load(argv[4], 0, 0, 1, &B)) { fprintf(stderr, "field-label: cannot load the fields\n"); return 1; }
+    if (gtd && fit_fields_load(gtd, 0, 0, 1, &G)) { fprintf(stderr, "field-label: cannot load the GT fields %s\n", gtd); return 1; }
+    const size_t N = (size_t)A.shape[0] * A.shape[1] * A.shape[2];
+    uint8_t *ph = malloc(N), *cf = malloc(N), *kd = malloc(N); fdl_stat s;
+    if (!ph || !cf || !kd) { fprintf(stderr, "field-label: out of memory\n"); return 1; }
+    const int rc = fdis_label(&A, &B, gtd ? &G : nullptr, &c, ph, cf, kd, &s);
+    if (rc) { fprintf(stderr, "field-label: %s\n", rc == -1 ? "out of memory" : "bad options"); return 1; }
+    size_t nk[6] = {0}; for (size_t i = 0; i < N; i++) nk[kd[i] < 6 ? kd[i] : 0]++;
+    mkdir(out, 0775);
+    char attrs[512]; snprintf(attrs, sizeof attrs, "{\"ufsm\": {\"origin\": [%lld, %lld, %lld], \"h\": %d, \"um\": %.6g, \"phase_fill\": 255}}", A.origin[0], A.origin[1], A.origin[2], A.h, A.um);
+    if (fdl_write(out, "phase", &A, ph, attrs) || fdl_write(out, "conf", &A, cf, attrs) || fdl_write(out, "kind", &A, kd, attrs)) return 1;
+    {   char jp[4096]; snprintf(jp, sizeof jp, "%s/label.json", out); FILE *jf = fopen(jp, "w");
+        if (!jf) { fprintf(stderr, "field-label: cannot write %s\n", jp); return 1; }
+        fprintf(jf, "{\"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %.9g}\n", A.origin[0], A.origin[1], A.origin[2], A.shape[0], A.shape[1], A.shape[2], A.h, A.um); fclose(jf); }
+    printf("field-label %s: %zu cells: agree %zu, disagree labelled A %zu / B %zu, abstained %zu, between %zu\n", tag, N, nk[1], nk[2], nk[3], nk[4], nk[5]);
+    if (gtd) {
+        char p[4096]; snprintf(p, sizeof p, "%s/gt.tsv", out); FILE *f = fopen(p, "w"); if (!f) { fprintf(stderr, "field-label: cannot write %s\n", p); return 1; }
+        fprintf(f, "tag\tkind\tcut\tcells_gt\tlabelled\tcorrect\tabstain\tbase_A\tbase_B\tany_right\tA_on_labelled\n");
+        for (int b = 0; b < 10; b++) {   /* cumulative: labels with conf >= b / 10 */
+            size_t n = 0, ok = 0, an = 0, aok = 0, la = 0; for (int k = b; k < 10; k++) { n += s.bin_n[k]; ok += s.bin_ok[k]; la += s.bin_a[k]; an += s.agree_bin_n[k]; aok += s.agree_bin_ok[k]; }
+            fprintf(f, "%s\tdisagree\t%.1f\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\n", tag, b / 10.0, s.ndis, n, ok, s.ndis - n, s.base_a, s.base_b, s.any_right, la);
+            fprintf(f, "%s\tagree\t%.1f\t%zu\t%zu\t%zu\t\t\t\t\t\n", tag, b / 10.0, s.nagree, an, aok);
+        }
+        fclose(f);
+        printf("  vs GT: %zu disagreement cells: labelled %.3f, accuracy %.3f (always A %.3f, always B %.3f, either right %.3f); %zu agree cells: accuracy %.3f\n", s.ndis,
+               s.ndis ? (double)s.nlab / s.ndis : 0, s.nlab ? (double)s.ncorrect / s.nlab : 0, s.ndis ? (double)s.base_a / s.ndis : 0, s.ndis ? (double)s.base_b / s.ndis : 0,
+               s.ndis ? (double)s.any_right / s.ndis : 0, s.nagree, s.nagree ? (double)s.agree_ok / s.nagree : 0);
+        printf("  picks A %zu / B %zu (B right %zu); A wrong + B right on %zu cells, B picked on %zu of them\n", s.nA, s.nB, s.nB_ok, s.nAwrong_Bright, s.nAwrong_Bright_pickB);
+    }
+    free(ph); free(cf); free(kd); fit_fields_free(&A); fit_fields_free(&B); if (gtd) fit_fields_free(&G);
+    return 0;
+}
+
+/* ufsm field-label-raster OUT --shape Z,Y,X --um U --regions FILE [--frame-um F] [--cut 0.5] [--agree-cut -1] LABELDIR..: one phase raster
+   (OUT/<U>, uint8 PHASE codes 0..251, 255 unknown = the mask; 128^3 shards, lossless; an OME group) of the scan's grid at U um voxels.
+   Inside each region of FILE (lines "z0 y0 x0 nz ny nx" in --frame-um voxels, '#' comments) every voxel takes the label of the field-label
+   cell holding its centre (the first LABELDIR covering it): disagreement labels with conf >= --cut, agree labels with conf >= --agree-cut
+   (< 0: none); everything else unknown. Sources: "phase": {"root": OUT, "key": "<U>", "level": L}. */
+typedef struct { long long o[3]; int n[3], h; double um; z3 *ph, *cf, *kd; } fdl_box;
+int cmd_field_label_raster(int argc, char **argv) {
+    if (argc < 4) { fprintf(stderr, "usage: ufsm field-label-raster OUT --shape Z,Y,X --um U --regions FILE [--frame-um F] [--cut 0.5] [--agree-cut -1] LABELDIR..\n"); return 2; }
+    const char *out = argv[2], *shs = fd_opt(argc, argv, "--shape", nullptr), *rf = fd_opt(argc, argv, "--regions", nullptr);
+    const double um = opt_atof("--um", fd_opt(argc, argv, "--um", "0")), fum = opt_atof("--frame-um", fd_opt(argc, argv, "--frame-um", "0")) > 0 ? opt_atof("--frame-um", fd_opt(argc, argv, "--frame-um", "0")) : um;
+    const double cut = opt_atof("--cut", fd_opt(argc, argv, "--cut", "0.5")), acut = opt_atof("--agree-cut", fd_opt(argc, argv, "--agree-cut", "-1"));
+    int64_t sh[3];
+    if (!shs || sscanf(shs, "%lld,%lld,%lld", (long long *)&sh[0], (long long *)&sh[1], (long long *)&sh[2]) != 3 || !(um > 0) || !rf) { fprintf(stderr, "field-label-raster: --shape Z,Y,X, --um and --regions\n"); return 2; }
+    store_global_init();
+    fdl_box *bx = calloc((size_t)argc, sizeof *bx); int nb = 0;
+    for (int i = 3; i < argc; i++) {
+        if (!strncmp(argv[i], "--", 2)) { i++; continue; }
+        char jp[4096]; snprintf(jp, sizeof jp, "%s/label.json", argv[i]); FILE *jf = fopen(jp, "r"); char buf[1024] = {0};
+        if (!jf) { fprintf(stderr, "field-label-raster: no %s\n", jp); return 1; }
+        size_t nr = fread(buf, 1, sizeof buf - 1, jf); (void)nr; fclose(jf); fdl_box *b = &bx[nb];
+        if (sscanf(buf, "{\"origin\": [%lld, %lld, %lld], \"shape\": [%d, %d, %d], \"h\": %d, \"um\": %lf", &b->o[0], &b->o[1], &b->o[2], &b->n[0], &b->n[1], &b->n[2], &b->h, &b->um) != 8) { fprintf(stderr, "field-label-raster: bad %s\n", jp); return 1; }
+        store *st = store_open(argv[i]); b->ph = z3_open(st, "phase", nullptr); b->cf = z3_open(st, "conf", nullptr); b->kd = z3_open(st, "kind", nullptr);
+        if (!b->ph || !b->cf || !b->kd) { fprintf(stderr, "field-label-raster: %s: %s\n", argv[i], z3_error()); return 1; }
+        nb++;
+    }
+    /* the boxes' arrays in memory (small: 256^3 cells each) */
+    uint8_t **P = calloc((size_t)nb, sizeof *P), **C = calloc((size_t)nb, sizeof *C), **K = calloc((size_t)nb, sizeof *K);
+    for (int b = 0; b < nb; b++) {
+        const size_t n = (size_t)bx[b].n[0] * bx[b].n[1] * bx[b].n[2]; const int64_t o0[3] = {0, 0, 0}, nn[3] = {bx[b].n[0], bx[b].n[1], bx[b].n[2]};
+        P[b] = malloc(n); C[b] = malloc(n); K[b] = malloc(n);
+        if (!P[b] || !C[b] || !K[b] || z3_read(bx[b].ph, o0, nn, P[b], 4) || z3_read(bx[b].cf, o0, nn, C[b], 4) || z3_read(bx[b].kd, o0, nn, K[b], 4)) { fprintf(stderr, "field-label-raster: read failed: %s\n", z3_error()); return 1; }
+        z3_close(bx[b].ph); z3_close(bx[b].cf); z3_close(bx[b].kd);
+    }
+    /* regions -> raster boxes */
+    FILE *f = fopen(rf, "r"); if (!f) { fprintf(stderr, "field-label-raster: cannot read %s\n", rf); return 1; }
+    int64_t (*R)[6] = nullptr; int nreg = 0, creg = 0; char ln[1024];
+    while (fgets(ln, sizeof ln, f)) {
+        char *hsh = strchr(ln, '#'); if (hsh) *hsh = 0; long long v[6];
+        if (sscanf(ln, "%lld %lld %lld %lld %lld %lld", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) continue;
+        if (nreg == creg) { creg = creg ? 2 * creg : 64; R = realloc(R, (size_t)creg * sizeof *R); }
+        for (int d = 0; d < 3; d++) { R[nreg][d] = (int64_t)floor(v[d] * fum / um + 1e-6); R[nreg][3 + d] = (int64_t)ceil((v[d] + v[3 + d]) * fum / um - 1e-6) - R[nreg][d]; }
+        nreg++;
+    }
+    fclose(f);
+    mkdir(out, 0775);
+    char key[64]; z3w_level_name(um, key, sizeof key); char ap[4096]; snprintf(ap, sizeof ap, "%s/%s", out, key);
+    z3w *w = z3w_create(ap, sh, 128, 0, 255, "{\"ufsm\": {\"encoding\": \"phase252\", \"from\": \"field-label\"}}");
+    if (!w || z3w_write_group(out, &um, 1, "field-label", nullptr)) { fprintf(stderr, "field-label-raster: %s\n", z3w_error()); return 1; }
+    /* the shards any region touches, each written once */
+    const int64_t ns[3] = {(sh[0] + 127) / 128, (sh[1] + 127) / 128, (sh[2] + 127) / 128};
+    uint8_t *mark = calloc((size_t)ns[0] * ns[1] * ns[2], 1), *buf = malloc((size_t)128 * 128 * 128); size_t nvox = 0, nlab = 0, nshard = 0;
+    for (int r = 0; r < nreg; r++) for (int64_t a = R[r][0] / 128; a * 128 < R[r][0] + R[r][3] && a < ns[0]; a++) for (int64_t b = R[r][1] / 128; b * 128 < R[r][1] + R[r][4] && b < ns[1]; b++)
+        for (int64_t e = R[r][2] / 128; e * 128 < R[r][2] + R[r][5] && e < ns[2]; e++) mark[((size_t)a * ns[1] + b) * ns[2] + e] = 1;
+    for (int64_t a = 0; a < ns[0]; a++) for (int64_t b = 0; b < ns[1]; b++) for (int64_t e = 0; e < ns[2]; e++) {
+        if (!mark[((size_t)a * ns[1] + b) * ns[2] + e]) continue;
+        memset(buf, 255, (size_t)128 * 128 * 128);
+        for (int r = 0; r < nreg; r++) {
+            int64_t lo[3], hi[3]; const int64_t s0[3] = {a * 128, b * 128, e * 128}; int ok = 1;
+            for (int d = 0; d < 3; d++) { lo[d] = R[r][d] > s0[d] ? R[r][d] : s0[d]; hi[d] = R[r][d] + R[r][3 + d] < s0[d] + 128 ? R[r][d] + R[r][3 + d] : s0[d] + 128; if (hi[d] > sh[d]) hi[d] = sh[d]; ok &= lo[d] < hi[d]; }
+            if (!ok) continue;
+            for (int64_t z = lo[0]; z < hi[0]; z++) for (int64_t y = lo[1]; y < hi[1]; y++) for (int64_t x = lo[2]; x < hi[2]; x++) {
+                const int64_t g[3] = {z, y, x}; uint8_t v = 255; nvox++;
+                for (int k = 0; k < nb && v == 255; k++) {
+                    int c[3], in = 1; for (int d = 0; d < 3 && in; d++) { c[d] = (int)floor(((g[d] + 0.5) * um / bx[k].um - bx[k].o[d]) / bx[k].h); in = c[d] >= 0 && c[d] < bx[k].n[d]; }
+                    if (!in) continue;
+                    const size_t i = ((size_t)c[0] * bx[k].n[1] + c[1]) * bx[k].n[2] + c[2]; const int kd = K[k][i];
+                    if (((kd == 2 || kd == 3) && C[k][i] >= cut * 255) || (kd == 1 && acut >= 0 && C[k][i] >= acut * 255)) v = P[k][i];
+                    else if (kd) v = 254;   /* (covered, unlabelled: kept apart from 'no box' until the end) */
+                }
+                if (v < 252) nlab++; else v = 255;
+                buf[((size_t)(z - s0[0]) * 128 + (size_t)(y - s0[1])) * 128 + (size_t)(x - s0[2])] = v;
+            }
+        }
+        if (z3w_write_shard(w, a, b, e, buf, 6)) { fprintf(stderr, "field-label-raster: shard write: %s\n", z3w_error()); return 1; }
+        nshard++;
+    }
+    if (z3w_close(w)) { fprintf(stderr, "field-label-raster: %s\n", z3w_error()); return 1; }
+    printf("field-label-raster: %d regions, %zu voxels, %zu labelled (%.3f), %zu shards -> %s key %s\n", nreg, nvox, nlab, nvox ? (double)nlab / nvox : 0, nshard, out, key);
+    for (int b = 0; b < nb; b++) { free(P[b]); free(C[b]); free(K[b]); }
+    free(P); free(C); free(K); free(bx); free(R); free(mark); free(buf);
+    return 0;
+}

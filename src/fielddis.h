@@ -49,3 +49,25 @@ double fdis_w4_pair(const fit_fields_buf *A, const double *ta, const fit_fields_
 /* the physical centre (um, scan frame) of output cell (z, y, x) */
 void fdis_cell_um(const fdis_out *o, int z, int y, int x, double p[3]);
 int cmd_field_disagree(int argc, char **argv);
+
+/* ---- ufsm field-label: semi-automatic labels for the disagreement cells (2026-11-27, disagree2) ----
+   Two models A (the grid) and B. Per A cell with both phases valid (material, confidence > conf):
+     agree    |dphi| <= agree (0.1 turn): the consensus phase (circular mean), weight the smaller confidence
+     disagree |dphi| > 0.25 turn: the evidence is sheet continuity from the agreeing cells around it, not the models' own call: the
+              consensus phases sampled on the cell's tangent plane (A's normal; radii rmin .. rmax cells, nang angles, nearest
+              cell), their weighted circular mean E (resultant R). The model nearer arg E wins when its error <= max_err, the other's
+              exceeds it by >= min_margin, >= min_samp samples and R >= 0.3; else abstain. conf = R x min(1, margin / 0.5) x
+              min(1, samples / (half the ring samples)).
+   kind plane: 0 none, 1 agree, 2 A chosen, 3 B chosen, 4 abstained, 5 between (0.1 .. 0.25: unlabelled). phase plane: 0..251 (x 252),
+   255 none; conf plane x 255. GT (oracle fields, sampled at the cell centres, confidence > 0.3) scores: a disagreement label is
+   correct when |chosen - GT| <= 0.25 turn; an agree label when |consensus - GT| <= 0.25. */
+typedef struct { double conf, agree, max_err, min_margin; int rmin, rmax, nang, min_samp; } fdl_cfg;
+typedef struct {
+    size_t ndis, nlab, ncorrect, nA, nB, nB_ok, nAwrong_Bright, nAwrong_Bright_pickB, base_a, base_b, any_right;   /* disagree cells with GT: labelled, correct; picks; always-A / always-B correct; either right */
+    size_t bin_n[10], bin_ok[10], bin_a[10];                            /* labelled by conf / 0.1: cells, correct, A right there (the always-A baseline on the same cells) */
+    size_t nagree, agree_ok, agree_bin_n[10], agree_bin_ok[10];         /* agree cells with GT, by consensus weight / 0.1 */
+} fdl_stat;
+int fdis_label(const fit_fields_buf *A, const fit_fields_buf *B, const fit_fields_buf *gt, const fdl_cfg *c, uint8_t *phase, uint8_t *conf, uint8_t *kind, fdl_stat *st);
+int cmd_field_label(int argc, char **argv);
+/* ufsm field-label-raster: the labels of many boxes (field-label outputs) as one 9.6 um phase raster for a sources "phase" target */
+int cmd_field_label_raster(int argc, char **argv);

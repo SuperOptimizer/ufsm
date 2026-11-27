@@ -126,6 +126,22 @@ int main(void) {
         CHECK(np == 0 && nc == 0 && o.nw4 > n / 3 && o.nw4 < n, "w4 case: pos %zu cnt %zu flagged, w4 valid %zu of %zu (the chain leaves the box near the top)", np, nc, o.nw4, n);
         fdis_free(&o);
     }
+    {   /* field-label: B (2.4 um) half a turn off in one quarter; the agreeing cells around the quarter decide for A near its edges,
+           deep inside (no agreeing cell on the tangent ring) it abstains; every label is right against A as the GT, B is never picked.
+           With the grids swapped (S the grid, A second) the picks are B's. */
+        const fdl_cfg lc = {.conf = 0.2, .agree = 0.1, .max_err = 0.2, .min_margin = 0.1, .rmin = 2, .rmax = 8, .nang = 12, .min_samp = 8};
+        const size_t N = (size_t)64 * 64 * 64; uint8_t *ph = malloc(N), *cf = malloc(N), *kd = malloc(N); fdl_stat st;
+        CHECK(!fdis_label(&A, &S, &A, &lc, ph, cf, kd, &st), "field-label run");
+        size_t nk[6] = {0}; for (size_t i = 0; i < N; i++) nk[kd[i] < 6 ? kd[i] : 0]++;
+        CHECK(st.ndis > 0 && st.nlab > st.ndis / 10 && st.nlab < st.ndis && st.ncorrect == st.nlab && st.nB == 0 && nk[4] > 0, "labels: dis %zu labelled %zu correct %zu B %zu abstain %zu", st.ndis, st.nlab, st.ncorrect, st.nB, nk[4]);
+        CHECK(st.nagree > N / 2 && st.agree_ok == st.nagree, "agree labels %zu ok %zu", st.nagree, st.agree_ok);
+        int ok = 1; for (size_t i = 0; i < N; i++) if (kd[i] == 2 && (ph[i] > 251 || !cf[i])) ok = 0;
+        CHECK(ok, "label codes");
+        free(ph); free(cf); free(kd);
+        const size_t M = (size_t)256 * 256 * 256; ph = malloc(M); cf = malloc(M); kd = malloc(M);
+        CHECK(!fdis_label(&S, &A, &A, &lc, ph, cf, kd, &st) && st.nA == 0 && st.nB > 0 && st.ncorrect == st.nlab, "swapped: A %zu B %zu correct %zu of %zu", st.nA, st.nB, st.ncorrect, st.nlab);
+        free(ph); free(cf); free(kd);
+    }
     {   /* the command: arrays, gt.tsv, regions ranked (16-cell regions of the 9.6 um frame: the two shifted ones first) */
         char *argv[] = {"ufsm", "field-disagree", po, pa, ps, "--gt", pa, "--region", "16", "--threads", "4", "--tag", "t", nullptr};
         CHECK(cmd_field_disagree(13, argv) == 0, "command");
@@ -146,6 +162,25 @@ int main(void) {
         if (f) fclose(f);
         CHECK(nr == 64 && top_ok, "regions: %d rows, the shifted quarter first %d", nr, top_ok);
         snprintf(p, sizeof p, "%s/gt.tsv", po); CHECK(access(p, R_OK) == 0, "gt.tsv");
+    }
+    {   /* field-label + field-label-raster: the labels of a box as a 9.6 um phase raster over one listed region (16^3 voxels), unknown elsewhere */
+        char pl[300], pr[300], rf[300]; snprintf(pl, sizeof pl, "%s/lab", root); snprintf(pr, sizeof pr, "%s/raster", root); snprintf(rf, sizeof rf, "%s/regions.txt", root);
+        char *a1[] = {"ufsm", "field-label", pl, pa, ps, "--threads", "4", nullptr};
+        CHECK(cmd_field_label(7, a1) == 0, "field-label command");
+        FILE *f = fopen(rf, "w"); fprintf(f, "# z y x nz ny nx\n112 112 144 16 16 16\n"); fclose(f);
+        char *a2[] = {"ufsm", "field-label-raster", pr, "--shape", "256,256,256", "--um", "9.6", "--regions", rf, "--cut", "0", "--agree-cut", "0", pl, nullptr};
+        CHECK(cmd_field_label_raster(14, a2) == 0, "field-label-raster command");
+        z3 *z = z3_open(store_open(pr), "9.6", nullptr); CHECK(z != nullptr, "raster array");
+        if (z) {
+            uint8_t *v = malloc(32 * 32 * 32); const int64_t oo[3] = {104, 104, 136}, nn[3] = {32, 32, 32};
+            CHECK(!z3_read(z, oo, nn, v, 2), "raster read");
+            /* the region (x 144 .. 160: A's cells 48 .. 63, outside the shifted quarter) agrees: every voxel known, its phase A's: z (120 + 0.5) 9.6 um from the box start P0 */
+            const double ph = (120 + 0.5 - 96) * 9.6 / 60; const int want = (int)lround((ph - floor(ph)) * 252) % 252, got = v[(16 * 32 + 16) * 32 + 16];
+            int known = 0, outside = 0; for (int i = 0; i < 32 * 32 * 32; i++) { const int zz = i / 1024, yy = i / 32 % 32, xx = i % 32;
+                const int in = zz >= 8 && zz < 24 && yy >= 8 && yy < 24 && xx >= 8 && xx < 24; if (in) known += v[i] < 252; else outside += v[i] != 255; }
+            CHECK(known == 16 * 16 * 16 && outside == 0 && abs(got - want) <= 3, "raster: %d known in the region, %d set outside, centre %d (want %d)", known, outside, got, want);
+            free(v); z3_close(z);
+        }
     }
     fit_fields_free(&A); fit_fields_free(&B); fit_fields_free(&S); fit_fields_free(&Dn); fit_fields_free(&W4);
     char cmd[300]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", root); if (system(cmd)) {}

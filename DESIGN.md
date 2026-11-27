@@ -821,6 +821,46 @@ Per-z distance from the reference, mm (median / p90 / max; CPU, 6 threads, 1-3 m
   - Their PTX differs from the pin in 117 of the 132 units (every lp_*, most nn_*).
   - 285d308 itself has been in the pin since before 01873d0 (an ancestor). Only the note asking for its review is outside.
 
+## Semi-automatic labels for the disagreement worklist: sheet continuity only agrees with try9 (negative; 2026-11-27, branch disagree2-20261127, disagree)
+
+User plan (lead): label the 474 worklist regions from evidence other than the two disagreeing models, validate on GT first, and gate at accuracy >= 0.9.
+
+**Evidence available on 1667.**
+- Hand segments / wraps: none in the worklist regions. They are the GT, and the worklist excludes GT tiles.
+- ATLAS: has no 1667 patches (atlas kept/: 0306B, 0800, others).
+- Fit ref-snap count: not built.
+- That leaves sheet continuity.
+
+**`ufsm field-label OUT A B [--gt ORACLE]`** (src/fielddis.c), on A's cells:
+- Agreeing cells (|dphi| <= 0.1) give a consensus phase.
+- For a disagreement cell (|dphi| > 0.25), the consensus is sampled on its tangent plane: A's normal, radii 2-8 cells, 12 angles. Their circular mean E picks the model nearer arg E (error <= 0.2, margin >= 0.1, >= 8 samples, R >= 0.3); otherwise it abstains.
+- conf = R x margin / 0.5 x the sample share.
+- `field-label-raster` writes the labels of many boxes as one 9.6 um phase raster over listed regions (255 = unknown, i.e. the mask), for a sources "phase" target.
+- test_fielddis covers both, including a B-correct case with the grids swapped.
+
+**GT check** (the 20 wbench boxes, try9 = A, w24 snap 2000 = B; GT hidden from the labeller; a label is correct if within 0.25 turn of GT):
+
+| conf cut | disagreement cells labelled | accuracy | always try9 on the same cells | agree-cell labels: accuracy |
+|---|---|---|---|---|
+| 0.0 | 10.9 % | 0.893 | 0.894 | 0.952 (all) |
+| 0.2 | 7.0 % | 0.909 | 0.908 | 0.952 |
+| 0.3 | 2.9 % | 0.916 | 0.915 | 0.967 |
+| 0.4 | 1.0 % | 0.920 | 0.919 | 0.974 |
+
+Pooled over the 9.29 M disagreement cells: always try9 is right on 0.855, either model on 0.956.
+
+**Result.** Continuity adds nothing over trusting try9:
+- It picks try9 976k times and w24 40k times, and the w24 picks are right 59 %.
+- Of the 939k cells where try9 is wrong and w24 right, it picks w24 on 1.3 %.
+- The neighbouring agreeing cells carry try9's phase, so the tangent-plane estimate reproduces try9.
+- Wider rings (radius 4-16, 16 angles) label ~50 % of the cells, at accuracy 0.79-0.88, again ≈ always try9.
+
+The formal gate passes at cut 0.2 (0.909 on 7 % of the cells), but those labels would be try9's own phase, i.e. pseudo-labels with no new information. So the worklist was not labelled; that is the lead's call.
+
+The agree-cell labels (0.952, 0.98 at weight >= 0.5) are plain committee pseudo-labels. They label where the models already agree, not the disagreement regions.
+
+What would add information on 1667: human traces in the worklist regions (sparse, with a partial-label loss), or evidence the nets do not share, e.g. a fitter ref-snap count. Rows: /vesuvius/ufsm/disagree/labgt/base (labgt.sh, labsumm.awk).
+
 ## Model disagreement as a labelling query: `ufsm field-disagree`, checked against the GT; a labelling worklist (2026-11-27, branch disagree-20261127, disagree)
 
 Idea (lead): human sheet labels are scarce, and we have several winding models. Label where they disagree (query by committee;
