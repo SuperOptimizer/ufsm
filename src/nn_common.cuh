@@ -108,7 +108,11 @@ extern thread_local cudaError_t g_err;
 extern "C" const char *lp_check(void);
 extern thread_local const char *g_err_file, *g_err_what; extern thread_local int g_err_line;   /* the call site of the latched g_err (nn_check_site) */
 extern "C" void nn_err_post(int e, const char *file, int line, const char *what);
-#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = #x; nn_err_post((int)e_, __FILE__, __LINE__, #x); if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
+/* a kernel that cannot be loaded (no image for this device, PTX the driver rejects, a device function nothing defines): a build error,
+   never latched for a later nn_check, the process stops at the call (nn_core.cu nn_err_load_fatal; 11-27 four_tab_k) */
+#define NN_LOAD_ERR(e) ((e) == 98 || (e) == 200 || (e) == 209 || (e) == 218 || (e) == 221 || (e) == 222 || (e) == 300 || (e) == 302)
+extern "C" void nn_err_load_fatal(int e, const char *file, int line, const char *what);
+#define CK(x) do { cudaError_t e_ = (x); if (NN_LOAD_ERR((int)e_)) nn_err_load_fatal((int)e_, __FILE__, __LINE__, #x); if (e_ != cudaSuccess && g_err == cudaSuccess) { g_err = e_; g_err_file = __FILE__; g_err_line = __LINE__; g_err_what = #x; nn_err_post((int)e_, __FILE__, __LINE__, #x); if (ufsm_env_on("UFSM_CUDA_TRACE")) fprintf(stderr,"CUDA at %s:%d (%s): %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e_)); } } while (0)
 #define KCHECK() CK(cudaGetLastError())
 
 extern "C" int nn_init(int device);

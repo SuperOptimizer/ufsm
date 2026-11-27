@@ -294,6 +294,9 @@ static int usage(void) {
         "  ufsm wrap-xsec <out.jpg> --ct ROOT KEY --level L --z Z [--crop y,x,h,w] R,G,B:TIFXYZ ...   mesh cross-sections drawn on one axial CT slice\n"
         "  ufsm wrap-align <tifxyz> --ct ROOT KEY --level L [--every 8] [--block 512] [--out PREFIX]   share of a mesh whose normal follows the CT lamination (structure tensor)\n"
         "  ufsm wrap-rays <out.tsv> --ct ROOT KEY --level L --z Z --meshes DIR [--map reg.json --cf CFDIR] [--rays 8]   CT laminae vs fitted wraps vs count-field turns along radial lines\n"
+        "  ufsm atlas-import OUT FILE.parquet... [--scroll S] [--limit N] [--dump 1]   ATLAS-15k Parquet surface patches -> OUT/<scroll>/<id>.tifxyz + index.tsv\n"
+        "  ufsm atlas-rvscore --rv ROOT KEY [--box B --phase R K --ct R K] [--patches INDEX --ids F --axis A]   a predicted rv volume vs GT phase sides / ATLAS recto faces\n"
+        "  ufsm atlas-audit INDEX.tsv --ref DIR [--scroll S] [--out T.tsv]   ATLAS patches vs reference sheets (GT q meshes / our wraps): distance, sheet switches\n"
         "  ufsm surf-near <query-tifxyz> <wraps-dir> [--radius 40] [--out PREFIX] [--matched DIR]   a foreign surface vs our wraps: plane distance, wraps followed\n"
         "  ufsm wrap-w <fit-model-dir> <tifxyz>... [--zr z0,z1]   a fit model's winding W on wrap meshes (level-set check: W = k flat on the model's own wraps)\n"
         "  ufsm unroll-qa --fields DIR --model SET [--ct ROOT KEY] [--fibres F.fib] [--box ..]... [--out DIR] [--strict]   label-free sheet-identity gates (phase confidence, phase-unwrap witness, wind4, fibres)\n"
@@ -359,6 +362,7 @@ static int usage(void) {
         "  ufsm fiber-trace <root> <key-prefix> <out.fib> --box Z,Y,X,NZ,NY,NX [--scaledown 3]   streamlines through a published fibre prediction (presence, nx, ny) -> UFIB\n"
         "  ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY)   H / V fibre mask labels (prob254) on the CT grid\n"
         "  ufsm fiber-onfly <fibres.afv|.fib> --ct ROOT KEY [--ref H V KEY]   the fibre planes on the fly (sources \"fibre\" targets): ms / window, diffs\n"
+        "  ufsm field-disagree OUT FIELDS1 FIELDS2 .. [--gt ORACLE] [--labelled ROOT KEY --lab-um U] [--region 512 --frame-um U]   where models' fit fields disagree (position, normal wrap count, winding mod 4): volume + ranked labelling regions\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean] [--paste F [--box z,y,x,nz,ny,nx]] [--plane-w GROUP=a,b,..:..]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
         "  ufsm store-bench <root> <array-key> [--box 128,256,512] [--n 8] [--par 1] [--threads 16]   HTTP zarr fetch benchmark\n"
@@ -4992,6 +4996,9 @@ int cmd_wrap_align(int argc, char **argv);   /* src/wrapxsec.c */
 int cmd_wrap_rays(int argc, char **argv);    /* src/wraprays.c */
 int cmd_wrap_w(int argc, char **argv);       /* src/wraprays.c */
 int cmd_surf_near(int argc, char **argv);    /* src/surfnear.c */
+int cmd_atlas_import(int argc, char **argv); /* src/atlas.c */
+int cmd_atlas_audit(int argc, char **argv);  /* src/atlas.c */
+int cmd_atlas_rvscore(int argc, char **argv); /* src/atlas.c */
 int cmd_gt_trans(int argc, char **argv);   /* src/gttrans.c */
 int cmd_fields_derive(int argc, char **argv);   /* src/fieldsderive.c */
 int cmd_annotate_serve(int argc, char **argv);   /* src/annot.c */
@@ -4999,6 +5006,7 @@ int cmd_annot_export(int argc, char **argv);   /* src/annot_export.c */
 int cmd_gt_anchors(int argc, char **argv);   /* src/anchors.c */
 int cmd_annot_regions(int argc, char **argv);
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
+int cmd_field_disagree(int argc, char **argv);   /* src/fielddis.c */
 int cmd_flatten(int argc, char **argv);         /* src/flatten.c */
 int cmd_faces(int argc, char **argv);           /* src/faces_cli.c */
 int cmd_flatten_warp(int argc, char **argv);
@@ -5083,6 +5091,9 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "wrap-rays")) return cmd_wrap_rays(argc, argv);
     if (!strcmp(cmd, "wrap-w")) return cmd_wrap_w(argc, argv);
     if (!strcmp(cmd, "surf-near")) return cmd_surf_near(argc, argv);
+    if (!strcmp(cmd, "atlas-import")) return cmd_atlas_import(argc, argv);
+    if (!strcmp(cmd, "atlas-audit")) return cmd_atlas_audit(argc, argv);
+    if (!strcmp(cmd, "atlas-rvscore")) return cmd_atlas_rvscore(argc, argv);
     if (!strcmp(cmd, "gt-trans")) return cmd_gt_trans(argc, argv);
     if (!strcmp(cmd, "fields-derive")) return cmd_fields_derive(argc, argv);
     if (!strcmp(cmd, "annotate-serve")) return cmd_annotate_serve(argc, argv);
@@ -5090,6 +5101,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "gt-anchors")) return cmd_gt_anchors(argc, argv);
     if (!strcmp(cmd, "annot-regions")) return cmd_annot_regions(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
+    if (!strcmp(cmd, "field-disagree")) return cmd_field_disagree(argc, argv);
     if (!strcmp(cmd, "flatten")) return cmd_flatten(argc, argv);
     if (!strcmp(cmd, "faces")) return cmd_faces(argc, argv);
     if (!strcmp(cmd, "flatten-warp")) return cmd_flatten_warp(argc, argv);

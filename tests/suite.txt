@@ -126,6 +126,7 @@ test_wbench_stats                              |              |     2 | bash tes
 test_gnwstats                                  |              |     2 | bash tests/test_gnwstats.sh $B/ufsm
 test_ckid                                      |              |     1 | bash tests/test_ckid.sh
 test_implicit_decl                             |              |     6 | bash tests/test_implicit_decl.sh
+test_gpuslot_prep                              |              |     2 | bash tests/test_gpuslot_prep.sh
 test_run_suite                                 |              |    17 | bash tests/test_run_suite.sh
 test_gpuq                                      | flaky        |    14 | bash tests/test_gpuq.sh
 test_robust                                    | gpu          |     1 | ./$B/test_robust
@@ -185,6 +186,7 @@ test_sheetscore                                |              |     3 | ./$B/tes
 test_patchsolve                                |              |     3 | ./$B/test_patchsolve
 test_patchid                                   |              |     3 | ./$B/test_patchid   
 test_gttrans                                   |              |     2 | ./$B/test_gttrans
+test_fielddis                                  |              |     2 | ./$B/test_fielddis
 test_fieldsderive                              |              |     2 | ./$B/test_fieldsderive
 test_recto                                     |              |     3 | ./$B/test_recto
 test_recto_gpu                                 | gpu          |     3 | ./$B/test_recto_gpu
@@ -198,6 +200,7 @@ test_render_stream                             |              |     7 | ./$B/tes
 test_imgops                                    | smoke        |     1 | ./$B/test_imgops
 test_tfx                                       |              |     1 | ./$B/test_tfx
 test_annot                                     |              |     2 | ./$B/test_annot
+test_atlas                                     |              |     2 | ./$B/test_atlas
 test_sheetcut                                  |              |     1 | ./$B/test_sheetcut
 test_dino_loss                                 | gpu,smoke    |     1 | ./$B/test_dino_loss
 test_dino_loss~D=16                            | gpu          |     1 | UFSM_TEST_D=16 ./$B/test_dino_loss
@@ -436,6 +439,7 @@ test_ct_gpu_decode                             | gpu          |    30 | bash tes
 test_vcgpu                                     | gpu,smoke    |     5 | ./$B/test_vcgpu
 test_lat                                       | gpu,smoke    |     1 | ./$B/test_lat
 test_cluster                                   | gpu,smoke    |     1 | ./$B/test_cluster
+test_devmath                                   | gpu          |     2 | ./$B/test_devmath
 test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
 test_latcodec                                  | cpu          |     4 | ./$B/test_latcodec $TMPDIR
 test_latvol                                    | gpu          |     6 | ./$B/test_latvol

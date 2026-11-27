@@ -54,6 +54,7 @@ ufsm_exe(scrollaug_anim tests/scrollaug_anim.c OBJS scannorm edt band sheet ct_a
 ufsm_exe(store_bench src/storebench.c OBJS store zarr3 json LIBS LDLIBS DEFS STORE_BENCH_MAIN)
 ufsm_exe(surface_dedup tools/surface_dedup.c OBJS tiff LIBS m z)
 ufsm_exe(test_afv SUITE tests/test_afv.c OBJS afv json LIBS LDLIBS)
+ufsm_exe(test_atlas SUITE tests/test_atlas.c OBJS atlas parquet zarr3 z3w store json optcheck imgops jpegpar tiffw tiff LIBS LDLIBS m)
 ufsm_exe(test_annot SUITE tests/test_annot.c OBJS annot z3w zarr3 store json tfx imgops jpegpar tiffw tiff surfcomp LIBS LDLIBS)
 ufsm_exe(test_attn SUITE tests/test_attn.c OBJS NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_xnet_oom SUITE tests/test_xnet_oom.c OBJS NN LP LIBS LDLIBS CUDA)
@@ -75,6 +76,7 @@ ufsm_exe(test_dvprobe SUITE tests/test_dvprobe.c OBJS CORE NN LP LIBS LDLIBS CUD
 ufsm_exe(test_gt_gate SUITE tests/test_gt_gate.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_hold_frame SUITE tests/test_hold_frame.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_gttrans SUITE tests/test_gttrans.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
+ufsm_exe(test_fielddis SUITE tests/test_fielddis.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_fieldsderive SUITE tests/test_fieldsderive.c OBJS CORE NN LP LIBS LDLIBS CUDA m)
 ufsm_exe(test_cond SUITE tests/test_cond.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug cover json
          store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb sample_cond embz LIBS LDLIBS)
@@ -192,6 +194,7 @@ ufsm_exe(test_l0_stream SUITE tests/test_l0_stream.c OBJS unet NN LP LIBS m CUDA
 ufsm_exe(test_l3_sched SUITE tests/test_l3_sched.c OBJS unet NN LP LIBS m CUDA)
 ufsm_exe(test_lat SUITE tests/test_lat.c OBJS NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_cluster SUITE tests/test_cluster.c OBJS NN LP LIBS m CUDA)
+ufsm_exe(test_devmath SUITE tests/test_devmath.c OBJS nn_devmath LIBS m CUDA)
 ufsm_exe(test_lat_conv0 SUITE tests/test_lat_conv0.c OBJS NN LP LIBS m CUDA)
 ufsm_exe(test_lat_fuse SUITE tests/test_lat_fuse.c OBJS NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_lat_head SUITE tests/test_lat_head.c OBJS unet NN LP LIBS m CUDA)
