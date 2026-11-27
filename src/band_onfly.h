@@ -15,7 +15,7 @@ z3 *phase_onfly_open(z3 *codes, float rmax);
 /* the two-level pair rule (band.h band_field_phase_pair2): codes (level 0) and codes1 (the same codes at level 1, both taken over) at rmax
    (level-0 voxels), level-0 tiles with a halo of h0 voxels. Not byte-identical to phase_onfly_open: the far sheets are taken at their
    level-1 cell's centre (w24 2026-11-27: gated by phase-cmp against the level-0 rule) */
-z3 *phase_onfly_open2(z3 *codes, z3 *codes1, float rmax, int h0);
+z3 *phase_onfly_open2(z3 *codes, z3 *codes1, float rmax, int h0, int ls);   /* (ls: codes1 is 2^ls coarser, 1..3) */
 /* the 2x circular-mean pooling of winding_mod14 codes (phase-raster --gs 4's praster_read, `ufsm codes-pool2`): of a box of the coarse
    grid, and as a derived array (shape ceil(codes / 2), fill 0; codes taken over; nullptr on failure, codes kept). The onfly phase over
    it equals phase-raster --gs 4 (the pair rule on the GPU, the codes pooled on the CPU) */
