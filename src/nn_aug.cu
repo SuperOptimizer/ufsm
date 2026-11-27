@@ -567,14 +567,13 @@ extern "C" size_t nn_label_warp_device_bytes_z(int P, int ns) { return 2 * (size
 /* ---- SA_FOURIER (scan_augment.h; the host reference scan_augment.c fourier_ref): the band's DFT by plane chunks (x as a GEMM against the
    twiddle matrix, then y, then z accumulated in double), the gain, and the inverse (z, y, then x as a GEMM added into F). NK = K + 1
    (kx >= 0), NY = 2 K + 1; the twiddles e^{2 pi i m / P} at m = k r mod P ---- */
-__global__ void four_tab_k(int P, int K, float2 *tw, float *W, float *V) {   /* tw[P]; W[P][2 NK] (cos, -sin); V[2 NK][P] (c_k cos, -c_k sin) / P^3 */
-    const int NK = K + 1; const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    const double s3 = 1.0 / ((double)P * P * P);
-    if (i < (size_t)P) { double sn, cs; sincospi(2.0 * (double)i / P, &sn, &cs); tw[i] = make_float2((float)cs, (float)sn); }
-    if (i < (size_t)P * NK) {
-        const int x = (int)(i / NK), k = (int)(i % NK), m = (int)(((long long)k * x) % P); double sn, cs; sincospi(2.0 * (double)m / P, &sn, &cs);
+/* the tables on the host in double (tw[P]; W[P][2 NK] (cos, -sin); V[2 NK][P] (c_k cos, -c_k sin) / P^3), angles from k x mod P */
+static void four_tab_host(int P, int K, float *tw, float *W, float *V) {
+    const int NK = K + 1; const double s3 = 1.0 / ((double)P * P * P);
+    for (int m = 0; m < P; m++) { tw[2 * m] = (float)cos(2 * M_PI * m / P); tw[2 * m + 1] = (float)sin(2 * M_PI * m / P); }
+    for (int x = 0; x < P; x++) for (int k = 0; k < NK; k++) {
+        const int m = (int)(((long long)k * x) % P); const double cs = cos(2 * M_PI * m / P), sn = sin(2 * M_PI * m / P), c = (k ? 2.0 : 1.0) * s3;
         W[(size_t)x * 2 * NK + 2 * k] = (float)cs; W[(size_t)x * 2 * NK + 2 * k + 1] = (float)-sn;
-        const double c = (k ? 2.0 : 1.0) * s3;
         V[(size_t)(2 * k) * P + x] = (float)(c * cs); V[(size_t)(2 * k + 1) * P + x] = (float)(-c * sn);
     }
 }
@@ -663,7 +662,10 @@ static void four_get(aug_dev *a, int P, int K) {
     if (a->fX) { CK(cudaDeviceSynchronize()); cudaFree(a->fX); cudaFree(a->fD); cudaFree(a->fR); cudaFree(a->ftw); cudaFree(a->fW); cudaFree(a->fV); }
     CK(cudaMalloc(&a->fX, NY * NY * NK * 16)); CK(cudaMalloc(&a->fD, NY * NY * NK * 8)); CK(cudaMalloc(&a->fR, nzc * NY * NK * 8));
     CK(cudaMalloc(&a->ftw, (size_t)P * 8)); CK(cudaMalloc(&a->fW, (size_t)P * NK * 2 * 4)); CK(cudaMalloc(&a->fV, (size_t)P * NK * 2 * 4));
-    four_tab_k<<<nblk((size_t)P * NK, 256), 256>>>(P, K, a->ftw, a->fW, a->fV); KCHECK(); CK(cudaDeviceSynchronize());
+    float *h = (float *)malloc(((size_t)2 * P + (size_t)4 * P * NK) * sizeof(float)); if (!h) abort();
+    four_tab_host(P, K, h, h + 2 * P, h + 2 * P + 2 * (size_t)P * NK);
+    CK(cudaMemcpy(a->ftw, h, (size_t)P * 8, cudaMemcpyHostToDevice)); CK(cudaMemcpy(a->fW, h + 2 * P, (size_t)P * NK * 8, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(a->fV, h + 2 * P + 2 * (size_t)P * NK, (size_t)P * NK * 8, cudaMemcpyHostToDevice)); free(h);
     a->fP = P; a->fK = K; a->fR_n = nzc * NY * NK;
 }
 extern "C" void nn_aug_fourier_reserve(int P, int K) { g_four_resv = K > 0 ? four_bytes(P, K, (size_t)P) : 0; }
