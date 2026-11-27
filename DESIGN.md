@@ -38,7 +38,11 @@ Per-z distance from the reference, mm (median / p90 / max; CPU, 6 threads, 1-3 m
   (Paris3) from it against 4.1 / 11.2 mm for the centroid axes in use. The hand axes are weak between their few clicks (1203: 6
   points), so the all-z rows mostly measure the references.
 - The fit fields gave no gain over the CT on 1203 (0.97 vs 0.91 mm clear core), so CT-only is enough; no GPU needed.
-- Proposal: `ufsm umbilicus` (CT, --uncrush 1.5) replaces `ufsm axis` as the auto axis for scrolls without a hand / upstream one.
+- Adopted (lead 11-27) as the auto axis for scrolls without a hand / trusted json: scripts/unroll/auto_axis.sh (unroll.sh prep and
+  corpus desk.sh "auto"): `ufsm umbilicus --level auto` (the finest existing level of >= 18 um: 2.4 um scans L3, 9.362 um L2).
+  An existing axis.json is kept byte for byte (AXIS_REDO=1 rebuilds); AXIS_METHOD=centroid is the old `ufsm axis`; the json's
+  "method" key and the log name the method. Check on 1667: auto picks L3, 1.02 / 2.30 / 3.29 mm vs the centroid's 0.85 / 2.21 /
+  4.80: on round, centred 1667 the centroid stays slightly better on median, the vote on max.
   Outputs: /vesuvius/ufsm/axisfind/out/*.json (PHerc1203 stays local).
 
 ## mcc pin 01873d0 -> edfc7a3: no implicit function declarations or implicit int (2026-11-27, mccdecl)

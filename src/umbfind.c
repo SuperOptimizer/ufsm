@@ -407,7 +407,7 @@ static void usage_umb(void) {
         "  the umbilicus by sheet-normal voting (villa vc_gen_umbilicus port): per xy slice the point the in-plane sheet normals point away\n"
         "  from, then a robust LOWESS along z. Output: umbilicus json (control_points z, y, x in level-0 voxels of a UM um scan).\n"
         "  --um0 UM          level-0 voxel size of the scan the axis refers to (um; required: sets the mm parameters and the fields' scale)\n"
-        "  --ct-root/--ct-key/--level   CT input: the 2-D structure tensor of each slice at level L (--sigma 1 --tsigma 3 px, --stride 4,\n"
+        "  --ct-root/--ct-key/--level   CT input: the 2-D structure tensor of each slice at level L (auto: finest existing >= 18 um) (--sigma 1 --tsigma 3 px, --stride 4,\n"
         "                    --thr 0: CT > thr is material, --min-coh 0.2)\n"
         "  --fields DIR      fit-field input (zarr planes t1 t2 t5 w; fields.json um / origin / h): the in-plane n n^T pooled --pool 4 cells\n"
         "  --dz-mm 1         slice spacing; --rows 4: input rows averaged per slice; --z0 / --z1 level-0 range\n"
@@ -447,10 +447,23 @@ int cmd_umbilicus(int argc, char **argv) {
     double zoff0 = 0; long long fzoff[3] = {0, 0, 0};
     char src_desc[1400];
     if (ctroot) {
-        const int L = opt_atoi("--level", opt(argc, argv, "--level", "-1"));
-        if (L < 0 || L > 9) { fprintf(stderr, "umbilicus: --level L required with --ct-root\n"); return 2; }
-        char k[1200]; snprintf(k, sizeof k, "%s/%d", ctkey, L);
-        if (!(st = store_open(ctroot)) || !(za[0] = z3_open(st, k, opt(argc, argv, "--cache", nullptr)))) { fprintf(stderr, "umbilicus: cannot open %s %s: %s\n", ctroot, k, z3_error()); return 1; }
+        const char *lv = opt(argc, argv, "--level", nullptr);
+        int L = lv && strcmp(lv, "auto") ? opt_atoi("--level", lv) : -1;
+        if (!lv || (strcmp(lv, "auto") && (L < 0 || L > 9))) { fprintf(stderr, "umbilicus: --level L (or auto) required with --ct-root\n"); return 2; }
+        char k[1200];
+        if (!(st = store_open(ctroot))) { fprintf(stderr, "umbilicus: cannot open %s\n", ctroot); return 1; }
+        if (L < 0) {   /* auto: the finest existing level of >= 18 um voxels (the 11-27 runs: 2.4 um L3, 9.362 um L2 as L1 is absent) */
+            for (int l = 0; l <= 9 && !za[0]; l++) {
+                if (um0 * (1 << l) < 18) continue;
+                snprintf(k, sizeof k, "%s/%d", ctkey, l);
+                if ((za[0] = z3_open(st, k, opt(argc, argv, "--cache", nullptr)))) L = l;
+            }
+            if (!za[0]) { fprintf(stderr, "umbilicus: --level auto: no level of >= 18 um voxels under %s %s\n", ctroot, ctkey); return 1; }
+            fprintf(stderr, "umbilicus: --level auto -> level %d (%.2f um voxels)\n", L, um0 * (1 << L));
+        } else {
+            snprintf(k, sizeof k, "%s/%d", ctkey, L);
+            if (!(za[0] = z3_open(st, k, opt(argc, argv, "--cache", nullptr)))) { fprintf(stderr, "umbilicus: cannot open %s %s: %s\n", ctroot, k, z3_error()); return 1; }
+        }
         const z3_meta *m = z3_meta_of(za[0]);
         Z = m->shape[0]; H = m->shape[1]; W = m->shape[2]; chunk = m->chunk[0] > 0 ? m->chunk[0] : 128;
         J.src = 0; J.s = 1 << L; zscale = J.s; zoff0 = -0.5;

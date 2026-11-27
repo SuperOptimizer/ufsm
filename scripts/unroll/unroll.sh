@@ -291,7 +291,7 @@ prep() {
         for (d = 1; d <= 3; d++) { lo = (a[d] - 1) * c; if (lo < 0) lo = 0; lo = int(lo / 512) * 512; hi = (b[d] + 2) * c; if (hi > s[d]) hi = s[d]; o[d] = lo; e[d] = hi - lo }
         printf "%d,%d,%d,%d,%d,%d\n", o[1], o[2], o[3], e[1], e[2], e[3] }' > $O/box.txt || { log "prep: mask $m has no set voxel: refusing"; rm -f $O/box.txt; return 1; }
   fi
-  if [ "$AXS" = auto ]; then X $O/logs/prep.log $U axis $R $K $O/axis.json || return 1
+  if [ "$AXS" = auto ]; then X $O/logs/prep.log bash $H/auto_axis.sh $U $R $K $UM $O/axis.json || return 1   # (umbilicus vote; AXIS_METHOD=centroid: ufsm axis)
   else [ "$DRY" = 1 ] && echo "    axis $AXS" || cp $AXS $O/axis.json; fi
   [ "$DRY" = 1 ] || [ -s $O/box.txt ]
 }
