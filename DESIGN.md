@@ -113,6 +113,13 @@ scanned source bytes, record and z-score aside (nn_aug_keep, 1 B/vox), and every
 rv / ink / fibre heads, 8-plane slabs, --det): 7 steps + 21 validation lines equal to the run without it; UFSM_LAT_XSLAB=check: 0 of 140 M
 rewritten slab bytes differ from the uploaded channel. Plan: -1.07 GB at P 1024, -0.70 at 896, -0.45 at 768.
 
+Open --det leak (not chased; for a later agent): two runs WITHOUT UFSM_LAT_XSLAB, same command (test_lat_xslab's C array: --det 1, lat 4,
+lat-guide 3, fstem 16, rv / ink / fib heads, muon, gpu-aug 3, lean 2 via UFSM_MEM_FREE_GB=0.05, UFSM_HEAD_SLAB_Z=8), UFSM_DET_TRACE=1: the
+step-1 start hashes (x, labels, params) agree; at step 2's start x and labels agree and the params hash differs (8afeb7f4.. vs abcd2cfb..),
+so step 1's update is not deterministic. The logged losses (4 decimals) stayed equal for 7 steps. Which tensor: not localised (the
+trace hashes the whole parameter vector; a per-tensor hash at step 2 is the next step). topoloss saw a last-digit loss wobble on the
+plain head under --det (gpuslot 7695db25). Logs: /vesuvius/ufsm/vramperf/xdet/off.log, off2.log.
+
 2-GPU split (--split z with --lat 4, g_lsplit): scratch2 ran P 1024 at 11.59 GB/card with hs_z 8 and onfly 768; halo +3-6 % compute,
 GPUs ~92 % busy, staged peer copies 14-17 GB/s.
 
