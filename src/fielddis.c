@@ -317,7 +317,7 @@ int cmd_field_disagree(int argc, char **argv) {
     const double lum = opt_atof("--lab-um", fd_opt(argc, argv, "--lab-um", "0")), nearf = opt_atof("--near", fd_opt(argc, argv, "--near", "0.1"));
     if (lroot && !(lum > 0)) { fprintf(stderr, "field-disagree: --labelled needs --lab-um (the raster's voxel size)\n"); return 2; }
     store_global_init();
-    static fit_fields_buf B[FD_NMAX], G; const fit_fields_buf *P[FD_NMAX];
+    fit_fields_buf B[FD_NMAX], G; const fit_fields_buf *P[FD_NMAX]; memset(B, 0, sizeof B); memset(&G, 0, sizeof G);
     for (int i = 0; i < n; i++) {
         if (fit_fields_load(ins[i], 0, 0, 1, &B[i])) { fprintf(stderr, "field-disagree: cannot load %s\n", ins[i]); return 1; }
         P[i] = &B[i];
