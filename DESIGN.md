@@ -6,6 +6,46 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Two-level pair rule for the 2.4 um labels (option 3) and the w24 trainer memory fixes (2026-11-27, branch opt3-20261127, unrollperf)
+
+**Pair rule.** At rmax 160 the level-0 rule needs a 162-voxel halo: a 3072 MB tile (edge 588) keeps only a 264^3 interior.
+- The two-level rule (`band_field_phase_pair2`, `band_pair_gpu_fill2`) splits the work:
+  - level-0 tiles carry a small halo h0;
+  - the level-1 codes cover the same region with a halo of rmax / 2 + 2;
+  - the parity feature transforms run on both tiles;
+  - each voxel takes the nearest sheet of each parity from level 0, or from its level-1 cell's nearest at that cell's centre;
+  - the level-1 candidate is used only when that cell is not wholly inside the level-0 tile and is nearer.
+- Turn it on with sources `"pair_coarse": 1` and `"pair_h0"` (default 12). It has its own dcache key.
+- With h0 12, one 536^3 tile covers one 512^3 dcache cell at 3072 MB.
+
+**Gate.** `ufsm phase-cmp` against the level-0 rmax-160 rule, 12 boxes of 256^3 per source. phase-cmp now also prints the agreement on voxels known in both.
+
+| source | lost h0 32 | lost h0 12 | exact h0 12 | within 2 codes h0 12 |
+|---|---|---|---|---|
+| Paris4 june | 0.06 % | 0.11 % | 0.917 | 1.0000 |
+| Paris4 july | 0.05 % | 0.11 % | 0.931 | 0.9999 |
+| 1667 | 0.08 % | 0.13 % | 0.900 | 0.9987 |
+| 0139 | 0.05 % | 0.13 % | 0.913 | 0.9999 |
+| 0814 | 0.22 % | 0.32 % | 0.879 | 0.9996 |
+
+"Lost" is the share of the rmax-160 known voxels that the two-level rule leaves unknown. Within 6 codes, agreement is ≥ 0.9997 everywhere. Compare rmax 120 on one level, which loses 0.9-17.5 %.
+
+**Rate.** Sampler-only, card 1, P 640, 1 slot of 3072 MB, fresh cells:
+
+| rule | s per 512^3 cell | windows |
+|---|---|---|
+| level 0, rmax 120 (the interim run) | ~2 (8 tiles) | ~33 s each in the run |
+| two-level, h0 32 | 2.5 (8 tiles: 520^3 did not fit one tile) | 5 in 207 s |
+| two-level, h0 12 | 0.57 (1 tile) | 7 in ~90 s |
+
+The tiles run one at a time on the slot. A tile is about 0.43 s of mesh stamps (two of ~0.2 s each) and ~0.1 s of transforms.
+
+**Trainer memory** (P 768 launches: OOM in step 1, then rc 139):
+- The planner keeps the meshes' device stamp buffers free: one stamp context per onfly slot, UFSM_MESHCODES_INTO_MB + 512 MB.
+- lab_early's second label plane is now decided at the second tail. At the first tail the step's activations were not allocated yet, so the plane took the plan's room.
+- A failed staging cudaMalloc in nn_aug is a hard error with a message. Before, the next upload segfaulted on desk HMM.
+- The w4runs host rebuild and the step-boundary label warp now print DEFAULTED.
+
 ## Native 2.4 um winding labels on the fly: the meshes' pair rule on the GPU, its cost by rmax (2026-11-27, branch w24-20261127, unrollperf)
 
 Goal (user): a native 2.4 um winding net (unwrap2, init try9) trained on level-0 CT with level-0 labels built from the GT meshes on the

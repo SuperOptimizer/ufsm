@@ -17,7 +17,7 @@ __attribute__((weak)) int lbc_decode(const void *enc, size_t n, uint8_t *dst);  
 #include <string.h>
 #include <time.h>
 
-typedef struct { float rmax; int halo; } onfly_ctx;
+typedef struct { float rmax; int halo; z3 *c1; int h0, h1; } onfly_ctx;   /* (c1: the two-level pair rule's level-1 codes, phase_onfly_open2; h0 / h1 its halos) */
 static int g_gpu = -1, g_slots = 2, g_budget_mb = 1024;
 static int g_cpu_decode;   /* UFSM_ONFLY_CPU_DECODE=1: the codes decoded on the CPU (A/B) */
 static _Atomic uint64_t g_gputiles, g_reads, g_tiles, g_skipped, g_vout, g_vtile, g_ns_pair, g_ns_read, g_ns_wait;
@@ -210,10 +210,12 @@ static int tile_gpu(z3 *codes, const int64_t co_[3], const int64_t cn_[3], const
 }
 
 static thread_local struct { uint8_t *p; size_t cap; int pinned; } t_gpb;   /* the GPU path's tile interior (per reading thread) */
+static int onfly_read2(const onfly_ctx *C, z3 *codes, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads);
 static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
     const onfly_ctx *C = vctx; const z3_meta *m = z3_meta_of(codes); const int h = C->halo;
     atomic_fetch_add(&g_reads, 1);
     const size_t N = (size_t)n[0] * n[1] * n[2]; memset(out, PHASE_UNKNOWN, N);
+    if (C->c1) { const int r = onfly_read2(C, codes, o, n, out, nthreads); atomic_fetch_add(&g_vout, N); return r; }
     int64_t lo[3], hi[3];   /* the part of the box inside the codes' shape (outside: the stored array's fill) */
     for (int d = 0; d < 3; d++) { lo[d] = o[d] < 0 ? 0 : o[d]; hi[d] = o[d] + n[d] < m->shape[d] ? o[d] + n[d] : m->shape[d]; if (hi[d] <= lo[d]) return 0; }
     const int E = phase_onfly_tile_edge(C->rmax), T = E - 2 * h;
@@ -273,6 +275,94 @@ static int onfly_read(void *vctx, z3 *codes, const int64_t o[3], const int64_t n
     return rc;
 }
 
+/* ---- the two-level pair rule (option 3, w24 2026-11-27; band.h band_field_phase_pair2): tiles of level-0 codes with a small halo h0 and
+   the level-1 codes over the same region with a halo of rmax / 2 + 2. At rmax 160 (2.4 um) a full-halo tile of edge 588 kept a 264^3
+   interior; with h0 32 the same budget keeps ~520^3 plus a ~430^3 level-1 tile ---- */
+static double tile2_bytes(int E0, int h1) { const double E1 = E0 / 2 + 2 * h1 + 2; return tile_bytes(E0) + 9 * E1 * E1 * E1; }
+static int tile2_edge(int h0, int h1) { int E = 2 * h0 + 32; while (tile2_bytes(E + 8, h1) <= (double)g_budget_mb * (1 << 20)) E += 8; return E; }
+static int64_t fdiv2(int64_t a) { return a >= 0 ? a / 2 : -((1 - a) / 2); }   /* floor(a / 2) */
+static _Atomic int g_two_cpu_said;
+static thread_local struct { uint8_t *c0, *c1, *ph, *rb; size_t cap0, cap1, caprb; } t_two;   /* the two-level CPU path's buffers (per reading thread) */
+/* the box (co, cn) of codes into the zeroed host buffer dst (outside the codes' shape: 0) */
+static int two_read(z3 *codes, const int64_t co[3], const int64_t cn[3], uint8_t *dst, int nthreads) {
+    const int64_t *sh = z3_meta_of(codes)->shape; int64_t ro[3], rn[3];
+    for (int d = 0; d < 3; d++) { ro[d] = co[d] < 0 ? 0 : co[d]; rn[d] = (co[d] + cn[d] < sh[d] ? co[d] + cn[d] : sh[d]) - ro[d]; if (rn[d] <= 0) return 0; }
+    const size_t rnn = (size_t)rn[0] * rn[1] * rn[2];
+    if (rnn > t_two.caprb) { free(t_two.rb); t_two.caprb = 0; if (!(t_two.rb = malloc(rnn))) return -1; t_two.caprb = rnn; }
+    if (z3_read(codes, ro, rn, t_two.rb, nthreads)) return -1;
+    for (int64_t z = 0; z < rn[0]; z++) for (int64_t y = 0; y < rn[1]; y++)
+        memcpy(dst + ((size_t)(z + ro[0] - co[0]) * cn[1] + (y + ro[1] - co[1])) * cn[2] + (ro[2] - co[2]), t_two.rb + ((size_t)z * rn[1] + y) * rn[2], (size_t)rn[2]);
+    return 0;
+}
+static int onfly_read2(const onfly_ctx *C, z3 *codes, const int64_t o[3], const int64_t n[3], uint8_t *out, int nthreads) {
+    const z3_meta *m = z3_meta_of(codes), *m1 = z3_meta_of(C->c1); const int h = C->h0, h1 = C->h1;
+    int64_t lo[3], hi[3];
+    for (int d = 0; d < 3; d++) { lo[d] = o[d] < 0 ? 0 : o[d]; hi[d] = o[d] + n[d] < m->shape[d] ? o[d] + n[d] : m->shape[d]; if (hi[d] <= lo[d]) return 0; }
+    const int E = tile2_edge(h, h1), T = E - 2 * h;
+    int cnt[3], ts[3];
+    for (int d = 0; d < 3; d++) { const int64_t L = hi[d] - lo[d]; cnt[d] = (int)((L + T - 1) / T); ts[d] = (int)((L + cnt[d] - 1) / cnt[d]); }
+    int rc = 0;
+    for (int a = 0; a < cnt[0] && !rc; a++) for (int b = 0; b < cnt[1] && !rc; b++) for (int c = 0; c < cnt[2] && !rc; c++) {
+        const int ti[3] = {a, b, c}; int64_t to[3], tn[3], co[3], cn[3], ro[3], rn[3], c1o[3], c1n[3], r1o[3], r1n[3]; int n0[3], n1[3], off[3];
+        for (int d = 0; d < 3; d++) {
+            to[d] = lo[d] + (int64_t)ti[d] * ts[d]; tn[d] = (to[d] + ts[d] < hi[d] ? to[d] + ts[d] : hi[d]) - to[d];
+            co[d] = to[d] - h; cn[d] = tn[d] + 2 * h; n0[d] = (int)cn[d];
+            ro[d] = co[d] < 0 ? 0 : co[d]; rn[d] = (co[d] + cn[d] < m->shape[d] ? co[d] + cn[d] : m->shape[d]) - ro[d];
+            c1o[d] = fdiv2(co[d]) - h1; c1n[d] = fdiv2(co[d] + cn[d] + 1) + h1 - c1o[d]; n1[d] = (int)c1n[d]; off[d] = (int)(co[d] - 2 * c1o[d]);
+            r1o[d] = c1o[d] < 0 ? 0 : c1o[d]; r1n[d] = (c1o[d] + c1n[d] < m1->shape[d] ? c1o[d] + c1n[d] : m1->shape[d]) - r1o[d];
+        }
+        if (r1n[0] <= 0 || r1n[1] <= 0 || r1n[2] <= 0) { atomic_fetch_add(&g_skipped, 1); continue; }
+        const int any = z3_box_any(C->c1, r1o, r1n);
+        if (any < 0) { rc = -1; break; }
+        if (!any) { atomic_fetch_add(&g_skipped, 1); continue; }
+        const double t0 = now_s(); const size_t tnn = (size_t)tn[0] * tn[1] * tn[2];
+        int g = -2;
+        if (g_gpu >= 0 && band_pair_gpu_fill2 && mesh_codes_stamp_dev && !g_cpu_decode) {
+            if (tnn > t_gpb.cap) {
+                if (t_gpb.p) { if (t_gpb.pinned) band_pair_gpu_host_free(t_gpb.p); else free(t_gpb.p); }
+                t_gpb.pinned = band_pair_gpu_host_alloc && band_pair_gpu_host_free; t_gpb.p = t_gpb.pinned ? band_pair_gpu_host_alloc(tnn) : nullptr;
+                if (!t_gpb.p) { t_gpb.pinned = 0; t_gpb.p = malloc(tnn); }
+                t_gpb.cap = t_gpb.p ? tnn : 0; if (!t_gpb.p) { rc = -1; break; }
+            }
+            const dfill_ctx F0 = {codes, ro, rn, {(int)(ro[0] - co[0]), (int)(ro[1] - co[1]), (int)(ro[2] - co[2])}};
+            const dfill_ctx F1 = {C->c1, r1o, r1n, {(int)(r1o[0] - c1o[0]), (int)(r1o[1] - c1o[1]), (int)(r1o[2] - c1o[2])}};
+            const int cro[3] = {h, h, h}, crn[3] = {(int)tn[0], (int)tn[1], (int)tn[2]};
+            g = rn[0] > 0 && rn[1] > 0 && rn[2] > 0 ? band_pair_gpu_fill2(dfill, (void *)&F0, n0, dfill, (void *)&F1, n1, off, C->rmax, cro, crn, t_gpb.p) : -2;
+            if (g == 2) { atomic_fetch_add(&g_skipped, 1); continue; }
+            if (!g) {
+                atomic_fetch_add(&g_ns_pair, (uint64_t)(1e9 * (now_s() - t0))); atomic_fetch_add(&g_tiles, 1); atomic_fetch_add(&g_gputiles, 1);
+                atomic_fetch_add(&g_vtile, (uint64_t)cn[0] * cn[1] * cn[2] + (uint64_t)c1n[0] * c1n[1] * c1n[2]);
+                for (int64_t z = 0; z < tn[0]; z++) for (int64_t y = 0; y < tn[1]; y++)
+                    memcpy(out + ((size_t)(to[0] - o[0] + z) * n[1] + (to[1] - o[1] + y)) * n[2] + (to[2] - o[2]), t_gpb.p + ((size_t)z * tn[1] + y) * tn[2], (size_t)tn[2]);
+                continue;
+            }
+        }
+        /* the host path: both tiles read (z3_read), band_field_phase_pair2 */
+        if (g_gpu >= 0 && !atomic_exchange(&g_two_cpu_said, 1))
+            fprintf(stderr, "DEFAULTED: phase onfly (two-level pair rule): a tile on the CPU (GPU fill2 returned %d; reported once)\n", g);
+        const size_t N0 = (size_t)n0[0] * n0[1] * n0[2], N1 = (size_t)n1[0] * n1[1] * n1[2];
+        if (N0 > t_two.cap0) { free(t_two.c0); free(t_two.ph); t_two.cap0 = 0; t_two.c0 = malloc(N0); t_two.ph = malloc(N0); if (!t_two.c0 || !t_two.ph) { rc = -1; break; } t_two.cap0 = N0; }
+        if (N1 > t_two.cap1) { free(t_two.c1); t_two.cap1 = 0; if (!(t_two.c1 = malloc(N1))) { rc = -1; break; } t_two.cap1 = N1; }
+        memset(t_two.c0, 0, N0); memset(t_two.c1, 0, N1);
+        if (two_read(codes, co, cn, t_two.c0, nthreads) || two_read(C->c1, c1o, c1n, t_two.c1, nthreads)) { rc = -1; break; }
+        const double t1 = now_s();
+        if (band_field_phase_pair2(t_two.c0, n0, t_two.c1, n1, off, C->rmax, t_two.ph)) { rc = -1; break; }
+        atomic_fetch_add(&g_ns_read, (uint64_t)(1e9 * (t1 - t0))); atomic_fetch_add(&g_ns_pair, (uint64_t)(1e9 * (now_s() - t1)));
+        atomic_fetch_add(&g_tiles, 1); atomic_fetch_add(&g_vtile, (uint64_t)N0 + N1);
+        for (int64_t z = 0; z < tn[0]; z++) for (int64_t y = 0; y < tn[1]; y++)
+            memcpy(out + ((size_t)(to[0] - o[0] + z) * n[1] + (to[1] - o[1] + y)) * n[2] + (to[2] - o[2]), t_two.ph + ((size_t)(z + h) * cn[1] + (y + h)) * cn[2] + h, (size_t)tn[2]);
+    }
+    return rc;
+}
+static void onfly_ctx_free(void *p) { onfly_ctx *C = p; if (C->c1) z3_close(C->c1); free(C); }
+z3 *phase_onfly_open2(z3 *codes, z3 *codes1, float rmax, int h0) {
+    if (!codes || !codes1 || !(rmax > 0) || h0 < 1) { z3_close(codes1); return nullptr; }
+    onfly_ctx *C = calloc(1, sizeof *C); if (!C) { z3_close(codes1); return nullptr; }
+    C->rmax = rmax; C->halo = h0; C->c1 = codes1; C->h0 = h0; C->h1 = (int)ceilf(rmax / 2) + 2;
+    z3 *z = z3_open_derived(codes, PHASE_UNKNOWN, onfly_read, C, onfly_ctx_free);
+    if (!z) onfly_ctx_free(C);
+    return z;
+}
 z3 *phase_onfly_open(z3 *codes, float rmax) {
     if (!codes || !(rmax > 0)) return nullptr;
     onfly_ctx *C = malloc(sizeof *C); if (!C) return nullptr;

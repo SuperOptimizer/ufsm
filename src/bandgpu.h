@@ -22,6 +22,11 @@ typedef struct bg_lchunk { int32_t o[3]; uint32_t mode, value, tab_off, raw_off,
    returned as is), the crop down into out. 0 ok, -1 a CUDA failure (the caller's host path) */
 __attribute__((weak)) int band_pair_gpu_fill(int (*fill)(void *ctx, uint8_t *dcodes, int dev, const int n[3]), void *ctx, const int n[3], float rmax,
                                              const int crop_o[3], const int crop_n[3], uint8_t *out);
+/* the two-level pair rule (band.h band_field_phase_pair2) on a level-0 tile (fill0, n0) and a level-1 tile (fill1, n1, the level-0 voxel z
+   in the level-1 cell (z + off) / 2); 2: nothing labelled in the level-1 tile; -2 / -1: the caller's host path */
+__attribute__((weak)) int band_pair_gpu_fill2(int (*fill0)(void *ctx, uint8_t *dcodes, int dev, const int n[3]), void *ctx0, const int n0[3],
+                                              int (*fill1)(void *ctx, uint8_t *dcodes, int dev, const int n[3]), void *ctx1, const int n1[3], const int off[3],
+                                              float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out);
 __attribute__((weak)) int band_pair_gpu_codes(const bg_lchunk *ch, int nch, const uint8_t *blob, size_t blob_n, const int n[3], const int lo[3], const int hi[3],
                                               float rmax, const int crop_o[3], const int crop_n[3], uint8_t *out);
 /* the same with the box's codes pooled `pool` (0..3) times on the device first (codes_pool.h cp_pool8, == codes_pool2_box): the chunks,

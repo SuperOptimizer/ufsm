@@ -21,5 +21,6 @@ void mesh_codes_gpu_config(int dev);   /* the stamp on GPU dev (< 0: the CPU) fo
    array dst on device ddev (the pair rule's tile; nothing copied down, w24 2026-11-27). 0 ok; 2 no mesh tile reaches the box (dst untouched);
    -2 not a mesh codes array / the stamp not on that GPU (the caller reads on the host); -1 a failure */
 int mesh_codes_stamp_dev(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *dst, int ddev, const int dn[3], const int dof[3]);
+int mesh_codes_opened(void);   /* mesh codes arrays opened so far (the trainer's planner keeps the device stamp's buffers free when > 0) */
 void mesh_codes_stats(uint64_t *gpu_reads, uint64_t *cpu_reads, uint64_t *gpu_fail, double *gpu_s, double *cpu_s);
 int cmd_codes_onfly(int argc, char **argv);   /* ufsm codes-onfly: the derived codes over windows, ms and byte diffs vs a stored raster */

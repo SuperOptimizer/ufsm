@@ -188,6 +188,59 @@ static void make_codes(uint8_t *c, const int n[3], unsigned seed, int empty) {
         c[((size_t)z * n[1] + y) * n[2] + x] = (rand() % 997 == 0) ? 255 : (uint8_t)(1 + (BAND_STEPS * k) % BAND_PERIOD);
     }
 }
+/* the two-level pair rule (band_field_phase_pair2, nn_band.cu band_pair_gpu_fill2; option 3 w24 2026-11-27): a 96^3 spiral, the level-1
+   codes a labelled child per 2^3 cell; the 32^3 interior at (32, 32, 32) from a level-0 tile with halo h0 and a level-1 tile with halo
+   rmax / 2 + 2. h0 >= rmax + 3: the level-0 rule exactly (no far sheet the tile misses); h0 4: within 2 codes on >= 99 % of the voxels
+   both know, coverage within 1 %; the GPU == the CPU (fast-math tolerance) */
+typedef struct { const uint8_t *h; size_t n; } t2_fill;
+static int t2_fillf(void *vp, uint8_t *d, int dev, const int n[3]) { (void)dev; (void)n; const t2_fill *F = vp; return cudaMemcpy(d, F->h, F->n, cudaMemcpyHostToDevice) == cudaSuccess ? 0 : -1; }
+static void t2_box(const uint8_t *src, const int sn[3], const int o[3], const int n[3], uint8_t *dst) {
+    for (int z = 0; z < n[0]; z++) for (int y = 0; y < n[1]; y++) for (int x = 0; x < n[2]; x++) {
+        const int gz = o[0] + z, gy = o[1] + y, gx = o[2] + x;
+        dst[((size_t)z * n[1] + y) * n[2] + x] = gz < 0 || gy < 0 || gx < 0 || gz >= sn[0] || gy >= sn[1] || gx >= sn[2] ? 0 : src[((size_t)gz * sn[1] + gy) * sn[2] + gx];
+    }
+}
+static int test_pair2(int gpu, int ndev, int *gpu_ran) {
+    const int G = 96, gn[3] = {G, G, G}, g1[3] = {G / 2, G / 2, G / 2}, I = 32, io = 32; const float rmax = 14.f; const int h1 = (int)ceilf(rmax / 2) + 2;
+    const size_t NG = (size_t)G * G * G, N1 = NG / 8;
+    uint8_t *c0 = malloc(NG), *c1 = calloc(N1, 1), *ref = malloc(NG); int fails = 0;
+    make_codes(c0, gn, 5u, 0);
+    for (int z = 0; z < G; z++) for (int y = 0; y < G; y++) for (int x = 0; x < G; x++) {
+        const uint8_t v = c0[((size_t)z * G + y) * G + x]; uint8_t *p = c1 + ((size_t)(z / 2) * g1[1] + y / 2) * g1[2] + x / 2;
+        if (v > 0 && v < 255 && !*p) *p = v;
+    }
+    if (band_field_phase_pair(c0, gn, rmax, ref, nullptr)) return 1;
+    uint8_t *ri = malloc((size_t)I * I * I); const int iO[3] = {io, io, io}, iN[3] = {I, I, I}; t2_box(ref, gn, iO, iN, ri);
+    const int hs[2] = {(int)rmax + 3, 4};
+    for (int k = 0; k < 2; k++) {
+        const int h0 = hs[k], co[3] = {io - h0, io - h0, io - h0}, n0[3] = {I + 2 * h0, I + 2 * h0, I + 2 * h0};
+        int o1[3], n1[3], off[3];
+        for (int d = 0; d < 3; d++) { o1[d] = co[d] / 2 - h1; n1[d] = (co[d] + n0[d] + 1) / 2 + h1 - o1[d]; off[d] = co[d] - 2 * o1[d]; }
+        const size_t M0 = (size_t)n0[0] * n0[1] * n0[2], M1 = (size_t)n1[0] * n1[1] * n1[2];
+        uint8_t *t0 = malloc(M0), *t1 = malloc(M1), *ph = malloc(M0), *pi = malloc((size_t)I * I * I), *gi = malloc((size_t)I * I * I);
+        t2_box(c0, gn, co, n0, t0); t2_box(c1, g1, o1, n1, t1);
+        if (band_field_phase_pair2(t0, n0, t1, n1, off, rmax, ph)) return 1;
+        const int hO[3] = {h0, h0, h0}; t2_box(ph, n0, hO, iN, pi);
+        size_t kr = 0, kb = 0, lost = 0, both = 0, w2 = 0;
+        for (size_t i = 0; i < (size_t)I * I * I; i++) {
+            const int a = ri[i] != PHASE_UNKNOWN, b = pi[i] != PHASE_UNKNOWN; kr += a; kb += b; lost += a && !b;
+            if (a && b) { int d = abs((int)ri[i] - (int)pi[i]); if (d > PHASE_PERIOD / 2) d = PHASE_PERIOD - d; both++; w2 += d <= 2; }
+        }
+        printf("pair2 h0 %d: level-0 rule known %zu, two-level %zu, lost %zu, within 2 codes %zu of %zu", h0, kr, kb, lost, w2, both);
+        if (k == 0) fails += fm_cmp_u8c("two-level (h0 >= rmax + 3) vs the level-0 rule", ri, pi, (size_t)I * I * I, 1, PHASE_PERIOD, 1e-3, 1e-4);
+        else if (!kr || lost > kr / 100 || w2 < both * 99 / 100) { printf(" FAIL"); fails++; }
+        if (gpu && band_pair_gpu_fill2) {
+            const t2_fill F0 = {t0, M0}, F1 = {t1, M1};
+            const int r = band_pair_gpu_fill2(t2_fillf, (void *)&F0, n0, t2_fillf, (void *)&F1, n1, off, rmax, hO, iN, gi);
+            if (r) { printf(", GPU fill2 rc %d%s", r, ndev ? ": FAIL" : " (no device)"); fails += ndev > 0; }
+            else { printf(", GPU"); fails += fm_cmp_u8c("two-level GPU vs CPU", pi, gi, (size_t)I * I * I, 1, PHASE_PERIOD, 1e-3, 1e-4); *gpu_ran = 1; }
+        }
+        printf("\n");
+        free(t0); free(t1); free(ph); free(pi); free(gi);
+    }
+    free(c0); free(c1); free(ref); free(ri);
+    return fails;
+}
 int main(void) {
     const int dims[][3] = {{40, 64, 72}, {57, 50, 61}, {33, 33, 33}, {24, 90, 40}, {16, 16, 16}};
     const int ncase = sizeof dims / sizeof dims[0];
@@ -218,6 +271,7 @@ int main(void) {
         if (c < ncase - 1 && (known == 0 || ks == 0)) { printf("FAIL: a case without known output\n"); fails++; }
         free(codes); free(a); free(b); free(g);
     }
+    fails += test_pair2(gpu, ndev, &gpu_ran);
     if (gpu) band_pair_gpu_free();
     printf("%s (GPU %s)\n", fails ? "FAIL" : "PASS", gpu_ran ? "checked" : ndev ? "not checked" : "not checked: no device");
     return fails != 0;

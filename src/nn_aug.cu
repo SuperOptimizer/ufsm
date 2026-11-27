@@ -530,7 +530,12 @@ extern "C" void nn_aug_set_slot(int slot) { g_aug_tslot = slot & 1; }
 static aug_dev *aug_get(int P, size_t sb, int slot = 0) {   /* sb: the staging buffer's bytes (P^3 the CT, 2 P^3 with the labels; z ranges: 2 (s1 - s0) P^2) */
     int dv = 0; cudaGetDevice(&dv); aug_dev *a = &g_ad[(dv & 7) * 2 + (slot & 1)];
     const size_t p2 = (size_t)P * P;
-    if (a->stage_n < sb) { a->key = nullptr; if (a->stage) { CK(cudaDeviceSynchronize()); cudaFree(a->stage); } CK(cudaMalloc(&a->stage, sb)); a->stage_n = sb; }
+    if (a->stage_n < sb) { a->key = nullptr; if (a->stage) { CK(cudaDeviceSynchronize()); cudaFree(a->stage); } a->stage = nullptr; a->stage_n = 0;
+        /* (a failed staging malloc used to leave stage null with stage_n set: the next upload into it segfaulted in the driver on the desk's
+           HMM driver, w24 2026-11-27 at P 768 beside 6 GB of onfly slots. Out of device memory here is fatal and says so) */
+        if (cudaMalloc(&a->stage, sb) != cudaSuccess) { size_t f = 0, tot = 0; cudaGetLastError(); cudaMemGetInfo(&f, &tot);
+            fprintf(stderr, "nn_aug: no device memory for the %.0f MB augmentation staging buffer (%.0f MB free): a smaller --P or --onfly-mb\n", sb / 1048576.0, f / 1048576.0); abort(); }
+        a->stage_n = sb; }
     if (a->pl_n < p2) { for (int i = 0; i < 4; i++) { if (a->pl[i]) cudaFree(a->pl[i]); CK(cudaMalloc(&a->pl[i], p2 * sizeof(float))); } a->pl_n = p2; }
     { const size_t zc = AUG_CN_BYTES / (p2 * sizeof(float)) < 1 ? 1 : AUG_CN_BYTES / (p2 * sizeof(float)), want = (zc < (size_t)P ? zc : (size_t)P) * p2;
       if (a->cn_n < want) { if (a->cn) { CK(cudaDeviceSynchronize()); cudaFree(a->cn); } CK(cudaMalloc(&a->cn, want * sizeof(float))); a->cn_n = want; } }
@@ -1028,7 +1033,7 @@ extern "C" void nn_w4runs_label_z(const uint8_t *side_h, const void *runs, const
         /* no device memory for the rebuild's scratch beside the trainer (2026-11-12: it aborted unissl three times at P 1024 on a
            16 GB card): this window's planes rebuilt on the host from the same phase (w4runs_apply_host: the same bytes), then uploaded */
         static int nfb; const int k = __sync_add_and_fetch(&nfb, 1);
-        if (k <= 3 || !(k & (k - 1))) fprintf(stderr, "nn_w4runs_label: no device memory for the runs rebuild: the window rebuilt on the host (%d so far)\n", k);
+        if (k <= 3 || !(k & (k - 1))) fprintf(stderr, "DEFAULTED: nn_w4runs_label: no device memory for the runs rebuild: the window rebuilt on the host (%d so far)\n", k);
         const size_t p3 = p2 * P;
         uint8_t *h = (uint8_t *)malloc(2 * p3); if (!h) { fprintf(stderr, "nn_w4runs_label: no host memory for the fallback\n"); abort(); }
         w4runs_apply_host(side_h, P, P, P, r->tile, r->ms, r, h, h + p3);

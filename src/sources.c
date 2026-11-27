@@ -230,9 +230,15 @@ static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int 
 }
 /* the phase of codes cz at rmax rm (owned); behind the derived-array cache when key names the codes (meshes): "cache_dir" (default
    $UFSM_DERIVED_CACHE / ~/.cache/ufsm/derived), "cache_mb" (1024) */
-static z3 *onfly_phase_of(z3 *cz, float rm, const char *key, const json *of) {
-    z3 *z = phase_onfly_open(cz, rm);
+/* c1 (owned; "pair_coarse": 1): the same codes one level coarser, the two-level pair rule (band_onfly.h phase_onfly_open2, level-0 tiles
+   with a halo of "pair_h0" voxels, default 12: a 536^3 tile, one 512^3 dcache cell, fits 3072 MB; w24 2026-11-27: the 2.4 um rung's rmax
+   160 halo made the onfly labels ~30 s a window; vs the level-0 rule within 2 codes on >= 99.87 % of the voxels, DESIGN.md) */
+static z3 *onfly_phase_of(z3 *cz, z3 *c1, float rm, const char *key_, const json *of) {
+    const int h0 = (int)json_num(json_get(of, "pair_h0"), 12);
+    z3 *z = c1 ? phase_onfly_open2(cz, c1, rm, h0) : phase_onfly_open(cz, rm);
     if (!z) { z3_close(cz); return nullptr; }
+    char key[1100];   /* (the two-level rule: its own dcache key) */
+    if (snprintf(key, sizeof key, c1 && key_[0] ? "%s two-level-v1 h0 %d" : "%s", key_, h0) >= (int)sizeof key) return z;   /* (truncated: no cache) */
     if (!key[0] || !z3_open_cached || json_num(json_get(of, "cache"), 1) == 0) return z;   /* ("cache": 0: computed per read, no cache) */
 
     const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);
@@ -263,14 +269,16 @@ static z3 *onfly_phase_open(const source *s, const json *of, int extra, int plev
     const float rm = (float)json_num(json_get(of, "rmax"), 0), div = (float)(1 << extra);
     const json *sj = json_get(of, "sets");   /* "sets": [{"root", "key", "rmax"} | {"meshes", "rmax"}, ...] + "tol" (0.1): the sets' phases fused per
                                                 voxel as phase-fuse (band_onfly.h phase_onfly_fuse_open); "root" / "key" then unused */
-    *rmx = 0; char key[1024];
+    *rmx = 0; char key[1024], k1[1024];
+    const int coarse = (int)json_num(json_get(of, "pair_coarse"), 0) != 0;   /* the two-level pair rule (onfly_phase_of) */
     if (sj && sj->type == J_ARR) {
         z3 *ph[FUSE_MAX]; int np = 0, bad = !sj->n || sj->n > FUSE_MAX;
         for (size_t k = 0; !bad && k < sj->n; k++) {
             const json *e2 = json_at(sj, k);
             const float rm2 = (float)json_num(json_get(e2, "rmax"), rm) / div;
-            z3 *c2 = onfly_codes_open(s, e2, of, extra, plev, key, sizeof key);
-            z3 *p2 = c2 && rm2 > 0 ? onfly_phase_of(c2, rm2, key, of) : nullptr;
+            z3 *c2 = onfly_codes_open(s, e2, of, extra, plev, key, sizeof key), *c21 = c2 && rm2 > 0 && coarse ? onfly_codes_open(s, e2, of, extra + 1, plev, k1, sizeof k1) : nullptr;
+            if (c2 && coarse && !c21) { z3_close(c2); c2 = nullptr; }
+            z3 *p2 = c2 && rm2 > 0 ? onfly_phase_of(c2, c21, rm2, key, of) : nullptr;
             if (!p2) { if (c2 && !(rm2 > 0)) z3_close(c2);   /* (onfly_phase_of closes its codes on failure) */ fprintf(stderr, "sources: %s: phase onfly set %zu: no codes or no \"rmax\" > 0\n", name, k); bad = 1; break; }
             ph[np++] = p2; if (rm2 * div > *rmx) *rmx = rm2 * div;
         }
@@ -279,8 +287,9 @@ static z3 *onfly_phase_open(const source *s, const json *of, int extra, int plev
         if (!z) fprintf(stderr, "sources: %s: phase onfly \"sets\": 1..%d sets of {root, key, rmax} / {meshes, rmax}, one shape\n", name, FUSE_MAX);
         return z;
     }
-    z3 *cz = onfly_codes_open(s, of, of, extra, plev, key, sizeof key);
-    z3 *z = cz && rm > 0 ? onfly_phase_of(cz, rm / div, key, of) : nullptr;
+    z3 *cz = onfly_codes_open(s, of, of, extra, plev, key, sizeof key), *c1 = cz && rm > 0 && coarse ? onfly_codes_open(s, of, of, extra + 1, plev, k1, sizeof k1) : nullptr;
+    if (cz && coarse && rm > 0 && !c1) { z3_close(cz); cz = nullptr; }
+    z3 *z = cz && rm > 0 ? onfly_phase_of(cz, c1, rm / div, key, of) : nullptr;
     if (!z) { if (cz && !(rm > 0)) z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: no codes or no \"rmax\" > 0\n", name); }
     *rmx = rm;
     return z;
