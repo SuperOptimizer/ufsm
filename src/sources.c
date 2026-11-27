@@ -235,10 +235,11 @@ static z3 *onfly_codes_open(const source *s, const json *e, const json *of, int 
    160 halo made the onfly labels ~30 s a window; vs the level-0 rule within 2 codes on >= 99.87 % of the voxels, DESIGN.md) */
 static z3 *onfly_phase_of(z3 *cz, z3 *c1, float rm, const char *key_, const json *of) {
     const int h0 = (int)json_num(json_get(of, "pair_h0"), 12);
-    z3 *z = c1 ? phase_onfly_open2(cz, c1, rm, h0) : phase_onfly_open(cz, rm);
+    const int ls = (int)json_num(json_get(of, "pair_coarse"), 1);   /* ("pair_coarse": L, the codes L levels coarser: 1 (2.4 um, w24) or 2 (1.1 um, w11) */
+    z3 *z = c1 ? phase_onfly_open2(cz, c1, rm, h0, ls) : phase_onfly_open(cz, rm);
     if (!z) { z3_close(cz); return nullptr; }
     char key[1100];   /* (the two-level rule: its own dcache key) */
-    if (snprintf(key, sizeof key, c1 && key_[0] ? "%s two-level-v1 h0 %d" : "%s", key_, h0) >= (int)sizeof key) return z;   /* (truncated: no cache) */
+    if (snprintf(key, sizeof key, c1 && key_[0] ? (ls == 1 ? "%s two-level-v1 h0 %d" : "%s two-level-v1 h0 %d coarse %d") : "%s", key_, h0, ls) >= (int)sizeof key) return z;   /* (truncated: no cache) */
     if (!key[0] || !z3_open_cached || json_num(json_get(of, "cache"), 1) == 0) return z;   /* ("cache": 0: computed per read, no cache) */
 
     const char *dcd = json_str(json_get(of, "cache_dir"), dcache_default_dir ? dcache_default_dir() : nullptr);
@@ -270,13 +271,14 @@ static z3 *onfly_phase_open(const source *s, const json *of, int extra, int plev
     const json *sj = json_get(of, "sets");   /* "sets": [{"root", "key", "rmax"} | {"meshes", "rmax"}, ...] + "tol" (0.1): the sets' phases fused per
                                                 voxel as phase-fuse (band_onfly.h phase_onfly_fuse_open); "root" / "key" then unused */
     *rmx = 0; char key[1024], k1[1024];
-    const int coarse = (int)json_num(json_get(of, "pair_coarse"), 0) != 0;   /* the two-level pair rule (onfly_phase_of) */
+    const int coarse = (int)json_num(json_get(of, "pair_coarse"), 0);   /* the two-level pair rule (onfly_phase_of): its codes `coarse` levels coarser */
+    if (coarse < 0 || coarse > 3) { fprintf(stderr, "sources: %s: \"pair_coarse\": 0..3\n", name); return nullptr; }
     if (sj && sj->type == J_ARR) {
         z3 *ph[FUSE_MAX]; int np = 0, bad = !sj->n || sj->n > FUSE_MAX;
         for (size_t k = 0; !bad && k < sj->n; k++) {
             const json *e2 = json_at(sj, k);
             const float rm2 = (float)json_num(json_get(e2, "rmax"), rm) / div;
-            z3 *c2 = onfly_codes_open(s, e2, of, extra, plev, key, sizeof key), *c21 = c2 && rm2 > 0 && coarse ? onfly_codes_open(s, e2, of, extra + 1, plev, k1, sizeof k1) : nullptr;
+            z3 *c2 = onfly_codes_open(s, e2, of, extra, plev, key, sizeof key), *c21 = c2 && rm2 > 0 && coarse ? onfly_codes_open(s, e2, of, extra + coarse, plev, k1, sizeof k1) : nullptr;
             if (c2 && coarse && !c21) { z3_close(c2); c2 = nullptr; }
             z3 *p2 = c2 && rm2 > 0 ? onfly_phase_of(c2, c21, rm2, key, of) : nullptr;
             if (!p2) { if (c2 && !(rm2 > 0)) z3_close(c2);   /* (onfly_phase_of closes its codes on failure) */ fprintf(stderr, "sources: %s: phase onfly set %zu: no codes or no \"rmax\" > 0\n", name, k); bad = 1; break; }
@@ -287,7 +289,7 @@ static z3 *onfly_phase_open(const source *s, const json *of, int extra, int plev
         if (!z) fprintf(stderr, "sources: %s: phase onfly \"sets\": 1..%d sets of {root, key, rmax} / {meshes, rmax}, one shape\n", name, FUSE_MAX);
         return z;
     }
-    z3 *cz = onfly_codes_open(s, of, of, extra, plev, key, sizeof key), *c1 = cz && rm > 0 && coarse ? onfly_codes_open(s, of, of, extra + 1, plev, k1, sizeof k1) : nullptr;
+    z3 *cz = onfly_codes_open(s, of, of, extra, plev, key, sizeof key), *c1 = cz && rm > 0 && coarse ? onfly_codes_open(s, of, of, extra + coarse, plev, k1, sizeof k1) : nullptr;
     if (cz && coarse && rm > 0 && !c1) { z3_close(cz); cz = nullptr; }
     z3 *z = cz && rm > 0 ? onfly_phase_of(cz, c1, rm / div, key, of) : nullptr;
     if (!z) { if (cz && !(rm > 0)) z3_close(cz); fprintf(stderr, "sources: %s: phase onfly: no codes or no \"rmax\" > 0\n", name); }
@@ -700,6 +702,12 @@ static sources *sources_load_(const char *path) {
             s->emb_name = strdup(json_str(json_get(ej, "name"), "pca64")); s->emb_level = (int)json_num(json_get(ej, "level"), -1);
             if (!s->nemb || s->emb_level < 0) { fprintf(stderr, "sources: %s: \"emb\" needs \"groups\": [DIR, ...] and \"level\" >= 0\n", s->name); json_free(j); sources_free(S); return nullptr; }
         }
+        const json *cj = json_get(e, "cond");   /* {"fields": [DIR, ...]}: train --cond-fields conditioning planes (sample_cond.h) */
+        if (cj) {
+            const json *fj = json_get(cj, "fields");
+            if (fj && fj->type == J_ARR) for (size_t k = 0; k < fj->n && s->ncond < 16; k++) { const char *g = json_str(json_at(fj, k), nullptr); if (g) s->cond_dir[s->ncond++] = strdup(g); }
+            if (!s->ncond) { fprintf(stderr, "sources: %s: \"cond\" needs \"fields\": [DIR, ...]\n", s->name); json_free(j); sources_free(S); return nullptr; }
+        }
         const json *ho = json_get(e, "holdout"); int hbad = 0;
         if (ho && ho->type == J_ARR && ho->n == 6 && json_at(ho, 0)->type != J_ARR) hbad = src_add_hold(s, ho, 0, 0);
         else if (ho && ho->type == J_ARR) for (size_t k = 0; k < ho->n && !hbad; k++) hbad = src_add_hold(s, json_at(ho, k), 0, 0);
@@ -784,6 +792,7 @@ void sources_free(sources *S) {
         free(s->lv_key); if (s->lv_s) store_close(s->lv_s);
         for (int k = 0; k < s->nxs; k++) free(s->xs_map[k]);
         for (int k = 0; k < s->nemb; k++) free(s->emb_grp[k]);
+        for (int k = 0; k < s->ncond; k++) free(s->cond_dir[k]);
         free(s->emb_name);
         store_close(s->s);
     }

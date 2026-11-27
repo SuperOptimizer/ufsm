@@ -57,7 +57,8 @@ int band_field_phase_pair(const uint8_t *codes, const int n[3], float rmax, uint
    with a halo of rmax / 2 + 2 level-1 voxels (n1; the level-0 voxel z lies in the level-1 cell (z + off) / 2). A voxel's nearest sheet of each
    parity: the level-0 tile's, or its level-1 cell's nearest (taken at that cell's centre) when that cell is not wholly inside the level-0
    tile and nearer. rmax in level-0 voxels. The phase of every level-0 tile voxel into phase (n0) */
-int band_field_phase_pair2(const uint8_t *codes0, const int n0[3], const uint8_t *codes1, const int n1[3], const int off[3], float rmax, uint8_t *phase);
+int band_field_phase_pair2(const uint8_t *codes0, const int n0[3], const uint8_t *codes1, const int n1[3], const int off[3], int ls, float rmax, uint8_t *phase);
+/* (ls: codes1 is 2^ls coarser, 1..3, the level-0 voxel z in the coarse cell (z + off) >> ls; w11 2026-11-27: ls 2 keeps a 384 um reach at 1.1 um) */
 int band_field_phase_pair_ex(const uint8_t *codes, const int n[3], float rmax, uint8_t *phase, uint8_t *spacing, int32_t *lo, int32_t *hi);
 
 /* Recto / verso side of every voxel from the labelled recto faces alone (no axis): between consecutive windings k and k + 1 the

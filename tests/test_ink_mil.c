@@ -148,6 +148,32 @@ int main(void) {
         CHECK(!bad && t0[254] == 255 && t1[0] == 13 && t1[254] == 242, "nn_ink_targets_smooth: %d off", bad);
         nn_free(di); nn_free(dt); nn_free(dm);
     }
+    if (!getenv("UFSM_TEST_NO_GPU") && nn_init(0) == 0) {   /* train --ink-neg-guard / --ink-neg-gate: nn_ink_neg against the host rule, byte-exact masks and counts */
+        const int z0 = 5, nz = 8; const size_t hw = (size_t)H * W, vb = (size_t)z0 * hw, ns = (size_t)nz * hw;
+        uint8_t *ink = malloc(nv), *m = malloc(ns), *mh = malloc(ns), *mg = malloc(ns); _Float16 *l16 = malloc(ns * 2); unsigned s2 = 11;
+        for (size_t k = 0; k < nv; k++) { const double u = urand(&s2); ink[k] = u < 0.7 ? 255 : u < 0.97 ? (uint8_t)(urand(&s2) * 127) : (uint8_t)(127 + urand(&s2) * 128); }
+        for (size_t k = 0; k < ns; k++) { m[k] = ink[vb + k] != 255 || urand(&s2) < 0.05; l16[k] = (_Float16)(8 * urand(&s2) - 4); }   /* (+ a few air-lattice voxels: m 1 on 255) */
+        uint8_t *dink = nn_malloc(nv), *dm = nn_malloc(ns); void *dl = nn_malloc(ns * 2); nn_h2d(dink, ink, nv); nn_h2d(dl, l16, ns * 2);
+        static const struct { int R; float T; } cs[] = {{0, 0.f}, {2, 0.f}, {0, 0.7f}, {1, 0.9f}, {3, 0.5f}};
+        for (int c = 0; c < 5; c++) {
+            const int R = cs[c].R; const float T = cs[c].T, lt = T > 0 ? logf(T / (1 - T)) : 0;
+            unsigned long long hc[3] = {0, 0, 0}, gc[3];
+            for (size_t k = 0; k < ns; k++) {
+                mh[k] = m[k]; if (!m[k] || ink[vb + k] >= 127 || (!R && !(T > 0))) continue;
+                hc[0]++; const int z = z0 + (int)(k / hw), y = (int)(k % hw / W), x = (int)(k % W); int g = 0;
+                for (int a = z - R; R > 0 && a <= z + R; a++) for (int b = y - R; b <= y + R; b++) for (int e = x - R; e <= x + R; e++)
+                    if (a >= 0 && a < D && b >= 0 && b < H && e >= 0 && e < W) { const uint8_t v = ink[(size_t)a * hw + (size_t)b * W + e]; g |= v >= 127 && v != 255; }
+                const int t = !g && T > 0 && (float)l16[k] > lt; hc[1] += g; hc[2] += t; if (g || t) mh[k] = 0;
+            }
+            nn_h2d(dm, m, ns); nn_ink_neg_counts(gc); nn_ink_neg(dink, vb, ns, D, H, W, R, dl, T, dm, 1); nn_d2h(mg, dm, ns); nn_ink_neg_counts(gc);
+            if (!R && !(T > 0)) hc[0] = 0;
+            const int diff = memcmp(mg, mh, ns) != 0;
+            fprintf(stderr, "ink neg R %d T %.2f: %llu negatives, guard %llu, gate %llu (gpu %llu %llu %llu)%s\n", R, T, hc[0], hc[1], hc[2], gc[0], gc[1], gc[2], diff ? " MASK DIFFERS" : "");
+            CHECK(!diff && gc[0] == hc[0] && gc[1] == hc[1] && gc[2] == hc[2], "nn_ink_neg R %d T %g", R, T);
+            CHECK(c == 0 || hc[1] + hc[2] > 0, "nn_ink_neg R %d T %g: the case drops nothing", R, T);
+        }
+        nn_free(dink); nn_free(dm); nn_free(dl); free(ink); free(m); free(mh); free(mg); free(l16);
+    }
     if (fails) { fprintf(stderr, "test_ink_mil: %d failures\n", fails); return 1; }
     fprintf(stderr, "test_ink_mil: ok\n"); return 0;
 }

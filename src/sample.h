@@ -200,6 +200,9 @@ typedef struct {
                                 the native input crop (P / 4)^3], both under one symmetry and tone LUT. 1, task restore: no target reads; batch.t holds the clean CT window alone (B x P^3, tone LUT and symmetry applied),
                                 batch.x / x16 and batch.m are absent (the trainer degrades the window on the device); training windows lie inside a
                                 source "boxes" entry when the source lists boxes, validation windows inside its holdout box; level = the source's min_level */
+    int cnd_div; float cnd_drop;   /* train --cond-fields: batch.cnd, the sources' "cond" fit fields (sample_cond.h, COND_K planes) on the grid of cnd_div^3
+                                window voxels per cell through the window's symmetry and warp; a window keeps none (all 0) with probability cnd_drop (one draw
+                                per window, only when cnd_div > 0), on crushed / torn / re-bent windows and outside the sets. 0: off */
     float emb_pap;           /* train --distill-papyrus F: targets only on head cells >= F papyrus (sources "papyrus" / "iso"; sample_emb.h); 0 off */
     int emb_ch, emb_div;     /* train --distill: batch.emb, the sources' "emb" feature targets (emb_ch channels, sources.h) on the grid of emb_div^3 window
                                 voxels per cell (the head's level), pulled at each cell centre through the window's symmetry and warp (trilinear,
@@ -263,6 +266,7 @@ typedef struct {
     void *lvr; int lvmax;    /* B x lvmax lv_chunk_ref (nn_latvol.h): the streams' offsets in its lvc part and first cells */
     int *nlvr; size_t *lvn;  /* B: the streams and bytes of each direct window */
     const void **lvz;        /* B: the latvol array (z3 *) of each direct window (its codec: z3_latvol) */
+    int8_t *cnd;             /* cfg.cnd_div: B x COND_K x (Pz / cnd_div) x (P / cnd_div)^2 conditioning planes (sample_cond.h) */
     int8_t *emb;             /* cfg.emb_ch: B x emb_ch x (Pz / emb_div) x (P / emb_div)^2 feature targets (int8 x 127 unit vectors, channel planes; a cell
                                 with all channels 0 has none) */
 } batch;
