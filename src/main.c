@@ -94,6 +94,8 @@ int cmd_ink_cover(int argc, char **argv);
 int cmd_self_gate(int argc, char **argv);
 int cmd_stitch(int argc, char **argv);   /* src/stitch.c */
 int cmd_coreline(int argc, char **argv);   /* src/coreline.c */
+int cmd_umbilicus(int argc, char **argv);   /* src/umbfind.c */
+int cmd_axis_diff(int argc, char **argv);   /* src/umbfind.c */
 int cmd_coreline_check(int argc, char **argv);   /* src/coreline_check.c */
 int cmd_render_sheets(int argc, char **argv);   /* src/render.c */
 int cmd_sheet_pbr(int argc, char **argv);       /* src/sheetpbr.c */
@@ -171,6 +173,8 @@ static int usage(void) {
         "  ufsm mirror  <root> <array-key> <out-dir> [--threads 4] [--mbps 0] [--link-from DIR] [--verify N]  local copy of one array's shard files\n"
         "  ufsm scanprep <root> <group-key> --level L --out PREFIX [...]   per-scan object mask + CT statistics (src/scanprep.h)\n"
         "  ufsm axis    <root> <ct-group-key> <out.json> [--cache DIR]  -> per-z centroid axis (umbilicus stand-in)\n"
+        "  ufsm umbilicus OUT.json --um0 UM (--ct-root R --ct-key K --level L | --fields DIR) [--ref AXIS]   umbilicus by sheet-normal voting (villa port)\n"
+        "  ufsm axis-diff A.json B.json --um0 UM   per-z distance of two umbilicus files (mm: median, p90, max)\n"
         "  ufsm ingest-labels <root> <zarr-key> <out-dir> --um U   HF/S3 zarr v2 labels -> volcomp pyramid\n"
         "  ufsm z3-recode <group-dir> <out-group> --um U --lut FILE [--hist 1]   a local prob254 pyramid through a LUT (255 kept), value histogram\n"
         "  ufsm z3-fetch ROOT KEY --cache DIR --box z,y,x,dz,dy,dx [--scale F] [--margin 128] [--threads 16]   the box's chunks into a z3 chunk cache (no decode)\n"
@@ -5081,6 +5085,8 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "stitch")) return cmd_stitch(argc, argv);
     if (!strcmp(cmd, "coreline") && argc > 2 && !strcmp(argv[2], "check")) return cmd_coreline_check(argc, argv);
     if (!strcmp(cmd, "coreline")) return cmd_coreline(argc, argv);
+    if (!strcmp(cmd, "umbilicus")) return cmd_umbilicus(argc, argv);
+    if (!strcmp(cmd, "axis-diff")) return cmd_axis_diff(argc, argv);
     if (!strcmp(cmd, "render-sheets")) return cmd_render_sheets(argc, argv);
     if (!strcmp(cmd, "sheet-pbr")) return cmd_sheet_pbr(argc, argv);
     if (!strcmp(cmd, "overlay-red")) return cmd_overlay_red(argc, argv);
