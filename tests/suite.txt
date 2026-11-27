@@ -435,6 +435,7 @@ test_ct_gpu_decode                             | gpu          |    30 | bash tes
 test_vcgpu                                     | gpu,smoke    |     5 | ./$B/test_vcgpu
 test_lat                                       | gpu,smoke    |     1 | ./$B/test_lat
 test_cluster                                   | gpu,smoke    |     1 | ./$B/test_cluster
+test_devmath                                   | gpu          |     2 | ./$B/test_devmath
 test_latents                                   | gpu          |    25 | bash tests/test_latents.sh ./$B/ufsm ./$B/make_wind_fixture
 test_latcodec                                  | cpu          |     4 | ./$B/test_latcodec $TMPDIR
 test_latvol                                    | gpu          |     6 | ./$B/test_latvol

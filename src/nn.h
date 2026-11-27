@@ -145,6 +145,9 @@ int nn_sp24_eligible(int co, int ci, int mode);
    memory written through mapa (mode 0: st.shared::cluster; 1: st.async on mbarriers, then remote arrivals): 0 (*nbad wrong words), -2 not
    available (pre-sm_90 build or card), else the CUDA error (tests/test_cluster.c) */
 int nn_cluster_selftest(int n, int mode, size_t dsm, int *nbad);
+/* nn_devmath.cu: the device library's sincospi / sinpi / cospi / sincos (double) and sincospif for n arguments, 8 doubles each into out
+   (tests/test_devmath.c); 0 or the CUDA error */
+int nn_devmath_probe(const double *x, int n, double *out);
 void nn_mask24m(const float *w, float *out, int co, int ci, int taps, int mode);
 void nn_srste24m(float *g, const float *w, int co, int ci, int taps, float lambda, int mode);
 void nn_mask24x(const float *w, float *out, float r, float *aux, double *e2, int co, int ci, int taps, int mode, uint8_t *kb, int kin);   /* pruned x r into out, aux zeroed where pruned, energy {all, kept} into e2; kb: keep bytes out (kin 0) / in (kin 1) */
