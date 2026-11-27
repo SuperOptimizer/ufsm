@@ -16,6 +16,7 @@ static const char *const cond_planes[8] = {"pc", "ps", "w", "sp", "dq", "dz", "d
 void sample_cond_decode(const uint8_t v[8], int has_w4, const int perm[3], const int flip[3], float out[COND_K]) {
     out[0] = (v[0] - 128) / 127.f; out[1] = (v[1] - 128) / 127.f; out[2] = v[2] / 255.f; out[3] = v[3] / 255.f;
     for (int k = 4; k < COND_K; k++) out[k] = 0.f;
+    out[11] = 1.f;
     if (!has_w4) return;
     const float q = v[4] / 255.f; out[4] = q;
     for (int a = 0; a < 3; a++) {
@@ -25,7 +26,7 @@ void sample_cond_decode(const uint8_t v[8], int has_w4, const int perm[3], const
 }
 
 /* per-thread open sets */
-typedef struct { const source *s; int k, ok, has_w4, h; double um; int64_t origin[3], off[3], shape[3]; z3 *z[8]; char dir[1024]; } ch_t;   /* (keyed by the directory too: predict's
+typedef struct { const source *s; int k, ok, has_w4, h; double um; int64_t origin[3], off[3], shape[3]; z3 *z[8]; char dir[1024]; int64_t tile; uint64_t *tk; size_t ntk; } ch_t;   /* (keyed by the directory too: predict's
    per-call source may reuse an address with other sets) */
 static _Thread_local ch_t *g_ch; static _Thread_local int g_nch;
 static json *read_json(const char *path) {
@@ -33,6 +34,27 @@ static json *read_json(const char *path) {
     fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
     char *t = malloc((size_t)n + 1); if (!t || n <= 0 || fread(t, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(t); return nullptr; }
     fclose(f); t[n] = 0; json *j = json_parse(t, (size_t)n); free(t); return j;
+}
+static int cmp_u64(const void *a, const void *b) { const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return (x > y) - (x < y); }
+static uint64_t tkey(int64_t z, int64_t y, int64_t x) { return ((uint64_t)z << 42) | ((uint64_t)y << 21) | (uint64_t)x; }
+/* the set's cond_tiles.txt: 0 none (the whole set counts), 1 read, -1 malformed */
+static int read_tiles(ch_t *h, const char *dir) {
+    char p[1400]; snprintf(p, sizeof p, "%s/cond_tiles.txt", dir); FILE *f = fopen(p, "r"); if (!f) return 0;
+    long long t = 0; if (fscanf(f, " tile %lld", &t) != 1 || t < 1) { fclose(f); return -1; }
+    size_t cap = 0; long long z, y, x;
+    while (fscanf(f, "%lld %lld %lld", &z, &y, &x) == 3) {
+        if (z < 0 || y < 0 || x < 0 || z >= (1 << 21) || y >= (1 << 21) || x >= (1 << 21)) { fclose(f); return -1; }
+        if (h->ntk == cap) { cap = cap ? 2 * cap : 4096; uint64_t *n = realloc(h->tk, cap * sizeof *n); if (!n) { fclose(f); return -1; } h->tk = n; }
+        h->tk[h->ntk++] = tkey(z, y, x);
+    }
+    fclose(f); h->tile = t; qsort(h->tk, h->ntk, sizeof *h->tk, cmp_u64);
+    return 1;
+}
+/* is native voxel position e (the set's voxels from 0) inside a listed tile */
+static int in_tiles(const ch_t *h, const double e[3]) {
+    if (!h->tile) return 1;
+    int64_t t[3]; for (int d = 0; d < 3; d++) { if (e[d] < 0) return 0; t[d] = (int64_t)floor(e[d] / (double)h->tile); }
+    const uint64_t k = tkey(t[0], t[1], t[2]); return bsearch(&k, h->tk, h->ntk, sizeof k, cmp_u64) != nullptr;
 }
 static ch_t *ch_get(const source *s, int k) {
     for (int i = 0; i < g_nch; i++) if (g_ch[i].s == s && g_ch[i].k == k && !strcmp(g_ch[i].dir, s->cond_dir[k])) return &g_ch[i];
@@ -49,6 +71,8 @@ static ch_t *ch_get(const source *s, int k) {
     const int w4d = (int)json_num(json_get(j, "w4_d"), 0); json_free(j);
     if (h->h < 1 || !(h->um > 0) || h->shape[0] < 1 || h->shape[1] < 1 || h->shape[2] < 1) { fprintf(stderr, "cond: %s: %s: fields.json without h / um / shape\n", s->name, dir); return h; }
     h->has_w4 = w4d > 0;
+    const int tr = read_tiles(h, dir);
+    if (tr < 0) { fprintf(stderr, "cond: %s: %s/cond_tiles.txt is malformed (\"tile T\" then \"iz iy ix\" lines)\n", s->name, dir); return h; }
     for (int q = 0; q < (h->has_w4 ? 8 : 4); q++) {
         if (!(h->z[q] = z3_open(store_open(dir), cond_planes[q], nullptr))) { fprintf(stderr, "cond: %s: %s/%s: %s\n", s->name, dir, cond_planes[q], z3_error()); return h; }
     }
@@ -78,11 +102,14 @@ int sample_cond_window(const source *s, int div, int l, const int64_t o[3], int 
         int64_t lo[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, hi[3] = {INT64_MIN, INT64_MIN, INT64_MIN}; size_t nin = 0;
         for (size_t q = 0; q < ng; q++) {
             int in = 1;
+            double ev[3];
             for (int d = 0; d < 3; d++) {
-                const double e = ((o[d] + V[3 * q + d] + 0.5) * uml / h->um - h->origin[d]) / h->h - 0.5;
+                ev[d] = (o[d] + V[3 * q + d] + 0.5) * uml / h->um;   /* (native voxels) */
+                const double e = (ev[d] - h->origin[d]) / h->h - 0.5;
                 cu[3 * q + d] = (float)e;
                 if (e < -0.5 || e > h->shape[d] - 0.5) in = 0;
             }
+            if (in && !in_tiles(h, ev)) in = 0;
             if (!in || done[q]) { cu[3 * q] = NAN; continue; }
             nin++;
             for (int d = 0; d < 3; d++) { const int64_t a = (int64_t)floor(cu[3 * q + d]); if (a < lo[d]) lo[d] = a; if (a + 1 > hi[d]) hi[d] = a + 1; }

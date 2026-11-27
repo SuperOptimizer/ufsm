@@ -378,7 +378,7 @@ static int g_tm_unused;    /* unwrap2 head slabs: the packed recto target / mask
 static int g_hs_z;         /* its planes per slab */
 static int g_ds; static float g_ds_w = 0.5f, g_ds_frac = 1.f; static int g_ds_anneal = 1;   /* --deep-sup K: decoder levels 1..K, weight w^j x frac */
 static const int8_t *emb_host(batch *b);
-static int g_cnd, g_cnd_g[3]; static float g_cnd_drop = 0.3f; static size_t g_cnd_n;   /* mgpu: config.  --cond-fields 1 [--cond-drop 0.3]: unet_cfg.cond_ch = COND_K planes (sample_cond.h) of g_cnd_n bytes a batch */   /* (below: an echo's / replay's distill targets cleared) */
+static int g_cnd, g_cnd_g[3]; static float g_cnd_drop = 0.5f; static size_t g_cnd_n;   /* mgpu: config.  --cond-fields 1 [--cond-drop 0.5]: unet_cfg.cond_ch = COND_K planes (sample_cond.h) of g_cnd_n bytes a batch */   /* (below: an echo's / replay's distill targets cleared) */
 static int g_distill, g_distill_lev = 3, g_distill_div; static float g_distill_w = 1.f; static float g_distill_pap;   /* --distill-papyrus F: targets only on head cells >= F papyrus */ static size_t g_distill_n;   /* --distill C: a C-channel 1^3 head on decoder level --distill-level
                                                                                                     (cells of g_distill_div^3 window voxels; g_distill_n int8 targets per batch), cosine loss x --distill-weight */
 static ssl_heads g_sslh; static float g_sslh_w[SSLH_MAX]; static const char *g_sslh_name[SSLH_MAX];   /* --ssl-heads LIST (--ssl-ink W: "ink:W"): gated mean-teacher
@@ -3789,7 +3789,7 @@ int cmd_train(int argc, char **argv) {
             {   /* --cond-fields 1 (2026-11-27): another model's fit fields (the sources' "cond" sets, sample_cond.h) as a second 32-channel input block,
                    sampled at 8^3-voxel cells, x2 onto the latent cells on the GPU (nn_cond_mx); --cond-drop P: a window keeps none with probability P (so the
                    net cannot just copy them). The checkpoint decides on resume; init-from a net without them: the new stem columns start at zero */
-                g_cnd = opt_atoi("--cond-fields", opt(argc, argv, "--cond-fields", "0")) != 0; g_cnd_drop = (float)opt_atof("--cond-drop", opt(argc, argv, "--cond-drop", "0.3"));
+                g_cnd = opt_atoi("--cond-fields", opt(argc, argv, "--cond-fields", "0")) != 0; g_cnd_drop = (float)opt_atof("--cond-drop", opt(argc, argv, "--cond-drop", "0.5"));
                 if (resume) { unet_cfg pc; int st; if (!unet_peek(resume, &pc, &st)) g_cnd = pc.cond_ch > 0; }
                 if (g_cnd) {
                     if (g_lsplit || (g_valP && g_valP != P)) { fprintf(stderr, "--cond-fields: not with --split or another --val-P (one conditioning grid)\n"); return 2; }

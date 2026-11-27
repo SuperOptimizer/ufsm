@@ -43,7 +43,8 @@ int main(void) {
         const uint8_t v[8] = {255, 128, 51, 102, 255, 64, 128, 0}; float o[COND_K]; sample_cond_decode(v, 1, id, nf, o);
         CHECK(fabsf(o[0] - 1.f) < 1e-6f && fabsf(o[1]) < 1e-6f && fabsf(o[2] - 0.2f) < 1e-6f && fabsf(o[3] - 0.4f) < 1e-6f && fabsf(o[4] - 1.f) < 1e-6f, "decode scalars");
         CHECK(fabsf(o[5]) < 1e-6f && fabsf(o[6] - 1.f) < 1e-6f && fabsf(o[7] + 1.f) < 1e-6f && fabsf(o[8]) < 1e-6f && fabsf(o[9] - 1.f) < 1e-6f && fabsf(o[10]) < 1e-6f, "decode winding pairs");
-        sample_cond_decode(v, 0, id, nf, o); CHECK(o[4] == 0.f && o[9] == 0.f, "no winding planes: 0");
+        CHECK(o[11] == 1.f, "presence 1");
+        sample_cond_decode(v, 0, id, nf, o); CHECK(o[4] == 0.f && o[9] == 0.f && o[11] == 1.f, "no winding planes: 0, presence 1");
     }
     const long long org[3] = {800, 1600, 2400};   /* native voxels (level 0, 2.4 um), field cell 8 voxels */
     mkset(d1, org, 1, 0);
@@ -62,6 +63,23 @@ int main(void) {
             for (int c = 0; c < COND_K; c++) bad += out[c * ng + q] != q8(e[c]);
         }
         CHECK(!bad && outside > 0, "aligned cells: %d values differ (%d cells outside)", bad, outside);
+    }
+    {   /* cond_tiles.txt: only the listed 64^3 tile (12, 25, 37) of native voxels counts; the other cells are absent (all channels 0, presence 0) */
+        char tp[400]; snprintf(tp, sizeof tp, "%s/cond_tiles.txt", d1); FILE *f = fopen(tp, "w"); fprintf(f, "tile 64\n12 25 37\n"); fclose(f);
+        source s2 = s; s2.name = (char *)"t2";   /* (a new source: the per-thread set cache is keyed by it) */
+        const int64_t o[3] = {org[0] + 16, org[1] + 8, org[2] + 24};
+        CHECK(sample_cond_window(&s2, 8, 0, o, Pz, P, id, nf, nullptr, out) == 0, "read");
+        int bad = 0, nin = 0, nout = 0;
+        for (int gz = 0; gz < G0; gz++) for (int gy = 0; gy < G1; gy++) for (int gx = 0; gx < G1; gx++) {
+            const int cz = gz + 2, cy = gy + 1, cx = gx + 3; const size_t q = ((size_t)gz * G1 + gy) * G1 + gx;
+            const long long nz = o[0] + 8 * gz + 4, ny = o[1] + 8 * gy + 4, nx = o[2] + 8 * gx + 4;
+            float e[COND_K] = {0};
+            if (nz / 64 == 12 && ny / 64 == 25 && nx / 64 == 37 && cz < FD && cy < FH && cx < FW) { uint8_t v[8]; cell(cz, cy, cx, v); sample_cond_decode(v, 1, id, nf, e); nin++; } else nout++;
+            for (int c = 0; c < COND_K; c++) bad += out[c * ng + q] != q8(e[c]);
+            if (e[11] == 1.f) bad += out[11 * ng + q] != 127;
+        }
+        CHECK(!bad && nin > 0 && nout > 0, "tile coverage: %d values differ (%d cells in the tile, %d absent)", bad, nin, nout);
+        remove(tp);
     }
     {   /* half a cell off along every axis: the mean of the 8 neighbours (interior cells) */
         const int64_t o[3] = {org[0] + 4, org[1] + 4, org[2] + 4};
