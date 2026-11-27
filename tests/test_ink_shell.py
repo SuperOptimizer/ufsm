@@ -1,8 +1,11 @@
 """ink-ext --shell-list / --shell-prev / --ct-shell (inkeval 2026-11-27, the q2 CT shell for coarse-scan ink). CPU only: --shell-list and
 --render-only load no net and touch no GPU. A two-shard (z) CT whose main store is 100 everywhere and whose shell copy is 200 everywhere;
 the shell's coverage is what its shell.boxes says. Checked:
-- --shell-list of surface A (z 100..599): one box per 1024^3 shard, only shard (0, 0, 0), header "# level 0 shard 1024", chunk-aligned and
-  covering A's rows; --shell-prev with surface B (z 100..1199): shard 0 grown (named in .redo), shard 1 added (not in .redo);
+- --shell-list of surface A (z 100..599): x runs of 128^3 chunks (128 x 128 x 128 k boxes, each inside one 1024^3 shard), header
+  "# level 0 shard 1024", covering A's rows, all in shard (0, 0, 0); --shell-prev with surface B (z 100..1199): A's chunks kept, shard 0
+  grown (named in .redo), shard 1 added (not in .redo);
+- latvol --zarr2 1 --volcomp 0 --exact 1 --boxes (a raw zarr v2 source, 1024^3 shards): exactly the listed chunks written (the shard index),
+  read back through --ct-shell; --exact 0 (the bounding region per shard) writes more;
 - --render-only --dump-layers of B through --ct-shell with A's boxes: rows (z) inside A's chunks read 200, rows past them 100, and the
   DEFAULTED line counts the chunks read from the main store; with B's boxes: all 200, no DEFAULTED; a shell root without shell.boxes:
   DEFAULTED, all 100 (the q8 fallback)."""
@@ -57,15 +60,46 @@ with tempfile.TemporaryDirectory(prefix="ufsm-shell-") as td:
     run(*ext("--surface", d / "A", "--ct", d / "m", "v", "--out", d / "o", "--shell-list", d / "s/v/shell.boxes"))
     hdr, ba = boxes(d / "s/v/shell.boxes")
     assert hdr.startswith("# level 0 shard 1024"), hdr
-    assert len(ba) == 1 and all(c % 128 == 0 for c in ba[0]), ba
-    z, y, x, nz, ny, nx = ba[0]
-    assert y <= YS - 12 and y + ny >= YS + 12 and z <= 100 - 10 and 600 + 10 <= z + nz <= 1024 and x <= 20 - 10 and x + nx >= 100 + 10, ba
+    chunks = lambda bs: {(z // 128, y // 128, (x // 128) + i) for z, y, x, nz, ny, nx in bs for i in range(nx // 128)}
+    assert all(c % 128 == 0 for b in ba for c in b) and all(b[3] == 128 and b[4] == 128 and b[0] // 1024 == 0 for b in ba), ba
+    assert all(b[2] // 1024 == (b[2] + b[5] - 1) // 1024 for b in ba), ba
+    ca = chunks(ba)
+    need = {(z // 128, y // 128, x // 128) for z in range(90, 611, 16) for y in (int(YS) - 12, int(YS) + 12) for x in (10, 110)}
+    assert need <= ca and len(ca) == len(ba) * 1 + sum(b[5] // 128 - 1 for b in ba), (sorted(need - ca), ba)
     run(*ext("--surface", d / "B", "--ct", d / "m", "v", "--out", d / "o", "--shell-list", d / "b.boxes", "--shell-prev", d / "s/v/shell.boxes"))
     _, bb = boxes(d / "b.boxes")
-    assert len(bb) == 2 and sorted(b[0] // 1024 for b in bb) == [0, 1], bb
-    assert all(b[0] // 1024 == (b[0] + b[3] - 1) // 1024 for b in bb), bb   # each box inside one shard
+    cb = chunks(bb)
+    assert ca < cb and {c[0] // 8 for c in cb} == {0, 1}, bb
+    assert all(b[3] == 128 and b[4] == 128 and b[2] // 1024 == (b[2] + b[5] - 1) // 1024 for b in bb), bb   # each run inside one shard
     redo = (d / "b.boxes.redo").read_text().split()
     assert redo == ["0", "0", "0"], redo   # shard 0 grew; shard 1 is new (nothing to delete)
+
+    # latvol --exact 1: the listed chunks alone, from a raw zarr v2 source (as from S3), 1024^3 shards
+    v2 = d / "v2/v/0"; v2.mkdir(parents=True)
+    (v2 / ".zarray").write_text(json.dumps({"shape": list(SH), "chunks": [128, 128, 128], "fill_value": 0, "order": "C", "filters": None,
+                                            "dimension_separator": "/", "compressor": None, "zarr_format": 2, "dtype": "|u1"}))
+    rng = np.random.default_rng(1); vals = {}
+    for cz in range(SH[0] // 128):
+        for cy in range(SH[1] // 128):
+            c = rng.integers(150, 250, (128, 128, 128), dtype=np.uint8); vals[(cz, cy, 0)] = c
+            (v2 / str(cz) / str(cy)).mkdir(parents=True, exist_ok=True); c.tofile(v2 / str(cz) / str(cy) / "0")
+    (d / "g/v").mkdir(parents=True)
+    (d / "g/v/zarr.json").write_text(json.dumps({"zarr_format": 3, "node_type": "group", "attributes": {}}))
+    lcb = d / "id.lcb"; lcb.write_bytes(np.array([0x424c4655, 1], np.uint32).tobytes() + np.zeros(64 + 64 * 64, np.float32).tobytes())
+    def latvol(out, *extra):
+        run(BIN, "latvol", lcb, d / "v2", "v", out, "--levels", 0, "--zarr2", 1, "--volcomp", 0, "--gpu", -1, "--threads", 2, "--boxes", d / "c.boxes",
+            "--group-from", d / "g", *extra)
+        n = 0
+        for f in (out / "0/c").rglob("*"):
+            if f.is_file():
+                ix = np.frombuffer(f.read_bytes()[-(512 * 16 + 4):-4], np.uint64).reshape(-1, 2)
+                n += int((ix[:, 0] != np.uint64(2**64 - 1)).sum())
+        return n
+    # A's chunks plus one at z chunk 7: shard 0's bounding region then spans z chunks 0..7
+    (d / "c.boxes").write_text((d / "s/v/shell.boxes").read_text() + "896 128 0 128 128 128\n")
+    ne, nb = latvol(d / "x/v", "--exact", 1), latvol(d / "y/v")
+    assert (6, 1, 0) not in ca and ne == len(ca | {(7, 1, 0)}) < nb, (ne, len(ca), nb)
+    (d / "x/v/shell.boxes").write_text((d / "c.boxes").read_text())
 
     def render(shell, tag):
         o = d / f"d{tag}"
@@ -85,6 +119,9 @@ with tempfile.TemporaryDirectory(prefix="ufsm-shell-") as td:
     L, err = render(d / "s", "b")
     assert "DEFAULTED" not in err and (L[row(150):row(1150), 10:60] == 200).all(), (err[-2000:], np.unique(L))
     (d / "e/v").mkdir(parents=True)   # a shell root with no shell.boxes: the q8 store, loudly
+    L, err = render(d / "x", "x")   # the latvol --exact copy: A's rows and z chunk 7 from it (source values >= 150), the rest from the main store
+    assert "outside the shell" in err and (L[row(300), 10:60] >= 150).all() and (L[row(1000), 10:60] >= 150).all() and (L[row(1150), 10:60] == 100).all() \
+        and (L[row(800), 10:60] == 100).all(), (err[-2000:], L[row(300), 10:14], L[row(800), 10:14], L[row(1000), 10:14])
     L, err = render(d / "e", "c")
     assert "DEFAULTED: ink-ext: --ct-shell" in err and (L[row(150):row(1150), 10:60] == 100).all(), (err[-2000:], np.unique(L))
-    print("test_ink_shell: OK", ba, bb)
+    print("test_ink_shell: OK", len(ca), len(cb), "chunks; latvol exact", ne, "bounding", nb)

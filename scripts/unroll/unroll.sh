@@ -176,11 +176,11 @@ ctshell() {
   if [ ! -s $SHD/grp/$s3k/zarr.json ]; then
     case $R in http*) curl -sf "$R/$K/zarr.json" -o $SHD/grp/$s3k/zarr.json;; *) cp "$R/$K/zarr.json" $SHD/grp/$s3k/zarr.json;; esac || { log "DEFAULTED: ctshell: no group zarr.json at $R/$K: ink from the q8 store $R"; shclose; return 0; }
   fi
-  nice -n 10 $U latvol $SHLCB $S3CT $s3k $SHD/$K --levels $lev --zarr2 1 --volcomp ${SHELLQ:-2} --gpu -1 --threads ${SHELLTH:-6} --resume 1 --boxes $SHD/new.boxes \
+  nice -n 10 $U latvol $SHLCB $S3CT $s3k $SHD/$K --levels $lev --zarr2 1 --volcomp ${SHELLQ:-2} --gpu -1 --threads ${SHELLTH:-6} --resume 1 --exact 1 --boxes $SHD/new.boxes \
     --group-from $SHD/grp >> $O/logs/ctshell.log 2>&1; rc=$?
   if [ $rc != 0 ]; then log "DEFAULTED: ctshell: latvol from $S3CT $s3k rc $rc ($O/logs/ctshell.log): ink from the q8 store $R"; rm -f $SHD/$K/shell.boxes; shclose; return 0; fi
   mv -f $SHD/new.boxes $SHD/$K/shell.boxes
-  n=$(grep -vc '^#' $SHD/$K/shell.boxes); log "ctshell: level $lev q${SHELLQ:-2} shell $SHD/$K: $n shard boxes, $(du -sb $SHD/$K/$lev 2> /dev/null | awk '{printf "%.2f GB", $1 / 1e9}'), $(( $(date +%s) - t0 )) s"
+  n=$(grep -vc '^#' $SHD/$K/shell.boxes); log "ctshell: level $lev q${SHELLQ:-2} shell $SHD/$K: $n chunk runs, $(du -sb $SHD/$K/$lev 2> /dev/null | awk '{printf "%.2f GB", $1 / 1e9}'), $(( $(date +%s) - t0 )) s"
   flock -s $shfd; SHX="--ct-shell $SHD"   # (shared while ink-ext reads: no rebuild under it; closed after the ink-ext)
 }
 r3pre() {

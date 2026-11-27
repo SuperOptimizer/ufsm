@@ -123,17 +123,16 @@ typedef struct {
     int64_t *hk; int32_t *hv; size_t hcap;   /* open-addressing key -> index into e (rebuilt per band) */
     uint8_t *zero; uint32_t epoch; uint64_t ndec;
     /* --ct-shell (inkeval 11-27): a higher-quality partial copy of this level (q2 around the inked surfaces); its chunks are those inside
-       the boxes of its shell.boxes (one per 1024^3 shard: what latvol --boxes wrote), the rest still come from z */
-    z3 *zs; int64_t sg[3]; int32_t *sbox; int64_t (*box)[6]; _Atomic long long nshell, nmain;
+       the 128^3 chunks its shell.boxes touches (what latvol --boxes --exact 1 wrote; before 11-27 one bounding box per 1024^3 shard, read the same
+       way), the rest still come from z. cmask: one byte per chunk of the level's sg[] grid. */
+    z3 *zs; int64_t sg[3]; uint8_t *cmask; _Atomic long long nshell, nmain;
 } ctlev;
 static inline int64_t ckey(int64_t a, int64_t b, int64_t c) { return (a << 42) | (b << 21) | c; }
-static int shell_has(const ctlev *L, int64_t k) {   /* chunk key k (128^3 grid) inside the shell's box of its 1024^3 shard */
+static int shell_has(const ctlev *L, int64_t k) {   /* chunk key k (128^3 grid) in the shell */
     if (!L->zs) return 0;
-    const int64_t c[3] = {k >> 42, (k >> 21) & 0x1fffff, k & 0x1fffff}, s[3] = {c[0] >> 3, c[1] >> 3, c[2] >> 3};
-    for (int d = 0; d < 3; d++) if (s[d] >= L->sg[d]) return 0;
-    const int32_t b = L->sbox[(s[0] * L->sg[1] + s[1]) * L->sg[2] + s[2]]; if (b < 0) return 0;
-    for (int d = 0; d < 3; d++) if (c[d] * 128 < L->box[b][d] || (c[d] + 1) * 128 > L->box[b][d] + L->box[b][3 + d]) return 0;
-    return 1;
+    const int64_t c[3] = {k >> 42, (k >> 21) & 0x1fffff, k & 0x1fffff};
+    for (int d = 0; d < 3; d++) if (c[d] >= L->sg[d]) return 0;
+    return L->cmask[(c[0] * L->sg[1] + c[1]) * L->sg[2] + c[2]];
 }
 /* (x >> 20) of the product alone (before 2026-11-16) depended only on key bits 0-29 (x and the low bits of y): every chunk differing in z
    alone probed the same slot, ct_find was 45 % of ink9um's CPU samples. A full mix spreads every key bit over the slot index. */
@@ -996,14 +995,16 @@ int cmd_ink_ext(int argc, char **argv) {
         if (!zs) fprintf(stderr, "DEFAULTED: ink-ext: --ct-shell %s: no usable shell for %s (%s: level %d, shard %d, %d boxes; or its level does not match the CT's shape / "
                                  "128^3 chunks): every chunk read from %s\n", shroot, argv[ci + 2], bp, sl, ssh, nb, argv[ci + 1]);
         else {
-            for (int d = 0; d < 3; d++) L->sg[d] = (L->shape[d] + 1023) / 1024;
-            const size_t ng = (size_t)(L->sg[0] * L->sg[1] * L->sg[2]); L->sbox = malloc(ng * sizeof *L->sbox); for (size_t i = 0; i < ng; i++) L->sbox[i] = -1;
-            int bad = 0;
-            for (int b = 0; b < nb; b++) { int64_t s3[3]; for (int d = 0; d < 3; d++) { s3[d] = bx[b][d] / 1024; if (s3[d] >= L->sg[d] || bx[b][d] + bx[b][3 + d] > (s3[d] + 1) * 1024) bad = 1; }
-                if (bad) break; L->sbox[(s3[0] * L->sg[1] + s3[1]) * L->sg[2] + s3[2]] = b; }
-            if (bad) { fprintf(stderr, "ink-ext: --ct-shell: %s: a box crosses a 1024^3 shard (not an ink-ext --shell-list file)\n", bp); return 2; }
-            L->zs = zs; L->box = bx; bx = nullptr;
-            fprintf(stderr, "ink-ext: CT level %d: %d shard boxes from the shell %s, the rest from %s\n", sl, nb, shroot, argv[ci + 1]);
+            for (int d = 0; d < 3; d++) L->sg[d] = (L->shape[d] + CE - 1) / CE;
+            L->cmask = calloc((size_t)(L->sg[0] * L->sg[1] * L->sg[2]), 1); int bad = 0; size_t nck = 0;
+            for (int b = 0; b < nb && !bad; b++) { int64_t c0[3], c1[3];   /* (a box must be chunk-aligned: a partial chunk would be half-written in the shell) */
+                for (int d = 0; d < 3; d++) { if (bx[b][d] % CE || bx[b][3 + d] < 1 || (bx[b][3 + d] % CE && bx[b][d] + bx[b][3 + d] < L->shape[d])) bad = 1;
+                    c0[d] = bx[b][d] / CE; c1[d] = (bx[b][d] + bx[b][3 + d] + CE - 1) / CE; if (c1[d] > L->sg[d]) c1[d] = L->sg[d]; }
+                for (int64_t z = c0[0]; !bad && z < c1[0]; z++) for (int64_t y = c0[1]; y < c1[1]; y++) for (int64_t x = c0[2]; x < c1[2]; x++) {
+                    uint8_t *q = &L->cmask[(z * L->sg[1] + y) * L->sg[2] + x]; nck += !*q; *q = 1; } }
+            if (bad) { fprintf(stderr, "ink-ext: --ct-shell: %s: a box not on the 128^3 chunk grid (not an ink-ext --shell-list file)\n", bp); return 2; }
+            L->zs = zs;
+            fprintf(stderr, "ink-ext: CT level %d: %zu chunks (%d boxes) from the shell %s, the rest from %s\n", sl, nck, nb, shroot, argv[ci + 1]);
         }
         free(bx);
     }
@@ -1171,42 +1172,52 @@ surfaces:;
         free(g); free(pm); isurf_free(&S); ns++;
     }
     if (pf) { fprintf(stderr, "ink-ext: prefetcher: %lld CT chunks fetched ahead (%d threads)%s\n", (long long)atomic_load(&pf->nf), pf->nt, atomic_load(&pf->nfail) ? ", some failed (read again by the renderer)" : ""); pf_close(pf); }
-    if (slist) {   /* the union of the surfaces' chunks, one box per 1024^3 shard */
+    if (slist) {   /* the union of the surfaces' chunks, as x runs of 128^3 chunks inside one 1024^3 shard each (latvol --exact 1 writes those chunks alone;
+                      one bounding box per shard before 11-27 encoded 2.2x the chunks ink reads: 1447 w058 16.7 Gvox for 7.5) */
         if (rc || !sh_n) { fprintf(stderr, "ink-ext: --shell-list: no chunks (%d surfaces)\n", ns); free(sh_keys); return 1; }
-        qsort(sh_keys, sh_n, sizeof *sh_keys, i64cmp); size_t u = 0; for (size_t i = 0; i < sh_n; i++) if (!u || sh_keys[i] != sh_keys[u - 1]) sh_keys[u++] = sh_keys[i];
-        const ctlev *L = &X.lev[sh_lev]; int64_t (*sb)[6] = nullptr; size_t nsb = 0;   /* per shard: chunk-index bbox lo[3], hi[3] */
-        if (u >= (1u << 22)) { fprintf(stderr, "ink-ext: --shell-list: %zu chunks > 2^22\n", u); free(sh_keys); return 1; }
-        int64_t *ord = malloc(u * sizeof *ord);   /* (shard key << 22 | chunk index), sorted: the chunks shard by shard */
-        const int64_t sgy = (L->shape[1] + 1023) / 1024 + 1, sgx = (L->shape[2] + 1023) / 1024 + 1;   /* (a compact shard index: ckey << 22 overflowed, 11-27) */
-        for (size_t i = 0; i < u; i++) { const int64_t k = sh_keys[i]; ord[i] = ((((k >> 42) >> 3) * sgy + (((k >> 21) & 0x1fffff) >> 3)) * sgx + ((k & 0x1fffff) >> 3)) << 22 | (int64_t)i; }
-        qsort(ord, u, sizeof *ord, i64cmp); sb = malloc(u * sizeof *sb); int64_t prev = -1;
-        for (size_t j = 0; j < u; j++) { const int64_t k = sh_keys[ord[j] & ((1 << 22) - 1)], c[3] = {k >> 42, (k >> 21) & 0x1fffff, k & 0x1fffff}, shk = ord[j] >> 22;
-            if (c[0] * CE >= L->shape[0] || c[1] * CE >= L->shape[1] || c[2] * CE >= L->shape[2]) continue;   /* (outside the array: read as zero) */
-            if (shk != prev) { for (int d = 0; d < 3; d++) { sb[nsb][d] = c[d]; sb[nsb][3 + d] = c[d]; } nsb++; prev = shk; continue; }
-            for (int d = 0; d < 3; d++) { if (c[d] < sb[nsb - 1][d]) sb[nsb - 1][d] = c[d]; if (c[d] > sb[nsb - 1][3 + d]) sb[nsb - 1][3 + d] = c[d]; } }
-        /* --shell-prev OLD (a shell grown run by run): OLD's boxes (chunk units here) are merged in shard by shard; a shard whose box grows
-           is named in SLIST.redo ("sz sy sx"): its written shard file must go before latvol --resume 1 rewrites it with the larger box */
-        const char *sprev = iopt(argc, argv, "--shell-prev", nullptr); FILE *redo = nullptr; size_t nredo = 0;
-        if (sprev) { FILE *pf2 = fopen(sprev, "r"); char ln[512], rp[1400]; snprintf(rp, sizeof rp, "%s.redo", slist); redo = fopen(rp, "w");
+        const ctlev *L = &X.lev[sh_lev]; const int64_t cgr[3] = {(L->shape[0] + CE - 1) / CE, (L->shape[1] + CE - 1) / CE, (L->shape[2] + CE - 1) / CE};
+        size_t u = 0;
+        for (size_t i = 0; i < sh_n; i++) { const int64_t k = sh_keys[i]; if (k >> 42 < cgr[0] && ((k >> 21) & 0x1fffff) < cgr[1] && (k & 0x1fffff) < cgr[2]) sh_keys[u++] = k; }   /* (outside the array: read as zero) */
+        qsort(sh_keys, u, sizeof *sh_keys, i64cmp); { size_t w = 0; for (size_t i = 0; i < u; i++) if (!w || sh_keys[i] != sh_keys[w - 1]) sh_keys[w++] = sh_keys[i]; u = w; }
+        const size_t unew = u;
+        /* --shell-prev OLD (a shell grown run by run): OLD's chunks are merged in; a shard OLD had that gains a chunk is named in SLIST.redo
+           ("sz sy sx"): its written shard file must go before latvol --resume 1 rewrites it with the larger set */
+        const char *sprev = iopt(argc, argv, "--shell-prev", nullptr); size_t nredo = 0;
+        if (sprev) { FILE *pf2 = fopen(sprev, "r"); char ln[512], rp[1400]; snprintf(rp, sizeof rp, "%s.redo", slist); FILE *redo = fopen(rp, "w");
             if (!pf2 || !redo) { fprintf(stderr, "ink-ext: --shell-prev %s / %s: cannot open\n", sprev, rp); return 1; }
+            int64_t *old = nullptr; size_t no = 0, oc = 0;
             while (fgets(ln, sizeof ln, pf2)) { long long v[6]; int pl, psh;
                 if (ln[0] == '#') { if (sscanf(ln, "# level %d shard %d", &pl, &psh) == 2 && (pl != sh_lev || psh != 1024)) { fprintf(stderr, "ink-ext: --shell-prev %s: level %d shard %d, this list level %d shard 1024\n", sprev, pl, psh, sh_lev); return 1; } continue; }
                 if (sscanf(ln, "%lld %lld %lld %lld %lld %lld", v, v + 1, v + 2, v + 3, v + 4, v + 5) != 6) continue;
-                int64_t lo[3], hi[3]; for (int d = 0; d < 3; d++) { lo[d] = v[d] / CE; hi[d] = (v[d] + v[3 + d]) / CE - 1; }
-                size_t b = 0; while (b < nsb && !(sb[b][0] >> 3 == lo[0] >> 3 && sb[b][1] >> 3 == lo[1] >> 3 && sb[b][2] >> 3 == lo[2] >> 3)) b++;
-                if (b == nsb) { sb = realloc(sb, (nsb + 1) * sizeof *sb); for (int d = 0; d < 3; d++) { sb[b][d] = lo[d]; sb[b][3 + d] = hi[d]; } nsb++; continue; }
-                int grew = 0; for (int d = 0; d < 3; d++) { if (sb[b][d] < lo[d]) grew = 1; if (sb[b][3 + d] > hi[d]) grew = 1; if (lo[d] < sb[b][d]) sb[b][d] = lo[d]; if (hi[d] > sb[b][3 + d]) sb[b][3 + d] = hi[d]; }
-                if (grew) { fprintf(redo, "%lld %lld %lld\n", (long long)(lo[0] >> 3), (long long)(lo[1] >> 3), (long long)(lo[2] >> 3)); nredo++; } }
-            fclose(pf2); if (fclose(redo)) { fprintf(stderr, "ink-ext: cannot write %s\n", rp); return 1; }
-            fprintf(stderr, "ink-ext: --shell-prev %s: %zu shards to rewrite (%s)\n", sprev, nredo, rp); }
-        FILE *f = fopen(slist, "w"); double vox = 0;
+                int64_t c0[3], c1[3]; for (int d = 0; d < 3; d++) { c0[d] = v[d] / CE; c1[d] = (v[d] + v[3 + d] + CE - 1) / CE; if (c1[d] > cgr[d]) c1[d] = cgr[d]; }
+                for (int64_t z = c0[0]; z < c1[0]; z++) for (int64_t y = c0[1]; y < c1[1]; y++) for (int64_t x = c0[2]; x < c1[2]; x++) {
+                    if (no == oc) { oc = oc ? 2 * oc : 4096; old = realloc(old, oc * sizeof *old); } old[no++] = ckey(z, y, x); } }
+            fclose(pf2);
+            qsort(old, no, sizeof *old, i64cmp); { size_t w = 0; for (size_t i = 0; i < no; i++) if (!w || old[i] != old[w - 1]) old[w++] = old[i]; no = w; }
+            const int64_t SM = ~(int64_t)0 ^ (7ll << 42 | 7ll << 21 | 7);   /* (a chunk key's shard: its low 3 bits per axis cleared) */
+            int64_t *osh = malloc((no ? no : 1) * sizeof *osh), *gsh = malloc((u ? u : 1) * sizeof *gsh); size_t nos = 0, ng = 0;
+            for (size_t i = 0; i < no; i++) osh[nos++] = old[i] & SM;
+            qsort(osh, nos, sizeof *osh, i64cmp); { size_t w = 0; for (size_t i = 0; i < nos; i++) if (!w || osh[i] != osh[w - 1]) osh[w++] = osh[i]; nos = w; }
+            for (size_t i = 0; i < u; i++) { const int64_t k = sh_keys[i], s3 = k & SM;
+                if (!bsearch(&k, old, no, sizeof *old, i64cmp) && bsearch(&s3, osh, nos, sizeof *osh, i64cmp)) gsh[ng++] = s3; }
+            qsort(gsh, ng, sizeof *gsh, i64cmp);
+            for (size_t i = 0; i < ng; i++) if (!i || gsh[i] != gsh[i - 1]) { fprintf(redo, "%lld %lld %lld\n", (long long)((gsh[i] >> 42) >> 3), (long long)(((gsh[i] >> 21) & 0x1fffff) >> 3), (long long)((gsh[i] & 0x1fffff) >> 3)); nredo++; }
+            if (fclose(redo)) { fprintf(stderr, "ink-ext: cannot write %s\n", rp); return 1; }
+            sh_keys = realloc(sh_keys, (u + no + 1) * sizeof *sh_keys); if (no) memcpy(sh_keys + u, old, no * sizeof *old); u += no;
+            qsort(sh_keys, u, sizeof *sh_keys, i64cmp); { size_t w = 0; for (size_t i = 0; i < u; i++) if (!w || sh_keys[i] != sh_keys[w - 1]) sh_keys[w++] = sh_keys[i]; u = w; }
+            free(old); free(osh); free(gsh);
+            fprintf(stderr, "ink-ext: --shell-prev %s: %zu chunks before, %zu after; %zu shards to rewrite (%s)\n", sprev, no, u, nredo, rp); }
+        FILE *f = fopen(slist, "w"); size_t nrun = 0;
         if (!f) { fprintf(stderr, "ink-ext: cannot write %s\n", slist); return 1; }
-        fprintf(f, "# level %d shard 1024 (ink-ext --shell-list: %zu chunks of 128^3 under %d surfaces, %s %s)\n", sh_lev, u, ns, argv[ci + 1], argv[ci + 2]);
-        for (size_t b = 0; b < nsb; b++) { int64_t o[3], n[3]; for (int d = 0; d < 3; d++) { o[d] = sb[b][d] * CE; n[d] = (sb[b][3 + d] + 1) * CE - o[d]; }
-            vox += (double)n[0] * n[1] * n[2]; fprintf(f, "%lld %lld %lld %lld %lld %lld\n", (long long)o[0], (long long)o[1], (long long)o[2], (long long)n[0], (long long)n[1], (long long)n[2]); }
+        fprintf(f, "# level %d shard 1024 (ink-ext --shell-list: %zu chunks of 128^3 under %d surfaces%s, x runs; latvol --exact 1; %s %s)\n", sh_lev, u, ns, sprev ? " + --shell-prev" : "", argv[ci + 1], argv[ci + 2]);
+        for (size_t i = 0; i < u;) {   /* (keys sorted by z, y, x: a run continues while x + 1 follows in the same row and shard) */
+            size_t j = i + 1; while (j < u && sh_keys[j] == sh_keys[j - 1] + 1 && (sh_keys[j] & 0x1fffff) % 8) j++;
+            const int64_t k = sh_keys[i];
+            fprintf(f, "%lld %lld %lld %d %d %lld\n", (long long)((k >> 42) * CE), (long long)(((k >> 21) & 0x1fffff) * CE), (long long)((k & 0x1fffff) * CE), CE, CE, (long long)((j - i) * CE));
+            nrun++; i = j; }
         if (fclose(f)) { fprintf(stderr, "ink-ext: cannot write %s\n", slist); return 1; }
-        fprintf(stderr, "ink-ext: --shell-list %s: level %d, %zu chunks (%.1f Gvox) in %zu shard boxes (%.1f Gvox to encode)\n", slist, sh_lev, u, u * (double)CE * CE * CE / 1e9, nsb, vox / 1e9);
-        free(sh_keys); free(ord); free(sb); return 0;
+        fprintf(stderr, "ink-ext: --shell-list %s: level %d, %zu chunks (%.1f Gvox; %zu from these surfaces) in %zu runs\n", slist, sh_lev, u, u * (double)CE * CE * CE / 1e9, unew, nrun);
+        free(sh_keys); return 0;
     }
     for (int l = 0; l < X.nlev; l++) if (X.lev[l].zs) {   /* --ct-shell: where the chunks came from */
         const long long a = atomic_load(&X.lev[l].nshell), b = atomic_load(&X.lev[l].nmain);
