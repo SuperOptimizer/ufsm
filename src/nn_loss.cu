@@ -1187,6 +1187,100 @@ extern "C" void nn_pgrad_apply(void *gc, void *gs, float *acc, size_t ns, const 
     else pgrad_apply_k<bf16><<<nblk(ns, 256), 256>>>((bf16 *)gc, (bf16 *)gs, acc, ns, sums, lambda * GSH);
     KCHECK();
 }
+/* ---- topology (wrap-count) loss (train --topo-lambda, topoloss 2026-11-27) ----
+   A sheet is a phase-0 crossing, so along the sheet normal the number of sheets between two points is the number of turns the phase
+   makes between them. One ray per lattice voxel (every k-th voxel on each axis, the lattice shifted by off per window) with a labelled
+   phase: the label's phase gradient (central code differences over +-s, as pgrad) is the normal, the ray takes up to len unit steps
+   each way (nearest voxels: lrint of the voxel + t n, IEEE ops so the host reference rounds alike) while its voxels stay in the slab,
+   labelled and in the mask (wm > 0: holdout / clipped voxels end a ray), and counts only with >= len steps in all. The label's turns
+   Tg = sum |wrapped code step| / 252 and the prediction's Tp = sum |angle(b conj(a))| / (2 pi) over the same steps (a, b the phasors
+   2 sigmoid(logit) - 1): the phase's total variation, so an extra sheet (an extra turn) and a phase dithering across 0 (extra
+   0-crossings, no net turn) both raise Tp, a missed sheet lowers it. Loss per ray huber(Tp - Tg) (delta 1 turn), weighted by the
+   centre's mask weight, mean over the rays. The angle carries no confidence (a blurred phasor is not cheaper); its gradient is
+   tangential, 1 / |a|, with |a|^2 floored at 0.05 (r 0.22; below it the gradient of a damped surrogate).
+   sums (device doubles, pgrad's layout so nn_pgrad_apply scales by sums[1]): [0] sum w loss, [1] sum w, [2] sum w over the rays off by
+   more than half a turn (a count error), [3] sum w (Tp - Tg). lc = ls = nullptr: [1] only (the training stats pass, no logits read);
+   acc (2 x slab floats, nullptr: statistics only): the logit gradient of sum w loss (float atomics: not bit-deterministic). ---- */
+typedef struct { int len, k, zl0, yl0, xl0, nzl, nyl, nxl; } topo_cfg;
+__device__ __forceinline__ long topo_at(int z, int y, int x, const float *n, int t, int z0, int z1, int H, int W) {
+    const int zz = (int)lrintf(__fadd_rn((float)z, __fmul_rn((float)t, n[0]))), yy = (int)lrintf(__fadd_rn((float)y, __fmul_rn((float)t, n[1]))),
+              xx = (int)lrintf(__fadd_rn((float)x, __fmul_rn((float)t, n[2])));
+    if (zz < z0 || zz >= z1 || yy < 0 || yy >= H || xx < 0 || xx >= W) return -1;
+    return ((long)(zz - z0) * H + yy) * W + xx;
+}
+template <typename LT> __global__ void topo_k(const LT *lc, const LT *ls, const uint8_t *ph, const uint8_t *wm, int D, int H, int W, int z0, int z1,
+                                              int s, topo_cfg c, double *sums, float *acc) {
+    const size_t HW = (size_t)H * W, ns = (size_t)(z1 - z0) * HW, nr = (size_t)c.nzl * c.nyl * c.nxl;
+    const uint8_t *const sp = ph + (size_t)z0 * HW;   /* (the slab's codes, by local index) */
+    const size_t r = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    float sl = 0.f, sw = 0.f, se = 0.f, sd = 0.f;
+    if (r < nr) do {
+        const int z = c.zl0 + c.k * (int)(r / ((size_t)c.nyl * c.nxl)), y = c.yl0 + c.k * (int)(r / c.nxl % c.nyl), x = c.xl0 + c.k * (int)(r % c.nxl);
+        const size_t li = (size_t)(z - z0) * HW + (size_t)y * W + x;
+        const float w = wm[li]; if (w <= 0.f || sp[li] >= 252) break;
+        if (z < s || z >= D - s || y < s || y >= H - s || x < s || x >= W - s) break;
+        const size_t gi = (size_t)z0 * HW + li, sz = (size_t)s * HW, sy = (size_t)s * W;
+        const int a6[6] = {ph[gi + sz], ph[gi - sz], ph[gi + sy], ph[gi - sy], ph[gi + s], ph[gi - s]};
+        int ok = 1; for (int q = 0; q < 6; q++) ok &= a6[q] < 252; if (!ok) break;
+        const int i0 = cnt_pdiff(a6[0], a6[1]), i1 = cnt_pdiff(a6[2], a6[3]), i2 = cnt_pdiff(a6[4], a6[5]);
+        if (!i0 && !i1 && !i2) break;
+        const float gn = __fsqrt_rn((float)(i0 * i0 + i1 * i1 + i2 * i2)), n[3] = {__fdiv_rn((float)i0, gn), __fdiv_rn((float)i1, gn), __fdiv_rn((float)i2, gn)};
+        int nb = 0, nf = 0;
+        for (int t = 1; t <= c.len; t++) { const long q = topo_at(z, y, x, n, -t, z0, z1, H, W); if (q < 0 || !wm[q] || sp[q] >= 252) break; nb = t; }
+        for (int t = 1; t <= c.len; t++) { const long q = topo_at(z, y, x, n, t, z0, z1, H, W); if (q < 0 || !wm[q] || sp[q] >= 252) break; nf = t; }
+        if (nb + nf < c.len) break;
+        int tg = 0, pv = sp[topo_at(z, y, x, n, -nb, z0, z1, H, W)];
+        for (int t = -nb + 1; t <= nf; t++) { const int v = sp[topo_at(z, y, x, n, t, z0, z1, H, W)]; tg += abs(cnt_pdiff(v, pv)); pv = v; }
+        sw += w;
+        if (!lc) break;
+        const float Tg = (float)tg * (1.f / 252.f);
+        float Tp = 0.f, ar, ai;
+        { const long q = topo_at(z, y, x, n, -nb, z0, z1, H, W); ar = 2.f / (1.f + __expf(-lgv(lc, q))) - 1.f; ai = 2.f / (1.f + __expf(-lgv(ls, q))) - 1.f; }
+        for (int t = -nb + 1; t <= nf; t++) {
+            const long q = topo_at(z, y, x, n, t, z0, z1, H, W);
+            const float br = 2.f / (1.f + __expf(-lgv(lc, q))) - 1.f, bi = 2.f / (1.f + __expf(-lgv(ls, q))) - 1.f;
+            Tp += fabsf(atan2f(ar * bi - ai * br, ar * br + ai * bi)); ar = br; ai = bi;
+        }
+        Tp *= 0.15915494309189535f;
+        const float dT = Tp - Tg, ad = fabsf(dT);
+        sl += w * (ad <= 1.f ? 0.5f * dT * dT : ad - 0.5f); se += ad > 0.5f ? w : 0.f; sd += w * dT;
+        if (!acc) break;
+        const float cf = w * fminf(fmaxf(dT, -1.f), 1.f) * 0.15915494309189535f;   /* d loss / d |angle step| */
+        /* per sample: its two steps' angle gradients (as the step's b, then as its a), one atomic per channel */
+        float pr = 0.f, pi_ = 0.f, qr, qi, qsc, qss, mr = 0.f, mi = 0.f, msc = 0.f, mss = 0.f;
+        long lq = topo_at(z, y, x, n, -nb, z0, z1, H, W);
+        qsc = 1.f / (1.f + __expf(-lgv(lc, lq))); qss = 1.f / (1.f + __expf(-lgv(ls, lq))); qr = 2.f * qsc - 1.f; qi = 2.f * qss - 1.f;
+        for (int t = -nb; t <= nf; t++) {
+            long lm = -1;
+            if (t < nf) { lm = topo_at(z, y, x, n, t + 1, z0, z1, H, W); msc = 1.f / (1.f + __expf(-lgv(lc, lm))); mss = 1.f / (1.f + __expf(-lgv(ls, lm))); mr = 2.f * msc - 1.f; mi = 2.f * mss - 1.f; }
+            const float e = fmaxf(qr * qr + qi * qi, 0.05f);
+            float gr = 0.f, gi_ = 0.f;
+            if (t > -nb) { const float cr = pr * qi - pi_ * qr, sg = (float)((cr > 0.f) - (cr < 0.f)); gr -= sg * qi / e; gi_ += sg * qr / e; }   /* d angle(q conj(p)) / dq = (-q_i, q_r) / |q|^2 */
+            if (t < nf) { const float cr = qr * mi - qi * mr, sg = (float)((cr > 0.f) - (cr < 0.f)); gr += sg * qi / e; gi_ -= sg * qr / e; }    /* d angle(m conj(q)) / dq = (q_i, -q_r) / |q|^2 */
+            if (gr != 0.f || gi_ != 0.f) { atomicAdd(&acc[lq], cf * gr * 2.f * qsc * (1.f - qsc)); atomicAdd(&acc[ns + lq], cf * gi_ * 2.f * qss * (1.f - qss)); }
+            pr = qr; pi_ = qi; qr = mr; qi = mi; qsc = msc; qss = mss; lq = lm;
+        }
+    } while (0);
+    for (int o = 16; o; o >>= 1) { sl += __shfl_down_sync(0xffffffffu, sl, o); sw += __shfl_down_sync(0xffffffffu, sw, o); se += __shfl_down_sync(0xffffffffu, se, o); sd += __shfl_down_sync(0xffffffffu, sd, o); }
+    __shared__ float sh[4][32];
+    if ((threadIdx.x & 31) == 0) { sh[0][threadIdx.x >> 5] = sl; sh[1][threadIdx.x >> 5] = sw; sh[2][threadIdx.x >> 5] = se; sh[3][threadIdx.x >> 5] = sd; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double a[4] = {0, 0, 0, 0}; for (int k = 0; k < (int)(blockDim.x >> 5); k++) for (int j = 0; j < 4; j++) a[j] += sh[j][k];
+        if (a[1] > 0) for (int j = 0; j < 4; j++) atomicAdd(&sums[j], a[j]);
+    }
+}
+extern "C" void nn_topo_slab(const void *lc, const void *ls, const uint8_t *phase, const uint8_t *wm, int d, int h, int w, int z0, int z1, int s, int len, int k,
+                             unsigned off, double *sums, float *acc) {
+    if (k < 1) k = 1;
+    const int oz = (int)(off % (unsigned)k), oy = (int)(off / (unsigned)k % (unsigned)k), ox = (int)(off / (unsigned)k / (unsigned)k % (unsigned)k);
+    topo_cfg c = {len, k, z0 + (k - (z0 + oz) % k) % k, (k - oy) % k, (k - ox) % k, 0, 0, 0};
+    c.nzl = c.zl0 < z1 ? (z1 - 1 - c.zl0) / k + 1 : 0; c.nyl = c.yl0 < h ? (h - 1 - c.yl0) / k + 1 : 0; c.nxl = c.xl0 < w ? (w - 1 - c.xl0) / k + 1 : 0;
+    const size_t nr = (size_t)c.nzl * c.nyl * c.nxl; if (!nr) return;
+    if (g_logits_h16) topo_k<f16><<<nblk(nr, 256), 256>>>((const f16 *)lc, (const f16 *)ls, phase, wm, d, h, w, z0, z1, s, c, sums, acc);
+    else topo_k<float><<<nblk(nr, 256), 256>>>((const float *)lc, (const float *)ls, phase, wm, d, h, w, z0, z1, s, c, sums, acc);
+    KCHECK();
+}
 /* ---- train --fib-normal-lambda: the normal head orthogonal to fibres ----
    A fibre lies in its sheet, so at fibre voxels the predicted sign-free normal dyad N should have t^T N t = (n . t)^2 = 0 for the fibre
    tangent t. N from the six normal logits as nn_unwrap_targets2 codes it: p_c = sigmoid(logit_c), N_zz = p0, N_yy = p1, N_xx = p2,

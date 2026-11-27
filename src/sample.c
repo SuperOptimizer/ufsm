@@ -23,6 +23,7 @@ _Static_assert(PHASE_PERIOD == 252, "draw_ counts known phase as (b & 0xfc) != 0
 #include "view.h"
 #include "scrollaug.h"
 #include "sample_emb.h"
+#include "sample_cond.h"
 #include "nn_latvol.h"
 /* (latvol_read.c: weak, so binaries without it link; --lat-direct-p then draws no direct window) */
 [[gnu::weak]] int lv_read_box(z3 *z, const int64_t o[3], const int64_t n[3], uint8_t *buf, size_t cap, lv_chunk_ref *refs, int maxref, size_t *bytes, int nthreads);
@@ -249,8 +250,10 @@ struct sampler {
     unsigned char (*lvl_ok)[2][MAXLEV];   /* per source: cached level availability (0 unknown, 1 no, 2 yes) */   /* per-stage nanoseconds (env UFSM_SAMPLER_PROF): read, targets, dilate, soft, trust, encode, zscore, augment, x16, other */
     int prof;
     double *cum;   /* cumulative source weights */
-    struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; uint32_t *pidx; size_t pn; } *occ;   /* per source: coarse label cells containing papyrus (guides the
-        position draw); pidx / pn: an onfly ink source's cells with positive labels (the stratified draw) */
+    struct { uint32_t *idx; size_t n; int lev; int64_t shape[3]; uint32_t *pidx; size_t pn; uint32_t *hidx; size_t hn; float hfrac; uint32_t *hset; size_t hsn; } *occ;   /* per source: coarse label cells
+        containing papyrus (guides the position draw); pidx / pn: an onfly ink source's cells with positive labels (the stratified draw); hidx / hn: its "hard" cells
+        (repeated by weight), drawn with probability hfrac (hard_index); hset / hsn: the hard cells sorted, unique (is a window's cell hard) */
+    _Atomic uint64_t hard_n[64][3];   /* per source (< 64): windows kept from a hard-cell draw / all kept windows / kept windows whose cell is hard by either draw (sampler_hard_stats) */
     uint8_t *c255;   /* --plane bank (cfg.plane_bank): one window plane of 255 (pinned like the slots) that every all-unknown label role of every slot points at */
     pthread_t sn_th[16]; int sn_nth; void *sn_q;   /* --scan-norm: the statistics' prefetch threads (sn_pre) */
     /* the plane bank's shared spares (2026-11-14): each slot owns bank_own planes; a window whose source fills more (fibre H + V, a phase
@@ -416,11 +419,12 @@ static batch alloc_batch(const sample_cfg *c, uint8_t *c255, int bank_own) {   /
         || (c->w4_runs && !b.w4r) || (c->ink_bits && !b.ink_it) || (c->ink_mil && (!b.mil || !b.nmil || !b.mil0 || !b.nmil0))) {
         fprintf(stderr, "sampler: out of host memory (batch slot records)\n"); abort(); }   /* (audit mini/alloc #8) */
 #undef RHALLOC
+    b.cnd = c->cnd_div ? halloc((size_t)c->B * COND_K * (size_t)(PZ(c) / c->cnd_div) * (c->P / c->cnd_div) * (c->P / c->cnd_div)) : nullptr;
     b.emb = c->emb_ch ? halloc((size_t)c->B * c->emb_ch * (size_t)(PZ(c) / c->emb_div) * (c->P / c->emb_div) * (c->P / c->emb_div)) : nullptr;
     return b;
 }
 
-static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->auxc) hfree(b->auxc); if (b->emb) hfree(b->emb); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
+static void free_batch(batch *b, int B) { free(b->latd); free(b->lvc); free(b->lvr); free(b->nlvr); free(b->lvn); free(b->lvz); if (b->nbank) { b->side = b->w4 = b->wcomp = b->ink = nullptr; for (int j = 0; j < 4; j++) b->aux[j] = nullptr; for (int q = 0; q < b->nbank; q++) hfree(b->bank[q]); b->nbank = 0; } if (b->mil) { for (int q = 0; q < B; q++) { free(b->mil[q]); free(b->mil0[q]); } free(b->mil); free(b->nmil); free(b->mil0); free(b->nmil0); } if (b->w4r) { for (int q = 0; q < B; q++) { w4runs *r = (w4runs *)b->w4r + q; free(r->off); free(r->ro); free(r->cb); } free(b->w4r); } if (b->ink) hfree(b->ink); for (int j = 0; j < 4; j++) if (b->aux[j]) hfree(b->aux[j]); if (b->inkb) hfree(b->inkb); free(b->ink_it); if (b->ct8) hfree(b->ct8); if (b->aug) hfree(b->aug); if (b->auxc) hfree(b->auxc); if (b->emb) hfree(b->emb); if (b->cnd) hfree(b->cnd); if (b->xv) hfree(b->xv); free(b->vok); free(b->chid); free(b->chidx); free(b->choff); if (b->w4) hfree(b->w4); if (b->wcomp) hfree(b->wcomp); if (b->tm) hfree(b->tm); if (b->rad) hfree(b->rad); if (b->axr) hfree(b->axr); if (b->pap) hfree(b->pap); if (b->wind) hfree(b->wind); if (b->band) hfree(b->band); if (b->side) hfree(b->side); if (b->pm) hfree(b->pm); if (b->x) hfree(b->x); if (b->x16) hfree(b->x16); if (b->t) hfree(b->t); if (b->m) hfree(b->m); hfree(b->w); free(b->src); free(b->level); free(b->um); free(b->corner); if (b->sheet) { sheet_batch_free(b->sheet[0]); free(b->sheet); } }
 
 /* Level choice for a source: restrict cfg.level_p to levels the CT has and every target of the source
    can provide (pyramid: same level; regions: levels 0..1). Returns -1 if nothing is usable. */
@@ -2832,7 +2836,7 @@ static void *sn_pre_thread(void *a) {
     for (int k; (k = atomic_fetch_add(&q->next, 1)) < q->nj;) scan_norm_of(&q->sp->S->src[q->jobs[k][0]], q->jobs[k][1], &c, &s);
     return nullptr;
 }
-static _Thread_local int g_stick_si = -1, g_stick_n, g_last_si = -1;   /* --stick-src: the source of the last draw / the one to redraw from */
+static _Thread_local int g_stick_si = -1, g_stick_n, g_last_si = -1, g_last_hard, g_last_onhard;   /* (g_last_hard: this draw took a hard-cell draw; g_last_onhard: its cell is hard) */   /* --stick-src: the source of the last draw / the one to redraw from */
 static int draw(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttmp, uint8_t *big, uint64_t tile_index, float *noise_state, chain_st *cs) {
     const int rc = draw_(sp, b, i, r, xtmp, ttmp, big, tile_index, noise_state, cs);
     if (sp->cfg.stick > 0) {   /* a rejection redraws from the same source (<= N in a row, then the global mix again: a source that never yields cannot starve the others) */
@@ -2867,7 +2871,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
     else if (cont) si = cs->si;
     else if (g_stick_si >= 0 && sp->cfg.stick > 0 && !cont) { si = g_stick_si; g_stick_si = -1; }
     else while (si < sp->S->n - 1 && sp->cum[si] < u) si++;
-    g_last_si = si;
+    g_last_si = si; g_last_hard = g_last_onhard = 0;
     source *s = &sp->S->src[si];
     if (c->holdout && !s->hold_n[0]) return 1;
     source_set_val_read(c->holdout != 0);   /* (the validation sampler reads the onfly ink targets without the holdout exclusions) */
@@ -2912,9 +2916,13 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         for (int d = 0; d < 3; d++) o[d] = lo[d] + rint_below(r, hi[d] - lo[d] + 1);
     } else if (sp->occ[si].n) {   /* draw around a random coarse cell that contains papyrus */
         uint32_t id;
-        if (sp->occ[si].pn && c->ink_pos_frac >= 0 && runif(r) < c->ink_pos_frac) {   /* the stratified ink draw: around a positive-label cell */
+        if (sp->occ[si].hn && runif(r) < sp->occ[si].hfrac) {   /* a hard-spot draw ("hard"; no rng drawn for a source without hard cells: byte-identical draws) */
+            size_t k = (size_t)(runif(r) * (double)sp->occ[si].hn); if (k >= sp->occ[si].hn) k = sp->occ[si].hn - 1; id = sp->occ[si].hidx[k]; g_last_hard = 1;
+        } else if (sp->occ[si].pn && c->ink_pos_frac >= 0 && runif(r) < c->ink_pos_frac) {   /* the stratified ink draw: around a positive-label cell */
             size_t k = (size_t)(runif(r) * (double)sp->occ[si].pn); if (k >= sp->occ[si].pn) k = sp->occ[si].pn - 1; id = sp->occ[si].pidx[k];
         } else { size_t k = (size_t)(runif(r) * (double)sp->occ[si].n); if (k >= sp->occ[si].n) k = sp->occ[si].n - 1; id = sp->occ[si].idx[k]; }
+        if (sp->occ[si].hsn) { size_t a = 0, e = sp->occ[si].hsn; while (a < e) { const size_t m = (a + e) / 2; if (sp->occ[si].hset[m] < id) a = m + 1; else e = m; }
+                               g_last_onhard = a < sp->occ[si].hsn && sp->occ[si].hset[a] == id; }
         int64_t cz = id / (sp->occ[si].shape[1] * sp->occ[si].shape[2]), cy = (id / sp->occ[si].shape[2]) % sp->occ[si].shape[1], cx = id % sp->occ[si].shape[2];
         int64_t cc[3] = {cz, cy, cx};
         int dl = sp->occ[si].lev - l;    /* coarse cell -> level-l voxels */
@@ -3711,6 +3719,13 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         else if (embp2) { size_t kept = 0; const size_t cl = sample_emb_papyrus(c->emb_ch, c->emb_div, Pz, P, y.perm, y.flip, &spatial, embp2, c->emb_pap, eo, &kept);
             atomic_fetch_add(&g_emb_pap_cleared, cl); atomic_fetch_add(&g_emb_pap_kept, kept); }
     }
+    if (c->cnd_div) {   /* train --cond-fields: the conditioning planes through the same symmetry and warp; dropped windows keep none */
+        const size_t gc = (size_t)(Pz / c->cnd_div) * (P / c->cnd_div) * (P / c->cnd_div);
+        int8_t *co = b->cnd + (size_t)i * COND_K * gc;
+        const int drop = runif(r) < c->cnd_drop;
+        if (drop || crushed || torn || delam || curved) memset(co, 0, gc * COND_K);
+        else if (sample_cond_window(s, c->cnd_div, l, o, Pz, P, y.perm, y.flip, &spatial, co)) return -1;
+    }
     if (embp2) tp_put(embp2, p3 / 8);
     PROF_MARK(PS_AUGMENT);
     const size_t xc = c->gpu_input ? 1 : 4 + (c->aux != 0);
@@ -3866,6 +3881,7 @@ static int draw_(sampler *sp, batch *b, int i, rng *r, float *xtmp, uint8_t *ttm
         b->chid[i] = cs->id; b->chidx[i] = cs->idx; memcpy(b->choff + 3 * i, off, sizeof off);
     }
     atomic_fetch_add(&sp->produced, 1); SL_ADD(SL_PROD);
+    if (si < 64) { atomic_fetch_add(&sp->hard_n[si][1], 1); if (g_last_hard) atomic_fetch_add(&sp->hard_n[si][0], 1); if (g_last_onhard) atomic_fetch_add(&sp->hard_n[si][2], 1); }
     return 0;
 }
 
@@ -4722,6 +4738,43 @@ static void edge_zboost_index(sampler *sp, const source *fs, occ_index *o) {
         free(o->idx); o->idx = ix; o->n = nn; }
     free(rep);
 }
+/* "hard" (hardspot 2026-11-27, villa's hard_fraction): the source's draw cells whose centre lies in a hard cell of its map (ufsm hard-map; cells of
+   2^hard_lev level-0 voxels of a scan of hard_um: the same scan, a power-of-two voxel size apart), each repeated (w + 31) / 32 = 1..8 times by the
+   map's weight; cells in a held-out box are dropped. The position draw takes a cell from this list with probability hfrac (cfg hard_frac > 0
+   overrides the json "frac", < 0 is off), from the usual index otherwise. Built from the unique cells before edge-boost / zboost / focus.
+   0 ok (possibly no hard cells), -1 the map does not fit the source (fatal). */
+static int cmp_u32(const void *a, const void *b) { const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return (x > y) - (x < y); }
+static int hard_index(sampler *sp, int si, const source *fs, const occ_index *o) {
+    sp->occ[si].hidx = nullptr; sp->occ[si].hn = 0; sp->occ[si].hfrac = 0; sp->occ[si].hset = nullptr; sp->occ[si].hsn = 0;
+    if (!fs->hard || !o->n || sp->cfg.holdout) return 0;   /* (validation draws inside the held-out boxes only) */
+    const float fr = sp->cfg.hard_frac > 0 ? sp->cfg.hard_frac : sp->cfg.hard_frac < 0 ? 0.f : fs->hard_frac;
+    if (!(fr > 0)) { fprintf(stderr, "sampler: %s: hard map loaded, frac %g: no hard draws\n", fs->name, (double)fr); return 0; }
+    const double ratio = fs->um / fs->hard_um, lr = log2(ratio), k2 = round(lr);   /* source level-0 voxel -> hard-frame level-0 voxels */
+    if (!(fabs(lr - k2) < 0.015)) { fprintf(stderr, "sampler: %s: the hard map's um %g is not the source's %g times a power of two (a different scan?)\n", fs->name, fs->hard_um, fs->um); return -1; }
+    const double cs = ldexp(1.0, o->lev), hs = ldexp(1.0, fs->hard_lev);
+    size_t nn = 0, nh = 0, nhold = 0; uint8_t *rep = malloc(o->n); if (!rep) return -1;
+    for (size_t k = 0; k < o->n; k++) {
+        const uint32_t id = o->idx[k]; const int64_t c[3] = {id / (o->shape[1] * o->shape[2]), (id / o->shape[2]) % o->shape[1], id % o->shape[2]};
+        int64_t v0[3], h[3]; int in = 1;
+        for (int d = 0; d < 3; d++) { v0[d] = (int64_t)((c[d] + 0.5) * cs); h[d] = (int64_t)floor((c[d] + 0.5) * cs * ratio / hs); in &= h[d] >= 0 && h[d] < fs->hard_grid[d]; }
+        const uint8_t w = in ? fs->hard[((size_t)h[0] * fs->hard_grid[1] + h[1]) * fs->hard_grid[2] + h[2]] : 0;
+        rep[k] = 0; if (!w) continue;
+        if (hits_holdout_span(sp, fs, v0, 0, 0, 1)) { nhold++; continue; }
+        rep[k] = (uint8_t)((w + 31) / 32); nn += rep[k]; nh++;
+    }
+    if (nn) {
+        uint32_t *ix = malloc(nn * sizeof *ix); if (!ix) { free(rep); return -1; }
+        size_t q = 0; for (size_t k = 0; k < o->n; k++) for (int t = 0; t < rep[k]; t++) ix[q++] = o->idx[k];
+        sp->occ[si].hidx = ix; sp->occ[si].hn = nn; sp->occ[si].hfrac = fr;
+        uint32_t *hs = malloc(nh * sizeof *hs); size_t u = 0;   /* (sorted: the occupancy index is not) */
+        if (hs) { for (size_t k = 0; k < o->n; k++) if (rep[k]) hs[u++] = o->idx[k]; qsort(hs, u, sizeof *hs, cmp_u32); sp->occ[si].hset = hs; sp->occ[si].hsn = u; }
+        fprintf(stderr, "sampler: %s: hard map: %zu of %zu draw cells hard (%.3f; %zu entries, x%.2f by weight), %zu in held-out boxes dropped; %.3f of the draws from them\n",
+                fs->name, nh, o->n, (double)nh / (double)o->n, nn, (double)nn / (double)nh, nhold, (double)fr);
+    } else UFSM_DEFAULTED("sampler: %s: hard draws = 0 (the hard map marks none of its %zu draw cells; %zu in held-out boxes)", fs->name, o->n, nhold);
+    free(rep);
+    return 0;
+}
+void sampler_hard_stats(const sampler *sp, int si, uint64_t out[3]) { out[0] = out[1] = out[2] = 0; if (sp && si >= 0 && si < 64) for (int k = 0; k < 3; k++) out[k] = atomic_load(&sp->hard_n[si][k]); }
 sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     if (rskip_selftest()) { fprintf(stderr, "sampler: rng jump-ahead self-test failed\n"); return nullptr; }
     if (cfg->echo_max > 0 && cfg->replay > 1) { fprintf(stderr, "sampler: --echo-max and --replay K > 1 exclude each other\n"); return nullptr; }
@@ -4921,6 +4974,7 @@ sampler *sampler_start(sources *S, const sample_cfg *cfg) {
     for (int i = 0; !cfg->cover && cfg->restore != 2 && i < S->n; i++) {
         occ_index o = pre ? pre[i] : source_occupancy(&S->src[i]);
         const source *fs = &S->src[i];
+        if (hard_index(sp, i, fs, &o)) return nullptr;
         if (o.n) edge_zboost_index(sp, fs, &o);
         if (o.n && fs->focus && (cfg->focus_w > 0 || fs->focus_w > 0)) {   /* "focus": cell k drawn 1 + w x packed share times as often (repeated in the index) */
             if (fs->focus_grid[0] != o.shape[0] || fs->focus_grid[1] != o.shape[1] || fs->focus_grid[2] != o.shape[2])
@@ -5168,7 +5222,7 @@ void sampler_stop(sampler *sp) {
     for (int t = 0; t < sp->sn_nth; t++) pthread_join(sp->sn_th[t], nullptr);
     if (sp->sn_q) { free(((sn_pre *)sp->sn_q)->jobs); free(sp->sn_q); }
     free(sp->rleft); free(sp->rq); free(sp->rdue); free(sp->rseq);
-    for (int i = 0; i < sp->S->n; i++) { free(sp->occ[i].idx); free(sp->occ[i].pidx); }
+    for (int i = 0; i < sp->S->n; i++) { free(sp->occ[i].idx); free(sp->occ[i].pidx); free(sp->occ[i].hidx); free(sp->occ[i].hset); }
     free(sp->occ); free(sp->slot_j); free(sp->slots); free(sp->state); free(sp->th); free(sp->cum); free(sp->lvl_ok);
     free(sp);
 }
