@@ -197,7 +197,7 @@ int pq_find_leaf(const pq_file *f, const char *top) { for (int i = 0; i < f->nle
 const pq_chunkmeta *pq_chunk(const pq_file *f, int rg, int leaf) { return &f->chunk[(size_t)rg * f->nleaf + leaf]; }
 const char *pq_created_by(const pq_file *f) { return f->created_by; }
 const char *pq_codec_name(int c) {
-    static const char *n[] = {"UNCOMPRESSED", "SNAPPY", "GZIP", "LZO", "BROTLI", "LZ4", "ZSTD", "LZ4_RAW"};
+    static const char *const n[] = {"UNCOMPRESSED", "SNAPPY", "GZIP", "LZO", "BROTLI", "LZ4", "ZSTD", "LZ4_RAW"};
     return c >= 0 && c < 8 ? n[c] : "?";
 }
 

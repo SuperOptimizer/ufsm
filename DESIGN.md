@@ -6,6 +6,133 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## ATLAS-15k as extra labels: import, inventory, CPU quality audit; 58 % of its area passes a gate (2026-11-27, branch atlas-20261127, atlas)
+
+**Dataset.** huggingface.co/datasets/Qualzz20/ATLAS-15k (rev ac4b982a, CC BY-NC 4.0): 14,678 recto patches on 28 scrolls, 2,306 cm².
+- Each patch is an x / y / z float32 node grid at a 2-voxel spacing, -1 = no node. The mean grid is 221 x 221 nodes (~440 voxels).
+- The patches sit on the public 8.64 / 9.362 / 9.366 um level-0 scans.
+- 18 Parquet files, 8,608,185,540 bytes, at /vesuvius/ufsm/atlas/raw. Download and import were each ~7 min.
+- None is on PHerc1667, Paris 4 or 0500P2. The related upstream model (atlas-mini-h) is not used.
+
+**Import.** `ufsm atlas-import OUT FILE.parquet...` writes OUT/<scroll>/<id>.tifxyz and OUT/index.tsv. The tifxyz layout is the one
+the `meshes` onfly sources read. The meta records scale 1/2, voxel_size_um, scroll, scan (the .zarr name), scan_url, atlas_id and
+license. The reader is a minimal C Parquet reader (src/parquet.c):
+- the Thrift-compact footer;
+- v1 and v2 data pages and dictionary pages;
+- snappy, gzip and zstd;
+- PLAIN and RLE_DICTIONARY encodings, and Dremel levels for nested lists.
+
+The files are pyarrow 20, one row group each, snappy, PLAIN floats. test_atlas writes such a file in C, covering every path the reader
+claims. Checks on the full set:
+
+| check | result |
+|---|---|
+| rows written | 14,678 / 14,678 |
+| nodes with -1 on one axis only | 0 |
+| the dataset's box_min / box_max_xyz equal the nodes' floor / ceil bbox (within 1 voxel) | 14,678 / 14,678 |
+| our quad area vs its area_cm2 | 2,297.8 vs 2,305.7 cm², max per-patch difference 0.056 cm² |
+
+Output: /vesuvius/ufsm/atlas/surf, 5.6 GB.
+
+**Audit.** `ufsm atlas-audit INDEX --ref DIR... [--value q.tif] [--holdouts H]...` is CPU only.
+- Each ATLAS node is matched to the nearest reference vertex within 20 voxels.
+- We measure its tangent-plane distance and the reference's sheet label: the GT q (one gauge per set), or our wrap id.
+- Grid neighbours on the sheet (≤ 4 voxels) whose labels differ by ≥ 0.5 are switch edges.
+- "big" is the largest sheet's share of the patch's on-sheet nodes. Components are joined across gaps when their labels agree.
+- Holdout boxes are matched by CT basename with a 16-voxel guard.
+- Whole-scroll wrap sets keep only vertices near patch nodes. Without that filter, 1203's set OOMed at 16 GB; with it, 54.6 M vertices.
+- `--tile T` splits a long surface into patch-sized calibration rows.
+
+`wrap-align` (share of mesh normals within 0.9 cos of the CT lamination, level 0, every 4th node) ran on every patch.
+Kit: /vesuvius/ufsm/atlas/{import,audit,align,table}.sh. Tables are in audit/.
+
+**Calibration** (what each reference can measure):
+
+| surface | reference | p50 plane dist (vox) | tiles single-sheet (big ≥ 0.95) | big |
+|---|---|---|---|---|
+| ATLAS, 812 patches on 1203 | our -p wraps (try9 era) | 2.04 (median) | 6.6 % | median 0.61 |
+| HercUeNet's approved VC3D sheet on 1203, cut into 41 ATLAS-sized tiles | our -p wraps | 3.2 (mean) | 7.3 % | mean 0.59 |
+| ATLAS, 435 patches on 0139 covered by GT | GT qA / qB | 1.65 (median) | 70 % | median 0.995 |
+
+- **Our wraps cannot judge sheet identity.** A human-approved single sheet "switches" our wraps exactly as often as ATLAS does: at
+  ~440 voxels our level sets cross sheets. On the pod-era wraps of 21 other scrolls ATLAS shows the same pattern (single-sheet
+  0-6 %). So off GT the audit gives only the distance: is the patch on a sheet our fit sees.
+- **CT alignment.** ATLAS aligns better than our own meshes on every scroll checked:
+
+  | scroll | ATLAS mean | our wraps (3 each) | GT meshes |
+  |---|---|---|---|
+  | 0125 | 0.59 | 0.41-0.50 | |
+  | 0175A | 0.85 | 0.37-0.75 | |
+  | 0009B | 0.64 | 0.50-0.57 | |
+  | 1203 | 0.78 | 0.13-0.65 | |
+  | 0139 | 0.92 | | 0.88 (21 meshes with samples) |
+
+  The low scrolls are low for our meshes too, so a gate at 0.8 would reject low-contrast scans, not bad patches. The gate uses 0.6.
+- GT itself is noisy: 0139 boxes 1-4 / 6-8 and all 0814 boxes are wbench label-noise (ceiling < 0.8). The 0139 "multi-sheet 28 %" is
+  therefore an upper bound on ATLAS switches. On 0814 only 17 patches touch GT, at p50 7.0 voxels: 0814's GT is not usable as a judge.
+
+**Per scroll.** Columns:
+- held: patches touching a holdout box (holdouts-w24 ∪ holdouts-J1);
+- dist p50 / le4: vs GT on 0139 / 0814, vs our wraps elsewhere; le4 is the share of matched nodes ≤ 4 voxels;
+- pass: the gate (no holdout box, le4 ≥ 0.7, align ≥ 0.6, plus p50 ≤ 2 and big ≥ 0.95 where GT covers the patch).
+
+CT is local at level 0 (/vesuvius/ufsm/v2/ct) for all 28 scans, and on ~/nas2/volcomp levels 0-5.
+
+| scroll | um | patches | cm² | held | ours already on the scroll | ref | p50 / le4 | align ≥ 0.6 | pass | pass cm² |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0800 | 8.64 | 2022 | 301.3 | 0 | none | wraps | 2.03 / 0.84 | 0.92 | 1728 | 260.2 |
+| 1447 | 8.64 | 1477 | 218.5 | 35 | fib; ink holdout | wraps | 1.80 / 0.86 | 0.98 | 1312 | 194.5 |
+| 0139 | 9.362 | 1178 | 200.5 | 452 | GT qA/qB, good, u2ink/hf (2.4 twin) | GT (435) | 2.70 / 0.76 | 1.00 | 164 | 28.5 |
+| 0175A | 8.64 | 1323 | 192.5 | 0 | good, fib | wraps | 2.15 / 0.81 | 1.00 | 1139 | 166.8 |
+| 0125 | 9.362 | 1038 | 174.0 | 246 | fib | wraps | 2.33 / 0.80 | 0.49 | 326 | 54.7 |
+| 0306B | 8.64 | 1131 | 163.6 | 0 | none | wraps | 2.12 / 0.81 | 0.92 | 888 | 129.2 |
+| 1203 | 9.362 | 812 | 135.3 | 0 | our unroll only (prize scroll: local only) | -p wraps | 2.09 / 0.82 | 0.94 | 689 | 114.9 |
+| 1545 | 9.362 | 685 | 112.1 | 0 | none | wraps | 2.26 / 0.80 | 0.79 | 447 | 73.7 |
+| 1218 | 8.64 | 739 | 104.9 | 0 | b3 (weight 0) | none | - | 0.78 | 0 | 0 |
+| 0826 | 9.362 | 618 | 103.3 | 0 | none | wraps | 2.48 / 0.75 | 0.98 | 402 | 67.5 |
+| 0814 | 9.362 | 614 | 102.0 | 28 | GT qs (w24), u2ink (2.4) | GT (17) | 7.00 / 0.48 | 0.99 | 4 | 0.6 |
+| 0813 | 9.362 | 580 | 96.1 | 0 | none | wraps | 2.73 / 0.70 | 0.99 | 294 | 48.6 |
+| 0846A | 9.362 | 581 | 95.7 | 0 | none | wraps | 2.50 / 0.77 | 0.60 | 255 | 41.7 |
+| 0841 | 9.366 | 541 | 89.0 | 0 | u2ink (2.4); ink holdout | wraps | 2.19 / 0.80 | 1.00 | 472 | 77.6 |
+| 0846B | 9.362 | 504 | 83.4 | 0 | none | none | - | 0.60 | 0 | 0 |
+| 0009B | 8.64 | 189 | 27.5 | 0 | good, u2ink (2.4) | wraps | 2.76 / 0.72 | 0.59 | 84 | 12.4 |
+| 12 small scrolls (0175B 0191 0211 0257 0268 0343 0358 0483A/B 0490A/B 1451) | | 646 | 98.2 | 0 | 1451 hf (2.4) | wraps (not 0268 / 0490B) | 2.0-3.6 / 0.69-0.85 | 0.29-1.00 | 409 | 63.0 |
+
+Totals:
+
+| | patches | cm² |
+|---|---|---|
+| pass the gate | 8,613 | 1,334 (58 %) |
+| pass, without 0841 / 1447 (ink holdouts, kept out for now) | 6,829 | 1,062 |
+
+1218 / 0846B / 0268 / 0490B have no wraps of ours (no reference), so they fail the gate. An align-only gate would pass 0.78 / 0.60 /
+0.64 / 0.29 of them.
+
+Overlap:
+- Holdout boxes: 0139 452 patches (slab z7936, 139-1/2/3/4/7/8, three mapped ink crops), 0125 246 (slab z11776), 1447 35 (1447-HOLD),
+  0814 28 (814-7).
+- 18 of the 28 scrolls carry no label of ours.
+
+**Proposal: a short fine-tune A/B (not run).**
+1. Labels:
+   - The recto side and the normal: the ATLAS sheet is the recto face, so the rv / normal / density heads get the patch band.
+   - Phase only where a patch has a q:
+     - 0139 GT-covered patches take q from the GT gauge;
+     - elsewhere `wind-assign` against the try9 count field, which makes the patches a `meshes` onfly set (q.tif) for the pair rule.
+     - An isolated patch gives phase only near itself, so phase waits for those q sets.
+2. Sources: one source per scroll from the gated list.
+   - Exclude 0841 and 1447, and every patch touching a holdout box.
+   - `holdout_file` = holdouts-w24 ∪ J1, `holdout_mode` mask, `holdout_strict` 1.
+   - Keep 10 % of each scroll's ATLAS patches (one z slab) out of training as an ATLAS eval set.
+   - Total ATLAS weight 0.15, per scroll ∝ passing area, capped at 0.03.
+   - 1203 is included; its data stays local.
+3. Arms: both init from try9 with try9's sources. B adds the ATLAS sources. 3000 steps each on one card in a desk window, paired.
+4. Score:
+   - wbench BOXES=holdout, paired B - A;
+   - rv p1667;
+   - on the held ATLAS slab, the distance of B's predicted recto to the patches (atlas-audit with the predicted wraps as --ref).
+5. Gate: wbench p05x Δ ≥ -0.01 (CI) and the ATLAS-holdout distance improves. Otherwise ATLAS stays out.
+
 ## Hard-spot sampling: a share of the draws from merge-flagged / id-change cells (2026-11-27, branch hardspot-20261127, hardspot)
 
 Port of upstream villa's hard-spot training (`tracers/sheets/evaluation/hard_spots.py`, `data.hard_windows` / `hard_fraction`: a fixed

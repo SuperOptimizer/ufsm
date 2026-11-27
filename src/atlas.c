@@ -296,7 +296,7 @@ static int au_occ_at(const au_ref *r, const float p[3]) {
 
 static int au_add_mesh(au_ref *r, const char *P, const char *value, int set, const double lo[3], const double hi[3], size_t *nmesh) {
     char p[2400]; int w = 0, h = 0, w2, h2; float *X[3] = {nullptr, nullptr, nullptr}, *Q = nullptr;
-    static const char *nm[3] = {"x.tif", "y.tif", "z.tif"};
+    static const char *const nm[3] = {"x.tif", "y.tif", "z.tif"};
     for (int a = 0; a < 3; a++) { snprintf(p, sizeof p, "%s/%s", P, nm[a]); X[a] = tfx_axis_read(p, a ? &w2 : &w, a ? &h2 : &h, img_read_f32); if (!X[a] || (a && (w2 != w || h2 != h))) goto bad; }
     double lab = NAN;
     if (value) { snprintf(p, sizeof p, "%s/%s", P, value); if (!access(p, F_OK)) { Q = img_read_f32(p, &w2, &h2); if (!Q || w2 != w || h2 != h) goto bad; } }
@@ -407,7 +407,7 @@ static void au_stats(au_job *J, const au_patch *P, const char *rid, float *X[3],
 static void au_patch_one(au_job *J, const au_patch *P) {
     char d[2400], p[2600]; int w = 0, h = 0, w2 = -1, h2 = -1; float *X[3] = {nullptr, nullptr, nullptr};
     snprintf(d, sizeof d, "%s/%s/%s.tifxyz", J->dir, P->scroll, P->id);
-    static const char *nm[3] = {"x.tif", "y.tif", "z.tif"};
+    static const char *const nm[3] = {"x.tif", "y.tif", "z.tif"};
     for (int a = 0; a < 3; a++) { snprintf(p, sizeof p, "%s/%s", d, nm[a]); X[a] = img_read_f32(p, a ? &w2 : &w, a ? &h2 : &h); }
     if (!X[0] || !X[1] || !X[2] || w2 != w || h2 != h) { fprintf(stderr, "atlas-audit: cannot read %s\n", d); for (int a = 0; a < 3; a++) free(X[a]); return; }
     char hold[512] = "";
@@ -559,7 +559,7 @@ int cmd_atlas_audit(int argc, char **argv) {
         uint8_t *o = calloc(ncell / 8 + 1, 1); ref.occ = calloc(ncell / 8 + 1, 1);
         if (!o || !ref.occ) { fprintf(stderr, "atlas-audit: out of memory (occupancy)\n"); return 1; }
         for (size_t k = 0; k < np; k++) {
-            char d[2600]; float *X[3]; int w = 0, h = 0, w2, h2; static const char *nm[3] = {"x.tif", "y.tif", "z.tif"};
+            char d[2600]; float *X[3]; int w = 0, h = 0, w2, h2; static const char *const nm[3] = {"x.tif", "y.tif", "z.tif"};
             for (int a = 0; a < 3; a++) { snprintf(d, sizeof d, "%s/%s/%s.tifxyz/%s", dir, P[k].scroll, P[k].id, nm[a]); X[a] = img_read_f32(d, a ? &w2 : &w, a ? &h2 : &h); }
             if (X[0] && X[1] && X[2] && w2 == w && h2 == h)
                 for (size_t i = 0; i < (size_t)w * h; i++) {
