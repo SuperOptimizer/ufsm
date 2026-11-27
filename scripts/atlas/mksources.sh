@@ -2,7 +2,8 @@
 # scripts/atlas/mksources.sh BASE.json OUT.json: BASE's sources + one "meshes" onfly source per ATLAS scroll with kept patches (scripts/atlas/gate.sh)
 # (2026-11-27, atlas). Each ATLAS source: level-0 CT of the patches' scan, phase on the fly from the kept patches' q.tif (pair rule, rmax ~384 um),
 # heads rv + normal only (the recto / verso side and the sheet normal; the phase gauge comes from our old fits, so phase / density / wind4 stay
-# off), scope local (draws near the patches), holdouts $HO in mask mode. Weights: $TOTAL (0.15) split by kept area, each capped at $CAP (0.03).
+# off), scope local (draws near the patches), holdouts $HO in mask mode where it has boxes for the scan (holdout_strict:
+# a holdout_file without a box for the source is fatal; the gate already dropped every patch near a box). Weights: $TOTAL (0.15) split by kept area, each capped at $CAP (0.03).
 # Env: A (/vesuvius/ufsm/atlas), K (kept dir), HO (holdouts json), TOTAL, CAP, CT (/vesuvius/ufsm/v2/ct)
 set -u
 BASE=${1:?BASE.json}; OUT=${2:?OUT.json}
@@ -15,8 +16,9 @@ tot=$(awk '{ t += $2 } END { print t }' $K/sources.tsv)
 jq -n --arg note "atlas-20261127: $(basename $BASE) + ATLAS-15k kept patches (scripts/atlas/gate.sh; CC BY-NC 4.0, measurement / validation use) as meshes onfly sources, heads rv + normal, total weight $TOTAL by kept area (cap $CAP), holdouts $HO" \
   --slurpfile base $BASE \
   --rawfile tsv $K/sources.tsv --arg K $K --arg HO $HO --arg CT $CT --argjson TOT $TOTAL --argjson CAP $CAP --argjson AREA $tot \
-  --rawfile axes $K/axes.tsv '
-  ($axes | split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): .[1]}) | add) as $ax
+  --rawfile axes $K/axes.tsv --slurpfile hold $HO '
+  ($hold[0].boxes | map(.ct | split("/") | map(select(length > 0)) | last) | unique) as $hk
+  | ($axes | split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): .[1]}) | add) as $ax
   | $base[0] as $b
   | $b + {note: ($note + " | base note: " + ($b.note // "")),
           sources: ($b.sources + ($tsv | split("\n") | map(select(length > 0) | split("\t")) | map(
@@ -24,5 +26,6 @@ jq -n --arg note "atlas-20261127: $(basename $BASE) + ATLAS-15k kept patches (sc
              axis: $ax[.[0]], iso: 64, weight: ([($TOT * (.[1] | tonumber) / $AREA), $CAP] | min),
              targets: {band: {radius: 20, span: 19, phase: {level: 0, onfly: {meshes: {dir: ($K + "/" + .[0]), value: "q.tif"}, rmax: (if (.[3] | tonumber) < 9 then 44 else 41 end)}}}},
              heads: {phase: 0, normal: 1, density: 0, wind4: 0, rv: 1},
-             holdout_file: $HO, holdout_mode: "mask"})))}' > $OUT
+             holdout_file: $HO, holdout_mode: "mask"}
+            | (.ct | split("/") | last) as $me | if ($hk | any(. == $me)) then . else del(.holdout_file, .holdout_mode) end)))}' > $OUT
 echo "$OUT: $(jq '.sources | length' $OUT) sources, ATLAS $(wc -l < $K/sources.tsv) ($(printf '%.1f' $tot) cm2 kept)"

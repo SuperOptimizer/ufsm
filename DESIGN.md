@@ -133,6 +133,47 @@ Overlap:
    - on the held ATLAS slab, the distance of B's predicted recto to the patches (atlas-audit with the predicted wraps as --ref).
 5. Gate: wbench p05x Δ ≥ -0.01 (CI) and the ATLAS-holdout distance improves. Otherwise ATLAS stays out.
 
+### Gate as a filter, labels, A/B set-up, atlas-mini-h baseline (2026-11-27 afternoon)
+
+User decision: train recto detection with ATLAS. `scripts/atlas/gate.sh` runs `atlas-audit --allow --write-q` per scroll against our old
+wraps (gate-scrolls.tsv; 0814 / 1218 / 0846B via the NAS wraps_src), thresholds calibrated on HercUeNet's approved 1203 sheets
+(big ≥ 0.271 = their p10, amb ≤ 0.052 = their p90, le4 ≥ 0.7), after CT alignment ≥ 0.6 and a holdout check (patch bbox + 16 voxels
+touches no box of holdouts-atlas.json: every wbench box, holdouts-20261114, J1, two ATLAS eval slabs 0800 z11136+640 / 0306B z8704+896).
+Excluded scrolls: 0841 / 1447 (ink holdouts), 0139 (rv p139 scroll; GT calibration), 0268 (no wrap meshes), 0490B (no axis).
+
+| stage (first failed) | patches |
+|---|---|
+| in the 23 gated scrolls | 11,422 |
+| held (holdout box) | 1,097 |
+| dropped: CT alignment < 0.6 | 1,555 |
+| nocover (matched < 0.3) | 56 |
+| fail (off-sheet le4 < 0.7: 1,318; switch big < 0.271: 1,266; merge amb > 0.052: 446; overlapping) | 2,505 |
+| **kept** (q.tif written) | **6,209 (960 cm²)** |
+
+Largest kept: 0175A 159 cm², 0800 150, 1203 112, 0306B 96, 1218 66, 1545 65, 0814 64.
+
+Labels: each kept patch gets q = K + θ/2π about the scroll axis, K the median wrap id of its matched nodes (the old wraps' gauge), as a
+`meshes` onfly set; the pair rule gives the phase where two consecutive q sheets are within rmax (41 / 44 cells), and --rv 2 derives the
+recto / verso target from that phase (same target as try9's rv head). Sources (`scripts/atlas/mksources.sh`): one per scroll, level 0,
+scope local, heads rv + normal (phase / density / wind4 off: the gauge is ours, not ATLAS's), weight 0.15 by kept area (cap 0.03),
+holdout_file only where the scan has boxes (holdout_strict: a file without a box is fatal).
+
+CPU sampler-only pass (UFSM_SAMPLER_ONLY, every device flag -1, --strict-sources 1): 92 windows over the 23 ATLAS sources, **0 DEFAULTED**,
+every source built windows; phase known 0.3-5.7 % of material per window (sparse patches). Phase rises outward on ≥ 0.97 of the aligned
+gradient samples on 19 sources, but 0009B 0.00 (inverted gauge) and 0483A 0.47: both removed from B (weight 0.002). B (try9's 32 sources
++ 21 ATLAS, ATLAS weight 0.148): strict load, 0 DEFAULTED over 20 batches (then the 16 G dev cap; try9's ink cache).
+
+A/B (`/vesuvius/ufsm/atlas/ab/ab.sh`, card 0 slot): from try9cool cooled-33333 (production rv), try9's flags, seed 3, 80 steps
+(~41 s / step at accum 10: ~55 min) per arm, A = try9's sources, B = + ATLAS. Score (scripts/rv/eval.sh's count fields are gone since
+11-17): `ufsm atlas-rvscore` on predict --heads rv of base / A / B: (1) balanced recto / verso accuracy on the papyrus of 4 held GT boxes
+(139-5, Paris4 HOLD, 1667 C2 / C10; GT side = GT pair-rule phase < 1/2 turn), (2) on 60 held ATLAS patches in 3 slab boxes (0800, 0306B
+x2): the share of nodes whose outer side (+2 voxels along the normal away from the axis) reads recto and inner side not.
+
+atlas-mini-h baseline (measurement only, NC licence, isolated venv /vesuvius/ufsm/atlas/mini, pins in PINS.txt): 128³ tiles, F1 of the
+surface band within 2 voxels of the GT sheets over the known-phase region, best threshold: 139-5 (0139 in ATLAS: in-distribution) 0.78,
+Paris4 HOLD 0.69, 1667 C2 0.67, C10 0.59. Peak 2.4 GB per window, 75-126 s per box on card 1. Its from_pretrained pulls unpinned weights;
+run offline from the pinned local files.
+
 ## Density uncertainty and the min-gap rule from upstream villa: opt-in train / predict / count-field paths (2026-11-27, branch densvar-20261127, densvar)
 
 This ports idea 2 of the villa scan (/vesuvius/ufsm/research/villa.md; upstream `winding_targets.density_loss`, `density_supervision_mask`).
