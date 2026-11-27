@@ -119,7 +119,7 @@ typedef struct {
                                     SAMPLE_AXR) and whether it has them (restore / slab batches: none) */
     void *ev_up[2], *ev_done[2]; /* upload into buffer i finished; the compute that last used buffer i finished */
     void *ev_lab[2];             /* lab_early: buffer i's label planes built (the head slabs wait for it; the forward only for ev_up) */
-    size_t hs_lg_bytes; int lsc_tried;
+    size_t hs_lg_bytes; int lsc_tried, tails;
     int lchunk;                  /* lab_early under --split z: the label warp in chunks through hs_lg (nn_lw_sink), no second plane allocated */
     uint8_t *lsc;                /* lab_early: the second label-warp scratch plane (the first: hs_lg, idle from the gradient pass to the next statistics pass) */
     batch *pending;              /* host batch whose upload into buffer (cur ^ 1) is in flight */
@@ -1217,12 +1217,15 @@ static void upload_tail(gpu_state *d, int B, int P) {
     nn_aug_stage_reset();
     const int i = d->cur;   /* (lean: both buffer indices alias) */
     const size_t p3 = (size_t)g_Pz * P * P;
-    if (!d->lsc_tried) {   /* lab_early: decided once, at the first tail (the planner's allocations done): hs_lg holds a label plane, one more plane fits */
+    /* lab_early: decided once, at the second tail: hs_lg holds a label plane, one more plane fits. At the first tail the step's activations
+       (build_acts, the first forward) were not allocated yet, so the free memory counted the plan's own room and the plane took it (w24
+       2026-11-27, P 768: step 1 out of memory). The first step runs the step-boundary warp */
+    if (!d->lsc_tried && d->tails++ >= 1) {
         d->lsc_tried = 1;
         const int want = (!getenv("UFSM_LAB_EARLY") || ufsm_env_on("UFSM_LAB_EARLY")) && d->hsplit && g_lstream && B == 1 && d->hs_lg && d->hs_lg_bytes >= p3;
         const size_t fr = want ? nn_mem_free() : 0, margin = (size_t)768 << 20;
         if (want && fr > p3 + margin) d->lsc = nn_malloc(p3);
-        if (d->side <= 0) fprintf(stderr, "label warp: %s (%.0f MB free; UFSM_LAB_EARLY=0 off)\n", d->lsc ? "after the input, under the forward (hs_lg + one more plane)" :
+        if (d->side <= 0) fprintf(stderr, "%slabel warp: %s (%.0f MB free; UFSM_LAB_EARLY=0 off)\n", want && !d->lsc ? "DEFAULTED: " : "", d->lsc ? "after the input, under the forward (hs_lg + one more plane)" :
                                              want ? "at the step boundary: too little device memory for its second plane" : "at the step boundary", fr / 1e6);
     }
     nn_stream_wait(1, d->ev_done[i]); nn_stream_wait(1, d->ev_done[i ^ 1]);
@@ -4818,6 +4821,14 @@ int cmd_train(int argc, char **argv) {
             }
             size_t mg_head = 0;   /* multi-GPU headroom per card (default 0.5 GB): peer contexts, gradient exchange and small late scratch */
             if (ng > 1) { const char *h = getenv("UFSM_MG_HEADROOM_GB"); mg_head = (size_t)((h ? atof(h) : 0.5) * 1e9); fmin = fmin > mg_head ? fmin - mg_head : 0; }
+            if (mesh_codes_opened() > 0) {   /* the meshes' device stamp (nn_mcodes.cu into-path: one pool context per onfly slot, its slab keys + the gathered
+                                                vertex blocks), allocated lazily by the sampler after the plan: w24 2026-11-27 at P 768 those and the
+                                                label warp's early plane took the activations' room and step 1 ran out of memory */
+                const char *im = getenv("UFSM_MESHCODES_INTO_MB"); const int ns = opt_atoi("--onfly-slots", opt(argc, argv, "--onfly-slots", "2"));
+                const size_t r = (size_t)(ns < 1 ? 1 : ns > 4 ? 4 : ns) * (((size_t)(im && atoi(im) > 0 ? atoi(im) : 512) + 512) << 20);
+                fmin = fmin > r ? fmin - r : 0;
+                fprintf(stderr, "memory: the meshes' device stamp keeps %.2f GB free (%d onfly slot(s))\n", r / 1e9, ns);
+            }
             if (g_mil && ink_mil_bytes) {   /* --ink-mil: the MIL sort buffers at the ray cap, allocated lazily on the first MIL window (2026-11-15 try7 one
                                                card: outside the plan, the first such window's cudaMalloc failed on a full card, exit 1 at step 1) */
                 g_mil_reserve = ink_mil_bytes(g_mil_max, g_mil_R, g_mil_step);

@@ -1033,7 +1033,7 @@ extern "C" void nn_w4runs_label_z(const uint8_t *side_h, const void *runs, const
         /* no device memory for the rebuild's scratch beside the trainer (2026-11-12: it aborted unissl three times at P 1024 on a
            16 GB card): this window's planes rebuilt on the host from the same phase (w4runs_apply_host: the same bytes), then uploaded */
         static int nfb; const int k = __sync_add_and_fetch(&nfb, 1);
-        if (k <= 3 || !(k & (k - 1))) fprintf(stderr, "nn_w4runs_label: no device memory for the runs rebuild: the window rebuilt on the host (%d so far)\n", k);
+        if (k <= 3 || !(k & (k - 1))) fprintf(stderr, "DEFAULTED: nn_w4runs_label: no device memory for the runs rebuild: the window rebuilt on the host (%d so far)\n", k);
         const size_t p3 = p2 * P;
         uint8_t *h = (uint8_t *)malloc(2 * p3); if (!h) { fprintf(stderr, "nn_w4runs_label: no host memory for the fallback\n"); abort(); }
         w4runs_apply_host(side_h, P, P, P, r->tile, r->ms, r, h, h + p3);

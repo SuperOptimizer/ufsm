@@ -268,7 +268,10 @@ static int mc_extent(void *vp, const int64_t grid[3], const int chunk[3], uint8_
     return 0;
 }
 
+static _Atomic int g_mc_opened;   /* mgpu: guarded (atomic) */
+int mesh_codes_opened(void) { return g_mc_opened; }
 z3 *mesh_codes_open(const char *dir, const char *value, const char *mapp, int level, z3 *ct_level, int gpu) {
+    atomic_fetch_add(&g_mc_opened, 1);
     if (gpu < 0) mesh_codes_gpu_config(-1); else if (gpu > 0) mesh_codes_gpu_config(gpu - 1);   /* (0: the process default) */
     if (!ct_level || !dir || !value || level < 0 || level > 8) { fprintf(stderr, "mesh codes: need a meshes dir, a value image name, level 0..8 and the CT level\n"); z3_close(ct_level); return nullptr; }
     const rmap *map = nullptr; if (mapp && *mapp && !(map = reg_map_load(mapp))) { fprintf(stderr, "mesh codes: cannot load the map %s\n", mapp); z3_close(ct_level); return nullptr; }
