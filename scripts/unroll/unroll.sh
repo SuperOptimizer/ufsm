@@ -736,12 +736,16 @@ check() {
   X $O/logs/unrollqa.log $U unroll-qa --fields $F --model $O/joined --ct $R $K/$LV --out $O/qa/unroll-qa --threads $TH --tiles ${UQTILES:-48} "${uqs[@]}" & uqp=$!
   [ "${DRIFT:-1}" = 1 ] && { X $O/logs/drift.log $U cf-demod $REF $F --step ${DRIFTSTEP:-8} --band 128 --cz 16 --threads $TH ${DRIFTMAX:+--drift-max $DRIFTMAX} & drp=$!; }
   ckill() { wait $uqp $drp 2> /dev/null; }   # (a failed wrap-check: let the side jobs end with the stage; a kill would reach only the X subshells, not ufsm)
-  X $O/logs/check.log $U wrap-check $O/joined $F --ct $R $K/$LV --ct-um $LUM --tsv $O/wrapcheck.tsv.tmp --threads $TH || { ckill; return 1; }
+  X $O/logs/check.log $U wrap-check $O/joined $F --ct $R $K/$LV --ct-um $LUM --tsv $O/wrapcheck.tsv.tmp --intervals $O/qa/intervals.tsv --threads $TH || { ckill; return 1; }
   [ -s $O/wrapcheck.tsv.tmp ] && [ $(awk -F'\t' 'NR > 1 && $NF != ""' $O/wrapcheck.tsv.tmp | wc -l) -gt 0 ] || { ckill; log "check: wrap-check wrote no verdicts"; return 1; }
   awk -F'\t' 'NR > 1 { n++; e += $3 } END { exit !(n > 0 && e / n < 0.999) }' $O/wrapcheck.tsv.tmp ||
     { ckill; log "check: wrap-check found no CT peaks (empty share ~1 on every wrap): wrong --ct-um $LUM or CT level $K/$LV?"; return 1; }
   mv $O/wrapcheck.tsv.tmp $O/wrapcheck.tsv
   log "check: $(grep -E '^wrap-check: verdicts' $O/logs/check.log | tail -1)"
+  # the layer-spacing QC (physics.md #2, DESIGN 2026-11-27): intervals with a fitted gap < SPACEMIN um (150) -> qa/spacing.tsv (flag column);
+  # on 1667 arm C the small gap predicts the GT-scored errors (interval AUC 0.89, patch 0.91; recall 0.83 at 4x the base rate). QC only.
+  X $O/logs/spacing.log $U wrap-spacing $O/qa/intervals.tsv --gap-min ${SPACEMIN:-150} --out $O/qa/spacing.tsv &&
+    log "check: $(grep -E '^wrap-spacing: flagged' $O/logs/spacing.log | tail -1)" || log "check: wrap-spacing failed (logs/spacing.log); QC only, continuing"
   wait $uqp || uqrc=1
   if [ $uqrc = 1 ]; then
     [ "${UQSTRICT:-0}" = 1 ] && { [ -n "$drp" ] && wait $drp 2> /dev/null; log "check: unroll-qa failed or a gate failed (UQSTRICT=1; logs/unrollqa.log)"; return 1; }

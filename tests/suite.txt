@@ -254,6 +254,7 @@ test_lat_sub                                   | gpu          |    40 | tests/te
 test_ink_mil_check                             | gpu          |    90 | ./$B/test_ink_mil_check ./$B/ufsm ./$B/make_wind_fixture
 test_pyports                                   |              |     1 | ./$B/test_pyports
 test_edt                                       | smoke        |     2 | ./$B/test_edt
+test_wrap_spacing                              | smoke        |     1 | ./$B/test_wrap_spacing
 test_volcomp                                   | smoke        |     1 | ./$B/test_volcomp
 test_volcomp_vll                               | smoke        |     1 | ./$B/test_volcomp_vll
 test_z3w_pool                                  | smoke        |     2 | ./$B/test_z3w_pool

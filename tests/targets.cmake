@@ -95,6 +95,7 @@ ufsm_exe(test_dino_pts SUITE tests/test_dino_pts.c LIBS LDLIBS)
 ufsm_exe(test_dinor SUITE tests/test_dinor.c OBJS NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_distill SUITE tests/test_distill.c OBJS sample_emb embz z3w spatial_augment json NN LP LIBS LDLIBS CUDA)
 ufsm_exe(test_edt SUITE tests/test_edt.c OBJS edt LIBS pthread m)
+ufsm_exe(test_wrap_spacing SUITE tests/test_wrap_spacing.c OBJS wrapspacing optcheck LIBS m)
 ufsm_exe(test_eval SUITE tests/test_eval.c OBJS scannorm edt band sheet ct_augment scan_augment spatial_augment crush scrollaug cover json
          store zarr3 sources band_onfly fuse fiberraster afv regmap srpair zarr2 tiff z3w hf zipr view reg sample_emb sample_cond embz LIBS LDLIBS)
 ufsm_exe(test_faces SUITE tests/test_faces.c OBJS faces LIBS LDLIBS)

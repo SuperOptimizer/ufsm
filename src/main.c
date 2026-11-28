@@ -355,6 +355,7 @@ static int usage(void) {
         "  ufsm fiber-export <afv> <fields-dir> <out.fib> --tr T.json    fibre polylines in a fit box's coordinates for fit --fibers\n"
         "  ufsm fiber-regscore <afv> (--map reg.json | --tr T.json) --pred ROOT KEY   a scan-to-scan map scored by fibre presence along mapped fibres (per-region residual shifts)\n"
         "  ufsm fit-phase-box <fit-set> z y x nz ny nx <out.raw> [--level L] [--step 2]   a fit set's winding phase over a CT box (uint8 band phase; fibre judge)\n"
+        "  ufsm wrap-spacing <intervals.tsv> [--win 3] [--out OUT.tsv]   layer-spacing jumps along each wrap (wrap-check --intervals) vs the GT: AUCs\n"
         "  ufsm wrap-dump <wraps-dir> <out.f32> --z z0,z1 [--yx y0,y1,x0,x1] [--every 2]   wrap vertices of a slab as float32 (z, y, x, id, column / width) records\n"
         "  ufsm fiber-match OURS.fib REF.afv|.fib --box Z,Y,X,NZ,NY,NX [--map reg.json]   our fibres vs a reference: lengths, recall, precision, how far one line follows one fibre\n"
         "  ufsm fiber-judge <fibres.afv|.fib> (--wraps DIR | --phase ROOT KEY | --set FITSET) --um U --slab Z0,NZ [--out rows.tsv]   do fibres stay in one sheet of our winding? (label-free judge)\n"
@@ -5024,6 +5025,7 @@ int cmd_fiber_export(int argc, char **argv);   /* src/fibercheck.c */
 int cmd_fiber_regscore(int argc, char **argv);   /* src/fibregscore.c */
 int cmd_fit_phase_box(int argc, char **argv);  /* src/fitphase.c */
 int cmd_wrap_dump(int argc, char **argv);      /* src/wrapdump.c */
+int cmd_wrap_spacing(int argc, char **argv);   /* src/wrapspacing.c */
 int cmd_fiber_judge(int argc, char **argv);    /* src/fiberjudge.c */
 int cmd_fiber_trace(int argc, char **argv);    /* src/fibertrace.c */
 int cmd_fiber_raster(int argc, char **argv);   /* src/fiberraster.c */
@@ -5124,6 +5126,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "fiber-regscore")) return cmd_fiber_regscore(argc, argv);
     if (!strcmp(cmd, "fit-phase-box")) return cmd_fit_phase_box(argc, argv);
     if (!strcmp(cmd, "wrap-dump")) return cmd_wrap_dump(argc, argv);
+    if (!strcmp(cmd, "wrap-spacing")) return cmd_wrap_spacing(argc, argv);
     if (!strcmp(cmd, "fiber-judge")) return cmd_fiber_judge(argc, argv);
     if (!strcmp(cmd, "fiber-match")) { int cmd_fiber_match(int, char **); return cmd_fiber_match(argc, argv); }   /* our fibres vs a reference set: lens, recall, precision, runs (src/fibermatch.c) */
     if (!strcmp(cmd, "fiber-trace")) return cmd_fiber_trace(argc, argv);

@@ -6,6 +6,44 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Research checks on the 1667 arm-C unroll: SLIM flattening (already ours), the layer-spacing diagnostic -> wrap-spacing QC (2026-11-27, branch physdiag-20261127, unrollperf)
+
+Two CPU validations from /vesuvius/ufsm/research (lead 11-27), on /vesuvius/ufsm/unrollrun/cmp (1667, the comparison unrolls).
+
+**flatten.md #1, SLIM vs our flatten: nothing to compare, ours is SLIM.** src/flatten.h is Rabinovich et al. 2017: symmetric
+Dirichlet energy, local / global steps, a line search capped before the first inversion (locally injective), multilevel on the
+wrap's grid (the grid map is the flip-free start, so no BFF / Tutte init is needed). strip-flatten runs it per chunk and blends the
+chunks. Arm A (arm C stopped at UPTO=strip): 254.7 cm2, aniso (s1 / s2) p50 / p95 / p99 1.062 / 1.153 / 1.240, area ratio p50 0.9995,
+flips 2842 = 0.0123 % of the area, all from the blend (the per-chunk SLIM has 0 flips: "Unroll audit fixes #7b, #13-#17", 2026-11-14); the per-wrap whole-mesh
+SLIM inks worse than the chunked strip (reader3 0.8633 vs 0.8666 at 20 um, same section). Left open from the note: #3 a fibre-
+alignment term, #4 cuts at tears.
+
+**physics.md #2, layer spacing along the wraps: the small gap predicts the GT errors, the jump prior does not add much.** wrap-check of
+arm C's joined fit with the GT codes (64 z x 360 rays: 869531 intervals, 191359 with GT at both ends, 3848 = 2.0 % wrong: 3254 span 2+
+GT sheets, 594 share one), then the new `ufsm wrap-spacing` (src/wrapspacing.c): per interval |ln| of its normal gap against the same
+wrap pair on +-3 neighbouring rays (st), on the adjacent z levels (sz), the pairs k +- 1 on the same ray (sr), the CT peak spacing (sct).
+
+| score | interval AUC | patch AUC (k x 10 deg x 4 z) |
+|---|---|---|
+| st, along-sheet jump, same z | 0.677 | 0.797 |
+| sz, adjacent z | 0.565 | 0.598 |
+| sr, radial (k +- 1) | 0.349 | 0.220 |
+| sct, gap / CT spacing | 0.410 | 0.388 |
+| wrap-check's CT flag npk != 1 | 0.484 | 0.486 |
+| -gap (small fitted gap) | **0.891** | **0.905** |
+
+- st is stable over --win 1..6 (patch 0.76-0.80) and patch sizes (0.78-0.83), but among gaps < 150 um its AUC is 0.585: it mostly
+  restates the small gap. Wrong intervals have a mean gap of 123 um (2+ GT sheets) / 93 um (one sheet), right ones 233 um: the errors
+  sit in the packed regions, where neighbouring layers are compressed alike (hence sr < 0.5: no radial contrast).
+- Wrong share by gap decile: 0.12 below 120 um, 0.04 at 120-147, 0.02 at 147-171, under 0.001 above 268 um.
+- Thickness along the wrap is not measured here (no thickness in the intervals); the CT peak spacing (sct) does not predict.
+
+QC output: `wrap-spacing` flags intervals with gap < --gap-min um (150; optional --thr for the jump). On arm C it flags 0.27 of all
+intervals, recall 0.83 at precision 0.079 (4x the 0.020 base rate); 120 um: 0.15 flagged, recall 0.59, precision 0.12; 180 um: 0.40,
+0.93, 0.056. unroll.sh check now writes qa/intervals.tsv (wrap-check --intervals) and qa/spacing.tsv (SPACEMIN, default 150) and logs
+the flagged share; QC only, never a gate (a coarse packed-region map, not a per-error detector). test_wrap_spacing (synthetic rings:
+the packed run flagged exactly, the jump's st = ln(400 / 220), sr of the packed run = ln(2.2)). Files: /vesuvius/ufsm/unrollperf/phys.
+
 ## q2 CT shell for coarse-scan ink: built from S3 around the inked surfaces, reader3 +0.028 on clean 1447 (2026-11-27, branch ctshell-20261127, inkeval)
 
 Lead decision after the lossless addendum (per-scroll ink eval section): the unroll's ink stage on a coarse scan builds a q2 copy of
