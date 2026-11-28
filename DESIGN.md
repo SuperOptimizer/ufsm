@@ -6,6 +6,53 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Ink ensembles and the predict CT shell: reader3 + E2D2 mean loses on 1447, ties on 0841; shell quality auto (≤ 100 GB lossless), predict --ct-shell (2026-11-27, branch shellq-20261127, inkeval)
+
+**Ensemble (lead).** reader3 and E2D2-avg probability maps, weighted mean on the pixels both maps cover (`ink-score --fuse mean
+--weights`), paired by crop against each model alone on the same pixels. These are existing maps only:
+- 1447: reader3-ctx-m8 on lossless CT, and E2D2 on lossless CT (the q20 store);
+- 0841: reader3-ctx-m8 and E2D2-t8 (PICKS2 / PICKS3).
+
+| vs reader3 (± paired SE, crops up) | 1447 (28) | 0841 (8) |
+|---|---|---|
+| reader3 / E2D2 alone | .8057 / .7092 | .8908 / .8578 |
+| mean 0.5 / 0.5 | -.0255 ± .0076 (8/28) | +.0116 ± .0079 (6/8) |
+| 0.7 reader3 / 0.3 E2D2 | -.0114 ± .0049 (12/28) | +.0112 ± .0049 (6/8) |
+| 0.3 reader3 / 0.7 E2D2 | -.0443 ± .0104 (7/28) | +.0068 ± .0119 (6/8) |
+
+- No weighting beats reader3 on both scrolls. 1447 loses at every weight; on 0841 the best arm (0.7 / 0.3) is 2.3 SE up on 8 crops.
+- 1-view reader3 + E2D2 on lossless 1447 also loses at every weight (0.7 / 0.3: -.0096 ± .0064).
+- This repeats the 11-25 E0 / S2 fusion result. No ensemble goes into the unroll, so no cost estimate was written.
+- Rows: /vesuvius/ufsm/inkeval/{ens.sh, ens/rows.tsv}.
+
+**Shell quality, automatic (lead).**
+- `--shell-q auto` (the default, in ink-ext --shell-list and ct-shell-list) writes q 0 (lossless) while the estimate is ≤
+  `--shell-max-gb` 100. The estimate is chunks x 128^3 x 0.70 B: 1447 w058 measured 0.69 B per voxel lossless.
+- Above the limit it writes q 2 and prints `DEFAULTED: ctshell q2 (lossless est N GB > 100)`. The quality goes into the list header
+  (`# level L shard 1024 q Q`); unroll's ctshell reads it for latvol and logs the DEFAULTED line.
+- A quality change against `--shell-prev` puts every old shard into .redo, so a shell never mixes qualities.
+- SHELLQ (a number) overrides the rule; SHELLMAXGB sets the limit.
+- Why: /vesuvius has ~300 GB free, and a whole-scroll lossless shell (1447 ~240 GB) would starve the other runs.
+
+**predict --ct-shell ROOT (lead: 3-D ink is the goal net, and its lossless gain, +.0075 over q2, is the larger one).**
+- `ufsm ct-shell-list ROOT KEY OUT --level L --box B --shard 512 --pad 1024` lists every stored 128^3 chunk of the box, rounded to
+  predict's output shards and grown by the windows' reach. The list code is shared with ink-ext in src/ctshell.c.
+- predict reads ROOT/KEY/<level> instead of the main level only if its shell.boxes holds every stored main chunk within the
+  shard-rounded box ± (window + halo). Otherwise it prints `DEFAULTED: predict: --ct-shell ROOT: not used (N of M chunks ...)` and
+  reads the main level.
+- In the unroll, inkcal and ink run `ctshell --box $box $LV` into the same $SHD store as reader3: the lists merge and the quality is
+  decided over the union. CTSHELL auto turns it on for coarse scans; PSHELL=0 turns off the predict part.
+- Real check on 1447 w058_0, E2D2-avg tta 8: ct-shell-list + lossless latvol from S3 took 138 s for 3226 chunks (4.60 GB). predict read
+  all 3240 reach chunks from the shell, and the AUC was .6541 = the q20 lossless row, exactly.
+  - The first try padded only window + halo and missed the shard rounding: predict refused it (2426 of 3240 chunks missing) and fell
+    back to q8 (.6253). That is the failure the check exists for.
+- Whole-box cost: the 3-D ink box of a full 1447 unroll is ~1.7 Tvox at level 0. That is far over 100 GB lossless, so it gets q2 by the
+  rule: ~0.086 B per voxel over the stored chunks, and some hours of S3 reads at the 50-75 Mvox/s measured. This runs once per run.
+- Test: test_predict_shell (gpu, ~30 s). A lossless shell gives a byte-identical prediction; a q8 shell is read (the output differs); a
+  shell that misses reach chunks is refused with DEFAULTED and gives the same output as the main store; ct-shell-list picks q 0 / q 2
+  around the limit. test_ink_shell also checks the q header, the auto DEFAULTED line, explicit --shell-q, and the full .redo on a
+  quality change.
+
 ## Lossless CT shell, chunk-exact: lossless beats q2 by +.0056 ± .0031 reader3 AUC on clean 1447, the shell 2.2x smaller per quality (2026-11-27, branch shellbox-20261127, inkeval)
 
 Lead: score q2 against lossless on 1447's 28 clean crops, paired; if q2 falls short by more than 1 SE, the shell goes lossless. Also cut the

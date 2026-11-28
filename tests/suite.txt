@@ -47,6 +47,7 @@ test_slot_planes                               | gpu          |    30 | tests/te
 test_idle_release                              |              |     8 | tests/test_idle_release.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/idlerel
 test_scan_norm                                 | gpu          |    14 | tests/test_scan_norm.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/scannorm
 test_predict_guard                             | gpu          |    20 | tests/test_predict_guard.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predguard
+test_predict_shell                             | gpu          |    30 | tests/test_predict_shell.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predshell
 test_parity                                    | gpu          |    30 | tests/test_parity.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/parity
 test_parity~latdec                             | gpu          |    30 | UFSM_LATDEC_TEST_W2=2 tests/test_parity.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/parity_latdec "--lat-dec 32"
 test_predict_heads~part0of3                   | gpu          |    25 | UFSM_TEST_PART=0/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads

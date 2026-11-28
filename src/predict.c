@@ -1,6 +1,7 @@
 /* ufsm predict: sliding-window inference of a checkpoint over a CT box, written as a volcomp zarr v3
    probability pyramid (uint8 p*255, q=8) in the published layout. */
 #include "sample_cond.h"
+#include "ctshell.h"
 #include "imgops.h"
 #include "scannorm.h"
 #include "optcheck.h"
@@ -2137,6 +2138,34 @@ static int predict_one(int argc, char **argv) {
         fprintf(stderr, "predict: --window-z: at most --window (given), a multiple of %d, --halo-z under half of it; one GPU's plain path (no --split, "
                         "half-resolution, winding, --aux, --cond-sweep or UFSM_PRED_HOSTPATH)\n", 1 << (cfg.nlev - 1));
         return 2;
+    }
+    if (opt(argc, argv, "--ct-shell", nullptr)) {   /* --ct-shell ROOT (inkeval 11-27): ROOT/KEY/<level> (a lossless / q2 copy of this level from the
+        S3 original, latvol --exact 1 over ufsm ct-shell-list's chunks) read instead of the level, when its shell.boxes holds every stored
+        chunk of the main level within the box grown by the window reach (window + halo per axis). Else DEFAULTED: the main level. */
+        const char *shr = opt(argc, argv, "--ct-shell", nullptr); char bp[1400], er[1600] = ""; snprintf(bp, sizeof bp, "%s/%s/shell.boxes", shr, key);
+        if (lvc) { fprintf(stderr, "predict: --ct-shell: the main CT is a latvol store; a shell is for volcomp levels\n"); return 2; }
+        int64_t cg[3]; for (int d = 0; d < 3; d++) cg[d] = (m->shape[d] + 127) / 128;
+        int sl = -1, sq = -1, mrc = 1; uint8_t *mk = nullptr; size_t nck = 0; long long miss = 0, nreach = 0; z3 *zs = nullptr; store *ss = nullptr;
+        if (m->chunk[0] == 128 && m->chunk[1] == 128 && m->chunk[2] == 128) mrc = ctshell_mask(bp, cg, m->shape, &sl, &sq, &mk, &nck, er, sizeof er);
+        else snprintf(er, sizeof er, "the level's chunks are not 128^3");
+        if (mrc == 2) { fprintf(stderr, "predict: --ct-shell: %s (not a shell list)\n", er); return 2; }
+        if (!mrc && sl != level) { snprintf(er, sizeof er, "%s: level %d, predict level %d", bp, sl, level); mrc = 1; }
+        if (!mrc && (ss = store_open(shr)) && (zs = pyramid_open_level(ss, key, level, um, nullptr))) {
+            const z3_meta *sm = z3_meta_of(zs);
+            for (int d = 0; d < 3; d++) if (sm->shape[d] != m->shape[d] || sm->chunk[d] != 128) { snprintf(er, sizeof er, "%s level %d: another shape or chunking", shr, level); z3_close(zs); zs = nullptr; break; }
+        } else if (!mrc) snprintf(er, sizeof er, "cannot open level %d of %s %s: %s", level, shr, key, z3_error());
+        if (zs) {   /* every stored main chunk the windows can reach must be in the shell (air chunks read as fill either way) */
+            int64_t c0[3], c1[3]; const int rch[3] = {Wz + hz, W + halo, W + halo};
+            for (int d = 0; d < 3; d++) { int64_t lo = bo[d] - rch[d], hi = bo[d] + bn[d] + rch[d]; if (lo < 0) lo = 0; if (hi > m->shape[d]) hi = m->shape[d]; c0[d] = lo / 128; c1[d] = (hi + 127) / 128; }
+            for (int64_t cz = c0[0]; cz < c1[0]; cz++) for (int64_t cy = c0[1]; cy < c1[1]; cy++) for (int64_t cx = c0[2]; cx < c1[2]; cx++) {
+                nreach++; if (mk[(cz * cg[1] + cy) * cg[2] + cx]) continue;
+                const int64_t o[3] = {cz * 128, cy * 128, cx * 128}, n3[3] = {128, 128, 128}; if (z3_box_any(ct, o, n3) != 0) miss++; }
+            if (miss) { snprintf(er, sizeof er, "%lld of the %lld chunks in the windows' reach are stored in the main level but not in the shell", miss, nreach); z3_close(zs); zs = nullptr; }
+        }
+        free(mk);
+        if (!zs) fprintf(stderr, "DEFAULTED: predict: --ct-shell %s: not used (%s): every chunk read from %s\n", shr, er, root);
+        else { z3_close(ct); ct = zs; m = z3_meta_of(ct);
+            fprintf(stderr, "predict: CT level %d from the shell %s (q%d, %zu chunks; all %lld chunks in the windows' reach covered)\n", level, shr, sq, nck, nreach); }
     }
     {   /* --align A (data audit #9, 2026-11-14; default 0 = off): every window origin on the A grid of the CT level, as training's snapped
            windows (sample.c snap: the volcomp 128 block). Windows start at grid_origin + k stride - halo, so this anchors the grid at

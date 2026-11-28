@@ -161,21 +161,29 @@ VOUT=$([ "$INKMODE" = r3 ] && echo "--volume-out 0")
 # (100) GB, else q2 with DEFAULTED; or a volcomp quality, 0 lossless / 2 q2 ~8x smaller), SHELLTH (6 threads), SHELLDIR, S3CT.
 CTSHELL=${CTSHELL:-auto}; [ "$CTSHELL" = auto ] && CTSHELL=$(awk -v u=$UM 'BEGIN { print (u >= 7) ? 1 : 0 }')
 SHD=${SHELLDIR:-$O/ink/ctshell}; S3CT=${S3CT:-https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com}; SHLCB=${SHLCB:-/vesuvius/ufsm/v2/lat/codec/klt1.lcb}
-# ctshell SURFACE-ARGS..: grow $SHD for those --surface args; sets SHX to the ink-ext flags ("" when the shell is not used) and holds
-# $SHD.lock shared on fd shfd (the caller's local) until shclose
+# ctshell SURFACE-ARGS..: grow $SHD for those --surface args (ink-ext --shell-list); ctshell --box BOX LEVEL: for a predict over BOX
+# at LEVEL (ufsm ct-shell-list: the stored chunks within BOX + PSHPAD 1024, the windows' reach; predict --ct-shell refuses a shell that
+# misses one). Sets SHX to the reader's flag ("" when the shell is not used) and holds $SHD.lock shared on fd shfd (the caller's local)
+# until shclose. One store for both: the lists merge (--shell-prev), the quality is decided over the union.
 shclose() { [ -n "${shfd:-}" ] && exec {shfd}>&-; shfd=; }
 ctshell() {
   SHX=; [ "$CTSHELL" = 1 ] || return 0
+  [ "${1:-}" = --box ] && { [ "${PSHELL:-1}" = 1 ] || return 0; [ "$DRY" = 1 ] && { echo "    (ctshell --box $2: ct-shell-list + latvol into $SHD, predict --ct-shell)"; return 0; }; }
   local t0=$(date +%s) s3k="${K%%/*}/volumes/${K##*/}" lev rc prev=() sz sy sx n q l0
   mkdir -p $SHD/tmp $SHD/grp/$s3k || { log "DEFAULTED: ctshell: cannot create $SHD: ink from the q8 store $R"; return 0; }
   exec {shfd}> $SHD.lock; flock -x -w ${SHELLWAIT:-7200} $shfd || { log "DEFAULTED: ctshell: $SHD.lock busy ${SHELLWAIT:-7200} s: ink from the q8 store $R"; shclose; return 0; }
   [ -s $SHD/$K/shell.boxes ] && prev=(--shell-prev $SHD/$K/shell.boxes)
   l0=$(cat $O/logs/ctshell.log 2> /dev/null | wc -l)   # (this call's lines only, for its DEFAULTED)
-  nice -n 10 $U ink-ext --model $R3MODEL --weights $R3W "$@" --ct $R $K --out $SHD/tmp --threads $R3TH $R3X --shell-list $SHD/new.boxes \
-    "${prev[@]}" --shell-q ${SHELLQ:-auto} --shell-max-gb ${SHELLMAXGB:-100} >> $O/logs/ctshell.log 2>&1; rc=$?
+  if [ "${1:-}" = --box ]; then
+    nice -n 10 $U ct-shell-list $R $K $SHD/new.boxes --level $3 --um $UM --box $2 --shard 512 --pad ${PSHPAD:-1024} --cache $O/ink/ct.cache \
+      "${prev[@]}" --shell-q ${SHELLQ:-auto} --shell-max-gb ${SHELLMAXGB:-100} >> $O/logs/ctshell.log 2>&1; rc=$?
+  else
+    nice -n 10 $U ink-ext --model $R3MODEL --weights $R3W "$@" --ct $R $K --out $SHD/tmp --threads $R3TH $R3X --shell-list $SHD/new.boxes \
+      "${prev[@]}" --shell-q ${SHELLQ:-auto} --shell-max-gb ${SHELLMAXGB:-100} >> $O/logs/ctshell.log 2>&1; rc=$?
+  fi
   lev=$(sed -n 's/^# level \([0-9]*\) shard 1024 q [0-9].*/\1/p' $SHD/new.boxes 2> /dev/null); q=$(sed -n 's/^# level [0-9]* shard 1024 q \([0-9]\).*/\1/p' $SHD/new.boxes 2> /dev/null)
   tail -n +$((l0 + 1)) $O/logs/ctshell.log | grep '^DEFAULTED: ctshell q2' | while read -r l; do log "$l"; done   # (auto: lossless estimate over SHELLMAXGB)
-  if [ $rc != 0 ] || [ -z "$lev" ] || [ -z "$q" ]; then log "DEFAULTED: ctshell: ink-ext --shell-list rc $rc ($O/logs/ctshell.log): ink from the q8 store $R"; shclose; return 0; fi
+  if [ $rc != 0 ] || [ -z "$lev" ] || [ -z "$q" ]; then log "DEFAULTED: ctshell: the shell list rc $rc ($O/logs/ctshell.log): ink from the q8 store $R"; shclose; return 0; fi
   if [ ${#prev[@]} -gt 0 ] && [ -s $SHD/new.boxes.redo ]; then
     while read -r sz sy sx; do rm -f "$SHD/$K/$lev/c/$sz/$sy/$sx"; done < $SHD/new.boxes.redo; fi   # (grown shards: latvol --resume rewrites them)
   if [ ! -s $SHD/grp/$s3k/zarr.json ]; then
@@ -589,8 +597,11 @@ inkcal() {
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, -v cz=${INKCALZ:-2048} '{ zc = $1 + int($4 / 2); z0 = zc - int(cz / 2); if (z0 < $1) z0 = $1; nz = cz; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
   local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $(lg $INKGPU) --axis $O/axis.json $(occlv)"
-  [ -s $O/ink/gn.bin ] || { X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window ${INKW:-auto} --halo ${INKH:-32} --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
-                             { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
+  [ -s $O/ink/gn.bin ] && return 0
+  local shfd=; ctshell --box $box $LV   # (the whole ink box: the main pass reuses it; the statistics from the CT the pass reads)
+  X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window ${INKW:-auto} --halo ${INKH:-32} --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp $SHX &&
+    { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || { shclose; return 1; }
+  shclose
 }
 ink() {
   [ "$INKMODE" = r3 ] && { [ "$DRY" = 1 ] && echo "    (INKMODE=r3: no ink volume; the renders' ink is r3ink.sh on each surface, $R3W)"; return 0; }
@@ -613,8 +624,10 @@ ink() {
   # --seamless 2 by default (lead 11-27, DESIGN "R11P HOLD rows": PHerc1203 window-seam jump 4.76 plain -> 0.13 / 0.11 at offsets 0 / 256,
   # 1.3x a w832 / h160 pass, which only reaches 1.24): two tile grids sin^2-blended; INKSEAM=0 = the old single feathered pass (INKF voxels)
   local seam; [ "${INKSEAM:-2}" = 0 ] && seam="--feather ${INKF:-32}" || seam="--seamless ${INKSEAM:-2}"
+  local shfd=; ctshell --box $box $LV   # (CTSHELL / PSHELL: a lossless / q2 copy of the ink box from S3, predict --ct-shell)
   X $O/logs/ink.log $U predict $INKCK $R $K $INK $P ${INKPX:-} --box $box --window ${INKW:-auto} --halo ${INKH:-32} $seam --full-grid 1 --resume 1 --levels 4 \
-    --gn-frozen $O/ink/gn.bin || return 1
+    --gn-frozen $O/ink/gn.bin $SHX || { shclose; return 1; }
+  shclose
 }
 
 # --- slab fits: one lane per GPU, claims by flock (fd.sh lane) ---

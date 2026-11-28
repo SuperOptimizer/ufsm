@@ -146,6 +146,7 @@ int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_strat(int argc, char **argv);   /* src/inkstrat.c */
+int cmd_ct_shell_list(int argc, char **argv);   /* src/ctshell.c */
 int cmd_ink_runs(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach_up(int argc, char **argv);   /* src/inksplat.c */
@@ -234,6 +235,7 @@ static int usage(void) {
         "  ufsm jpeg-fit IN.jpg OUT.jpg --div 2 | --max-px N                  a finished JPEG shrunk (OUT may be IN)\n"
         "  ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K]   tifxyz wraps -> surface-compressor .sfc (readers take .sfc wraps directly)\n"
         "  ufsm sheet-cut <wraps-dir> <out-dir> [--tol 0.3] [--min-cm2 0.25] [--max 8]   square flat sheets: largest isometric rectangles of each wrap\n"
+        "  ufsm ct-shell-list ROOT KEY OUT --level L --box B   the CT shell list of a predict box (latvol --exact 1, predict --ct-shell)\n"
         "  ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   external ink networks on a surface\n"
         "  ufsm ink-ensemble <out.tif> --ink [W:]INK.tif ..   per-model percentile-stretched weighted mean of ink renders\n"
         "  ufsm ink-splat <out-group> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U --iso I [--band -4,4] ..   published 2D ink labels -> sparse 3D label zarr\n"
@@ -5184,6 +5186,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
     if (!strcmp(cmd, "ink-strat")) return cmd_ink_strat(argc, argv);
+    if (!strcmp(cmd, "ct-shell-list")) return cmd_ct_shell_list(argc, argv);
     if (!strcmp(cmd, "ink-runs")) return cmd_ink_runs(argc, argv);
     if (!strcmp(cmd, "ink-teach")) return cmd_ink_teach(argc, argv);
     if (!strcmp(cmd, "ink-teach-up")) return cmd_ink_teach_up(argc, argv);
