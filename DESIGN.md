@@ -345,6 +345,36 @@ Decision (lead's rule: adopt if the CI excludes 0):
   `CFROBUST=` gives the old L2 ref. Test: tests/test_unroll_cfrobust.sh.
 - fz-phbm is not adopted for unrolls.
 
+**Second-region check (lead, 11-28).** The setup:
+- Boxes: every wbench box with kept try9 fields outside the region: 37 on 1667, 32 on Paris 4 (PH1-3, HOLD, July J boxes). No
+  label-noise box is among them. The other 17 listed boxes have no bl-t9 fields: 11 label-noise 1667 boxes, which wbench never
+  predicted, and J18 / J21 / J28 / J29 / J31 / J33.
+- Per box: the unroll's ref (refpool flags, L2 vs `--cf-robust 8 --cf-robust-delta 0.02`), then the unroll's slab fit against that
+  ref. CPU, one binary (ef7cf27c) for both arms. Scripts: unrollrun/sh/sec2.sh, sec2box.sh, sec2boot.sh.
+
+| C − A, GT ids | boxes | A | C | diff | 95 % CI | C better |
+|---|---|---|---|---|---|---|
+| slab fit, all | 69 | 0.7675 | 0.7775 | +0.0100 | [−0.0010, +0.0243] | 44 / 69 |
+| slab fit, 1667 | 37 | 0.9016 | 0.9119 | +0.0103 | [−0.0037, +0.0291] | 24 / 37 |
+| slab fit, Paris 4 | 32 | 0.3499 | 0.3590 | +0.0091 | [−0.0003, +0.0206] | 20 / 32 |
+| ref model, all | 69 | 0.7478 | 0.7626 | +0.0148 | [+0.0058, +0.0262] | 53 / 69 |
+| ref model, 1667 | 37 | 0.8748 | 0.8909 | +0.0161 | [+0.0052, +0.0308] | 33 / 37 |
+| ref model, Paris 4 | 32 | 0.3521 | 0.3629 | +0.0108 | [+0.0003, +0.0232] | 20 / 32 |
+
+- The same direction and size as the region: the ref gains everywhere (CI > 0 on both scrolls), and the per-box slab fit's +0.010
+  sits just inside 0.
+- Per-box fits on 512³ crops are a weaker test of the ref than a joined region. The default stays.
+
+wrap-align (unrollrun/sh/cmpviz.sh, area-weighted share of the snapped wraps following the CT lamination):
+
+| arm | wrap-align | wraps |
+|---|---|---|
+| A | 0.7968 | 45 |
+| B | 0.7956 | 45 |
+| C | 0.7986 | 44 |
+
+The C21 middle slice with every arm's wraps (A red, B green, C blue): unrollrun/cmp/viz/c21_ABC.jpg.
+
 ## ATLAS-15k as extra labels: import, inventory, CPU quality audit; 58 % of its area passes a gate (2026-11-27, branch atlas-20261127, atlas)
 
 **Dataset.** huggingface.co/datasets/Qualzz20/ATLAS-15k (rev ac4b982a, CC BY-NC 4.0): 14,678 recto patches on 28 scrolls, 2,306 cm².
