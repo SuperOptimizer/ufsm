@@ -6,6 +6,13 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## microc MCC_MVPHI (moves-before-branch gate): opt-in, no SASS gain, not timed (2026-11-28, microc 9cd6a55, mccdecl)
+
+microc main 9cd6a55 has `MCC_MVPHI=N` (default 0 = off): a many-way join keeps its early moves unless it has ≥ N used phis. Off: all
+178 PTX-bearing ufsm units are byte-identical to 3db3c25, verify flags included (nn_s2 / nn_sysinfo have no kernels). At N = 16, 21 units'
+PTX changes, but SASS (ptxas 13, sm_120a) barely moves: lp_mx_conv1 962544 → 962536 instructions, MMA hot loops 395099 → 395095; f4 / f8
+wgrad, lp_s2 and nn_vwt_fast within ±0.2 %, no kernel's hot loop shrinks ≥ 5 %. Under the ≥ 5 % bar for a card-0 A/B, so none was run.
+
 ## Ink augmentation audit; SA_FOURIER, a low-band Fourier amplitude op (`--aug-fourier-p`) (2026-11-27, branch inkaug-20261127, inkaug)
 
 **Question.** Do the ink recipes' scanner ops erase the ink signal, which is a thin, high-frequency surface cue (Bukreeva 2016, Angelotti
