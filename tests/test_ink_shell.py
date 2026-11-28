@@ -4,6 +4,9 @@ the shell's coverage is what its shell.boxes says. Checked:
 - --shell-list of surface A (z 100..599): x runs of 128^3 chunks (128 x 128 x 128 k boxes, each inside one 1024^3 shard), header
   "# level 0 shard 1024", covering A's rows, all in shard (0, 0, 0); --shell-prev with surface B (z 100..1199): A's chunks kept, shard 0
   grown (named in .redo), shard 1 added (not in .redo);
+- the shell quality (header "q Q"): auto = lossless (q 0) while the estimate (chunks x 128^3 x 0.7 B) is <= --shell-max-gb, else q 2
+  with "DEFAULTED: ctshell q2 (lossless est N GB > M)"; --shell-q 2 sets it without DEFAULTED; a quality change against --shell-prev
+  puts every old shard into .redo (A on A: nothing grew, shard 0 still rewritten);
 - latvol --zarr2 1 --volcomp 0 --exact 1 --boxes (a raw zarr v2 source, 1024^3 shards): exactly the listed chunks written (the shard index),
   read back through --ct-shell; --exact 0 (the bounding region per shard) writes more;
 - --render-only --dump-layers of B through --ct-shell with A's boxes: rows (z) inside A's chunks read 200, rows past them 100, and the
@@ -59,13 +62,24 @@ with tempfile.TemporaryDirectory(prefix="ufsm-shell-") as td:
     # --shell-list of A, then B on top of it
     run(*ext("--surface", d / "A", "--ct", d / "m", "v", "--out", d / "o", "--shell-list", d / "s/v/shell.boxes"))
     hdr, ba = boxes(d / "s/v/shell.boxes")
-    assert hdr.startswith("# level 0 shard 1024"), hdr
+    assert hdr.startswith("# level 0 shard 1024 q 0 "), hdr
     chunks = lambda bs: {(z // 128, y // 128, (x // 128) + i) for z, y, x, nz, ny, nx in bs for i in range(nx // 128)}
     assert all(c % 128 == 0 for b in ba for c in b) and all(b[3] == 128 and b[4] == 128 and b[0] // 1024 == 0 for b in ba), ba
     assert all(b[2] // 1024 == (b[2] + b[5] - 1) // 1024 for b in ba), ba
     ca = chunks(ba)
     need = {(z // 128, y // 128, x // 128) for z in range(90, 611, 16) for y in (int(YS) - 12, int(YS) + 12) for x in (10, 110)}
     assert need <= ca and len(ca) == len(ba) * 1 + sum(b[5] // 128 - 1 for b in ba), (sorted(need - ca), ba)
+    # the quality: an estimate over the limit (A: 10 chunks = 0.015 GB lossless) -> q2, loudly; explicit --shell-q; a change rewrites all
+    r = run(*ext("--surface", d / "A", "--ct", d / "m", "v", "--out", d / "o", "--shell-list", d / "q.boxes", "--shell-max-gb", "0.01"))
+    m = re.search(r"DEFAULTED: ctshell q2 \(lossless est ([\d.]+) GB > 0.01\)", r.stderr)
+    assert m and boxes(d / "q.boxes")[0].startswith("# level 0 shard 1024 q 2 "), r.stderr[-2000:]
+    r = run(*ext("--surface", d / "A", "--ct", d / "m", "v", "--out", d / "o", "--shell-list", d / "q.boxes", "--shell-q", "2"))
+    assert "DEFAULTED" not in r.stderr and boxes(d / "q.boxes")[0].startswith("# level 0 shard 1024 q 2 "), r.stderr[-2000:]
+    r = run(*ext("--surface", d / "A", "--ct", d / "m", "v", "--out", d / "o", "--shell-list", d / "q.boxes", "--shell-prev", d / "s/v/shell.boxes"))
+    assert (d / "q.boxes.redo").read_text().split() == [], "same quality, nothing grew: nothing to rewrite"
+    r = run(*ext("--surface", d / "A", "--ct", d / "m", "v", "--out", d / "o", "--shell-list", d / "q.boxes", "--shell-prev", d / "s/v/shell.boxes",
+                 "--shell-max-gb", "0.01"))
+    assert (d / "q.boxes.redo").read_text().split() == ["0", "0", "0"] and "quality differs" in r.stderr, r.stderr[-2000:]
     run(*ext("--surface", d / "B", "--ct", d / "m", "v", "--out", d / "o", "--shell-list", d / "b.boxes", "--shell-prev", d / "s/v/shell.boxes"))
     _, bb = boxes(d / "b.boxes")
     cb = chunks(bb)

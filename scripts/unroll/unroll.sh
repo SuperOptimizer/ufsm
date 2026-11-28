@@ -157,7 +157,8 @@ VOUT=$([ "$INKMODE" = r3 ] && echo "--volume-out 0")
 # render reads, as chunk runs; latvol --volcomp 0 --exact 1 --boxes from S3CT; lossless beat q2 by +.0056 +- .0031 reader3 AUC on
 # clean 1447), then reads ink through ink-ext --ct-shell. The shell is shared by
 # the run's r3pre calls (flock $SHD.lock: built exclusively, read shared; a grown shard is rewritten). A shell that cannot be built:
-# DEFAULTED, the ink from the q8 store. CTSHELL=0 off, 1 on any scan; SHELLQ (0 = lossless; 2 = q2, ~8x smaller), SHELLTH (6 threads), SHELLDIR, S3CT.
+# DEFAULTED, the ink from the q8 store. CTSHELL=0 off, 1 on any scan; SHELLQ (auto: lossless while ink-ext's estimate is <= SHELLMAXGB
+# (100) GB, else q2 with DEFAULTED; or a volcomp quality, 0 lossless / 2 q2 ~8x smaller), SHELLTH (6 threads), SHELLDIR, S3CT.
 CTSHELL=${CTSHELL:-auto}; [ "$CTSHELL" = auto ] && CTSHELL=$(awk -v u=$UM 'BEGIN { print (u >= 7) ? 1 : 0 }')
 SHD=${SHELLDIR:-$O/ink/ctshell}; S3CT=${S3CT:-https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com}; SHLCB=${SHLCB:-/vesuvius/ufsm/v2/lat/codec/klt1.lcb}
 # ctshell SURFACE-ARGS..: grow $SHD for those --surface args; sets SHX to the ink-ext flags ("" when the shell is not used) and holds
@@ -165,23 +166,26 @@ SHD=${SHELLDIR:-$O/ink/ctshell}; S3CT=${S3CT:-https://vesuvius-challenge-open-da
 shclose() { [ -n "${shfd:-}" ] && exec {shfd}>&-; shfd=; }
 ctshell() {
   SHX=; [ "$CTSHELL" = 1 ] || return 0
-  local t0=$(date +%s) s3k="${K%%/*}/volumes/${K##*/}" lev rc prev=() sz sy sx n
+  local t0=$(date +%s) s3k="${K%%/*}/volumes/${K##*/}" lev rc prev=() sz sy sx n q l0
   mkdir -p $SHD/tmp $SHD/grp/$s3k || { log "DEFAULTED: ctshell: cannot create $SHD: ink from the q8 store $R"; return 0; }
   exec {shfd}> $SHD.lock; flock -x -w ${SHELLWAIT:-7200} $shfd || { log "DEFAULTED: ctshell: $SHD.lock busy ${SHELLWAIT:-7200} s: ink from the q8 store $R"; shclose; return 0; }
   [ -s $SHD/$K/shell.boxes ] && prev=(--shell-prev $SHD/$K/shell.boxes)
-  nice -n 10 $U ink-ext --model $R3MODEL --weights $R3W "$@" --ct $R $K --out $SHD/tmp --threads $R3TH $R3X --shell-list $SHD/new.boxes "${prev[@]}" >> $O/logs/ctshell.log 2>&1; rc=$?
-  lev=$(sed -n 's/^# level \([0-9]*\) shard 1024.*/\1/p' $SHD/new.boxes 2> /dev/null)
-  if [ $rc != 0 ] || [ -z "$lev" ]; then log "DEFAULTED: ctshell: ink-ext --shell-list rc $rc ($O/logs/ctshell.log): ink from the q8 store $R"; shclose; return 0; fi
+  l0=$(cat $O/logs/ctshell.log 2> /dev/null | wc -l)   # (this call's lines only, for its DEFAULTED)
+  nice -n 10 $U ink-ext --model $R3MODEL --weights $R3W "$@" --ct $R $K --out $SHD/tmp --threads $R3TH $R3X --shell-list $SHD/new.boxes \
+    "${prev[@]}" --shell-q ${SHELLQ:-auto} --shell-max-gb ${SHELLMAXGB:-100} >> $O/logs/ctshell.log 2>&1; rc=$?
+  lev=$(sed -n 's/^# level \([0-9]*\) shard 1024 q [0-9].*/\1/p' $SHD/new.boxes 2> /dev/null); q=$(sed -n 's/^# level [0-9]* shard 1024 q \([0-9]\).*/\1/p' $SHD/new.boxes 2> /dev/null)
+  tail -n +$((l0 + 1)) $O/logs/ctshell.log | grep '^DEFAULTED: ctshell q2' | while read -r l; do log "$l"; done   # (auto: lossless estimate over SHELLMAXGB)
+  if [ $rc != 0 ] || [ -z "$lev" ] || [ -z "$q" ]; then log "DEFAULTED: ctshell: ink-ext --shell-list rc $rc ($O/logs/ctshell.log): ink from the q8 store $R"; shclose; return 0; fi
   if [ ${#prev[@]} -gt 0 ] && [ -s $SHD/new.boxes.redo ]; then
     while read -r sz sy sx; do rm -f "$SHD/$K/$lev/c/$sz/$sy/$sx"; done < $SHD/new.boxes.redo; fi   # (grown shards: latvol --resume rewrites them)
   if [ ! -s $SHD/grp/$s3k/zarr.json ]; then
     case $R in http*) curl -sf "$R/$K/zarr.json" -o $SHD/grp/$s3k/zarr.json;; *) cp "$R/$K/zarr.json" $SHD/grp/$s3k/zarr.json;; esac || { log "DEFAULTED: ctshell: no group zarr.json at $R/$K: ink from the q8 store $R"; shclose; return 0; }
   fi
-  nice -n 10 $U latvol $SHLCB $S3CT $s3k $SHD/$K --levels $lev --zarr2 1 --volcomp ${SHELLQ:-0} --gpu -1 --threads ${SHELLTH:-6} --resume 1 --exact 1 --boxes $SHD/new.boxes \
+  nice -n 10 $U latvol $SHLCB $S3CT $s3k $SHD/$K --levels $lev --zarr2 1 --volcomp $q --gpu -1 --threads ${SHELLTH:-6} --resume 1 --exact 1 --boxes $SHD/new.boxes \
     --group-from $SHD/grp >> $O/logs/ctshell.log 2>&1; rc=$?
   if [ $rc != 0 ]; then log "DEFAULTED: ctshell: latvol from $S3CT $s3k rc $rc ($O/logs/ctshell.log): ink from the q8 store $R"; rm -f $SHD/$K/shell.boxes; shclose; return 0; fi
   mv -f $SHD/new.boxes $SHD/$K/shell.boxes
-  n=$(grep -vc '^#' $SHD/$K/shell.boxes); log "ctshell: level $lev q${SHELLQ:-0} shell $SHD/$K: $n chunk runs, $(du -sb $SHD/$K/$lev 2> /dev/null | awk '{printf "%.2f GB", $1 / 1e9}'), $(( $(date +%s) - t0 )) s"
+  n=$(grep -vc '^#' $SHD/$K/shell.boxes); log "ctshell: level $lev q$q shell $SHD/$K: $n chunk runs, $(du -sb $SHD/$K/$lev 2> /dev/null | awk '{printf "%.2f GB", $1 / 1e9}'), $(( $(date +%s) - t0 )) s"
   flock -s $shfd; SHX="--ct-shell $SHD"   # (shared while ink-ext reads: no rebuild under it; closed after the ink-ext)
 }
 r3pre() {
