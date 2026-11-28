@@ -22,7 +22,8 @@ q2 rows reproduce exactly). E2D2-avg ran vox, window 288, halo 16, --tta 8, rend
 | lossless | .7968 | **+.0056 ± .0031 (19/28)** |
 
 - lossless − q2 is 1.8 SE: by the rule the shell is now lossless (unroll.sh `SHELLQ` default 0; `SHELLQ=2` keeps q2).
-- E2D2 rows: see the addendum line below when it lands (E2D2 does not read the shell; it decides nothing here).
+- E2D2-avg on the same box stores: q8 .6822, q2 .7017, lossless .7092; lossless − q2 **+.0075 ± .0028 (20/28)**, 2.7 SE, so the same
+  sign and size as reader3. E2D2 does not read the shell, but a 3-D ink predict on a coarse scan should read lossless CT too.
 
 **Chunk-exact shells.**
 - `ink-ext --shell-list` writes the chunks as x runs of 128^3 chunks (128 x 128 x 128k boxes, each inside one 1024^3 shard), not one
