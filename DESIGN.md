@@ -6,6 +6,49 @@ the gated HuggingFace `scrollprize/datasets` bucket and the AWS `vesuvius-challe
 Originally no teacher models; since 2026-11-15 published ink networks run as teachers in our own C/CUDA ports (ink3d-ext, ink-ext; their weights only, never their code) and their gated predictions become extra ink labels (ink-teach). All upstream data is re-exported once into the user's own codecs
 (volcomp volumes, surfcomp surfaces) so training reads one compact local store.
 
+## Lossless CT shell, chunk-exact: lossless beats q2 by +.0056 ± .0031 reader3 AUC on clean 1447, the shell 2.2x smaller per quality (2026-11-27, branch shellbox-20261127, inkeval)
+
+Lead: score q2 against lossless on 1447's 28 clean crops, paired; if q2 falls short by more than 1 SE, the shell goes lossless. Also cut the
+2.2x bounding-box overencoding of the q2 shell section below.
+
+**Paired, same crops, same settings.** Two box stores of 1447 level 0 from the S3 original over the 28 crops' boxes + 384 voxels: q2
+(2.06 GB, 410 s) and lossless q0 (16.96 GB, 467 s, 8.2x q2). reader3 ran 1 view, no context, --batch 8, as in the q2 section (its q8 and
+q2 rows reproduce exactly). E2D2-avg ran vox, window 288, halo 16, --tta 8, rendered at depth 2 (its PICKS2 / PICKS3 settings).
+
+| reader3, 28 crops | AUC | vs q2 (± SE, crops up) |
+|---|---|---|
+| q8 | .7637 | -.0275 ± .0069 (4/28) |
+| q2 | .7912 | |
+| lossless | .7968 | **+.0056 ± .0031 (19/28)** |
+
+- lossless − q2 is 1.8 SE: by the rule the shell is now lossless (unroll.sh `SHELLQ` default 0; `SHELLQ=2` keeps q2).
+- E2D2 rows: see the addendum line below when it lands (E2D2 does not read the shell; it decides nothing here).
+
+**Chunk-exact shells.**
+- `ink-ext --shell-list` writes the chunks as x runs of 128^3 chunks (128 x 128 x 128k boxes, each inside one 1024^3 shard), not one
+  bounding box per shard. `--shell-prev` merges chunk sets; a shard the old shell had that gains a chunk goes into .redo.
+- `latvol --exact 1` reads and writes only the 128^3 chunks its boxes touch, one chunk per task on --threads workers. `--boxes` takes
+  any number of boxes (was 4096). Without `--exact` the per-shard bounding region is read as before.
+- `ink-ext --ct-shell` builds a one-byte-per-chunk mask from any box file (old bounding-box shells read the same way). A box off the
+  128^3 grid is refused.
+- unroll.sh ctshell passes `--exact 1`. test_ink_shell adds a zarr v2 source with 1024^3 shards: `--exact 1` writes exactly the listed
+  chunks (11, read back through --ct-shell), the bounding region 16.
+
+| 1447 w058 (22 cm², 3590 chunks = 7.5 Gvox, S3, 6 threads) | encoded | shell | latvol |
+|---|---|---|---|
+| q2, bounding box per shard (before) | 16.7 Gvox | 1.43 GB | 236 s |
+| q2, exact | 7.5 Gvox | 0.64 GB | 179 s |
+| lossless, exact (the new default) | 7.5 Gvox | 5.19 GB | 131 s |
+| + w060 lossless (`--shell-prev`, 49 shards rewritten) | 8.6 Gvox | 5.94 GB | 163 s |
+
+- S3 read dominates (113-172 s for the same 7.5 Gvox: internet noise); encoding is 7 s (q2) / 18 s (lossless).
+- A segment-scale ink pass now costs ~0.24 GB and ~6 s per cm² lossless (q2 exact: 0.03 GB).
+- **Full-scroll cost at lossless.** A whole unroll's shell tends to the material-touched part of level 0: ~0.3 B/vox read (this store)
+  against q2's 0.037, so ~8x the q2 estimates below: 1447 ~240 GB, 0139 ~190 GB, 0172 ~570 GB, all 31 coarse scans ~6 TB. Such a run
+  should pass `SHELLQ=2` (or the lead picks per run); the gain over q2 is .0056.
+
+Files: /vesuvius/ufsm/inkeval/{q20.sh, q20b.sh, q20.out, q20/rows.tsv, shellmeas2.sh / .out (q2 exact), shellmeas3.sh / .out (lossless)}.
+
 ## q2 CT shell for coarse-scan ink: built from S3 around the inked surfaces, reader3 +0.028 on clean 1447 (2026-11-27, branch ctshell-20261127, inkeval)
 
 Lead decision after the lossless addendum (per-scroll ink eval section): the unroll's ink stage on a coarse scan builds a q2 copy of
