@@ -19,7 +19,7 @@
 #           fields/rsp --src <m7 prob> --half-um 400 --half2-um 800 --blend 0.3 (RECTOSPX overrides the flags; RECTOSRC="ROOT KEY UM"
 #           names the source): the sheet spacing blended with the m7 recto hit spacing (RECTO 11-02: whole P4 ids .1764 -> .2054, 1667 slabs
 #           +.006..+.045, 0139 -.01..-.02); the ref, slabs and later stages then read fields/rsp. No m7 for this scan + level: skipped.
-#   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads) REFX: extra count-field flags (e.g. --rho-scale S)
+#   ref     -> fields: count-field --model-only (REFCMD F REF [--ct-cal FILE] overrides; cf GPU, TH threads) REFX: extra count-field flags (e.g. --rho-scale S); CFROBUST: the L1 ref flags (default --cf-robust 8 --cf-robust-delta 0.02, CFROBUST= = L2)
 #   slabs   -> ref: snapped slab fits, FITLANES lanes per GPU in FITGPUS ("0 1"; auto: by device memory, 1..3); the INKGPU lanes start once the ink is done; then the
 #           bad-slab check (fit.log: "illegal memory", "loss 0.00000", no final loss line): refit on 1 lane, up to 3 tries, else fail
 #   join    -> slabs: fit-join --ref (refuses bad slabs) ; check -> join: wrap-check (wrapcheck.tsv verdicts; 0 CT peaks = fail) +
@@ -151,13 +151,60 @@ VOUT=$([ "$INKMODE" = r3 ] && echo "--volume-out 0")
 # r3pre OUT GPU SURF..: ONE ink-ext over every surface that has no map in OUT yet (decoded chunks resident across surfaces, --ct-mem LRU;
 # the fetched ones in the run's shared --cache $O/ink/ct.cache: neighbouring 1667 wraps share ~83 % of their chunks, a cold wrap was 46 of 50 s
 # CT fetch, warm 12 s, unrollperf 11-17); r3ink.sh then takes OUT/<name>_<model>.tif (R3PRE). GPU "": the run's device.
+# CTSHELL (inkeval 11-27, lead: lossless / q2 CT gave reader3 +.035 on clean 1447, +.010-.013 on 0139 / 0009B, nil on pooled reads; DESIGN
+# "Per-scroll / per-recipe ink eval" addendum): on a coarse scan (UM >= 7: reader3 reads level 0, which the mirror holds at q8) r3pre first
+# grows a lossless shell of that level around its surfaces from the S3 original, $SHD/$K (ink-ext --shell-list: exactly the chunks the
+# render reads, as chunk runs; latvol --volcomp 0 --exact 1 --boxes from S3CT; lossless beat q2 by +.0056 +- .0031 reader3 AUC on
+# clean 1447), then reads ink through ink-ext --ct-shell. The shell is shared by
+# the run's r3pre calls (flock $SHD.lock: built exclusively, read shared; a grown shard is rewritten). A shell that cannot be built:
+# DEFAULTED, the ink from the q8 store. CTSHELL=0 off, 1 on any scan; SHELLQ (auto: lossless while ink-ext's estimate is <= SHELLMAXGB
+# (100) GB, else q2 with DEFAULTED; or a volcomp quality, 0 lossless / 2 q2 ~8x smaller), SHELLTH (6 threads), SHELLDIR, S3CT.
+CTSHELL=${CTSHELL:-auto}; [ "$CTSHELL" = auto ] && CTSHELL=$(awk -v u=$UM 'BEGIN { print (u >= 7) ? 1 : 0 }')
+SHD=${SHELLDIR:-$O/ink/ctshell}; S3CT=${S3CT:-https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com}; SHLCB=${SHLCB:-/vesuvius/ufsm/v2/lat/codec/klt1.lcb}
+# ctshell SURFACE-ARGS..: grow $SHD for those --surface args (ink-ext --shell-list); ctshell --box BOX LEVEL: for a predict over BOX
+# at LEVEL (ufsm ct-shell-list: the stored chunks within BOX + PSHPAD 1024, the windows' reach; predict --ct-shell refuses a shell that
+# misses one). Sets SHX to the reader's flag ("" when the shell is not used) and holds $SHD.lock shared on fd shfd (the caller's local)
+# until shclose. One store for both: the lists merge (--shell-prev), the quality is decided over the union.
+shclose() { [ -n "${shfd:-}" ] && exec {shfd}>&-; shfd=; }
+ctshell() {
+  SHX=; [ "$CTSHELL" = 1 ] || return 0
+  [ "${1:-}" = --box ] && { [ "${PSHELL:-1}" = 1 ] || return 0; [ "$DRY" = 1 ] && { echo "    (ctshell --box $2: ct-shell-list + latvol into $SHD, predict --ct-shell)"; return 0; }; }
+  local t0=$(date +%s) s3k="${K%%/*}/volumes/${K##*/}" lev rc prev=() sz sy sx n q l0
+  mkdir -p $SHD/tmp $SHD/grp/$s3k || { log "DEFAULTED: ctshell: cannot create $SHD: ink from the q8 store $R"; return 0; }
+  exec {shfd}> $SHD.lock; flock -x -w ${SHELLWAIT:-7200} $shfd || { log "DEFAULTED: ctshell: $SHD.lock busy ${SHELLWAIT:-7200} s: ink from the q8 store $R"; shclose; return 0; }
+  [ -s $SHD/$K/shell.boxes ] && prev=(--shell-prev $SHD/$K/shell.boxes)
+  l0=$(cat $O/logs/ctshell.log 2> /dev/null | wc -l)   # (this call's lines only, for its DEFAULTED)
+  if [ "${1:-}" = --box ]; then
+    nice -n 10 $U ct-shell-list $R $K $SHD/new.boxes --level $3 --um $UM --box $2 --shard 512 --pad ${PSHPAD:-1024} --cache $O/ink/ct.cache \
+      "${prev[@]}" --shell-q ${SHELLQ:-auto} --shell-max-gb ${SHELLMAXGB:-100} >> $O/logs/ctshell.log 2>&1; rc=$?
+  else
+    nice -n 10 $U ink-ext --model $R3MODEL --weights $R3W "$@" --ct $R $K --out $SHD/tmp --threads $R3TH $R3X --shell-list $SHD/new.boxes \
+      "${prev[@]}" --shell-q ${SHELLQ:-auto} --shell-max-gb ${SHELLMAXGB:-100} >> $O/logs/ctshell.log 2>&1; rc=$?
+  fi
+  lev=$(sed -n 's/^# level \([0-9]*\) shard 1024 q [0-9].*/\1/p' $SHD/new.boxes 2> /dev/null); q=$(sed -n 's/^# level [0-9]* shard 1024 q \([0-9]\).*/\1/p' $SHD/new.boxes 2> /dev/null)
+  tail -n +$((l0 + 1)) $O/logs/ctshell.log | grep '^DEFAULTED: ctshell q2' | while read -r l; do log "$l"; done   # (auto: lossless estimate over SHELLMAXGB)
+  if [ $rc != 0 ] || [ -z "$lev" ] || [ -z "$q" ]; then log "DEFAULTED: ctshell: the shell list rc $rc ($O/logs/ctshell.log): ink from the q8 store $R"; shclose; return 0; fi
+  if [ ${#prev[@]} -gt 0 ] && [ -s $SHD/new.boxes.redo ]; then
+    while read -r sz sy sx; do rm -f "$SHD/$K/$lev/c/$sz/$sy/$sx"; done < $SHD/new.boxes.redo; fi   # (grown shards: latvol --resume rewrites them)
+  if [ ! -s $SHD/grp/$s3k/zarr.json ]; then
+    case $R in http*) curl -sf "$R/$K/zarr.json" -o $SHD/grp/$s3k/zarr.json;; *) cp "$R/$K/zarr.json" $SHD/grp/$s3k/zarr.json;; esac || { log "DEFAULTED: ctshell: no group zarr.json at $R/$K: ink from the q8 store $R"; shclose; return 0; }
+  fi
+  nice -n 10 $U latvol $SHLCB $S3CT $s3k $SHD/$K --levels $lev --zarr2 1 --volcomp $q --gpu -1 --threads ${SHELLTH:-6} --resume 1 --exact 1 --boxes $SHD/new.boxes \
+    --group-from $SHD/grp >> $O/logs/ctshell.log 2>&1; rc=$?
+  if [ $rc != 0 ]; then log "DEFAULTED: ctshell: latvol from $S3CT $s3k rc $rc ($O/logs/ctshell.log): ink from the q8 store $R"; rm -f $SHD/$K/shell.boxes; shclose; return 0; fi
+  mv -f $SHD/new.boxes $SHD/$K/shell.boxes
+  n=$(grep -vc '^#' $SHD/$K/shell.boxes); log "ctshell: level $lev q$q shell $SHD/$K: $n chunk runs, $(du -sb $SHD/$K/$lev 2> /dev/null | awk '{printf "%.2f GB", $1 / 1e9}'), $(( $(date +%s) - t0 )) s"
+  flock -s $shfd; SHX="--ct-shell $SHD"   # (shared while ink-ext reads: no rebuild under it; closed after the ink-ext)
+}
 r3pre() {
   local out=$1 g=$2 a=() x; shift 2; [ -n "$g" ] && { g=$(pcard $g) || return 1; }
   for x in "$@"; do [ -s $x/meta.json ] && [ ! -s $out/$(basename $x)_$R3MODEL.tif ] && a+=(--surface $x); done
   [ ${#a[@]} = 0 ] && return 0; mkdir -p $out $O/ink
+  local shfd=; ctshell "${a[@]}"
   ${g:+env CUDA_VISIBLE_DEVICES=$g} nice -n 10 $U ink-ext --model $R3MODEL --weights $R3W "${a[@]}" --ct $R $K --out $out --threads $R3TH \
-    --cache $O/ink/ct.cache $R3X >> $O/logs/r3ink.log 2>&1 || { log "r3pre: ink-ext failed ($O/logs/r3ink.log)"; return 1; }
-  log "r3pre: $(( ${#a[@]} / 2 )) surfaces -> $out: $(grep -oE '[0-9.]+ tiles/s' $O/logs/r3ink.log | tail -1)"
+    --cache $O/ink/ct.cache $R3X $SHX >> $O/logs/r3ink.log 2>&1 || { shclose; log "r3pre: ink-ext failed ($O/logs/r3ink.log)"; return 1; }
+  shclose
+  log "r3pre: $(( ${#a[@]} / 2 )) surfaces -> $out: $(grep -oE '[0-9.]+ tiles/s' $O/logs/r3ink.log | tail -1)$([ -n "$SHX" ] && grep -E '^DEFAULTED: ink-ext: .*outside the shell' $O/logs/r3ink.log | tail -1 | sed 's/^/; /')"
 }
 
 # the run's own copy of the scripts (bash reads scripts incrementally: editing the repo must not change a running driver)
@@ -234,7 +281,7 @@ mstart() {
   elif [ -n "${INKCMD:-}" ]; then mset inkcmd "$INKCMD"; mset ink_ck "${LATINK_CK:-the default of INKCMD}"; [ -n "${LATINK_CK:-}" ] && mset ink_ck_sha "$(fsha $LATINK_CK)"
   else mset ink_ck "$(readlink -f $INKCK)"; mset ink_ck_sha "$(fsha $INKCK)"; fi
   mset box "${BOX:-mask}"; mset zr "${ZR:--}"; mset stripargs_env "${STRIPARGS:-}"
-  mset env "$(for v in CK FEMA FPX FGRID INKCK INKSEAM INKCMD LATINK_CK R3W R3GATE R3PWGATE FILLX FLATX SLABFIT SLABI SLABOV REFX REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
+  mset env "$(for v in CK FEMA FPX FGRID INKCK INKSEAM INKCMD LATINK_CK R3W R3GATE R3PWGATE FILLX FLATX SLABFIT SLABI SLABOV REFX CFROBUST REFCMD RECTOSP TRIM PAPMIN RNETMIN DISTGATE DISTP95 DISTFOLD MINCM2W SNAP SNAPT FWIN LWIN LHALO FSKIP FBLEND ONEPASS OPWIN FCTR FCTK FILLCT LATWROUND INKGATE INKMODE; do [ -n "${!v+x}" ] && printf '%s=%s; ' $v "${!v}"; done)"
 }
 mstage() {
   [ "$DRY" = 1 ] && return 0
@@ -441,7 +488,10 @@ ctcal() {
 # short, 12 B per cell of a cross-section, a multiple of the pool 8, then of 128, until 2026-11-17)
 # MSTRIDE 1 (was 4): the model's local gauge from every chunk. With 4 only every 4th chunk had one (count-field now interpolates the rows
 # between, but the 1667 refs were coherent on 1 / K of z: unroll #8 recheck 11-14); the full pass costs ~4x a 7 s GPU model pass
-refpool() { echo "--R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --model-only 1 --model-stride ${MSTRIDE:-1} ${REFX:-}"; }
+# CFROBUST (default "--cf-robust 8 --cf-robust-delta 0.02"; CFROBUST= = the old L2 integration): the ref integrates the count edges in
+# L1 (8 small-delta Huber IRLS passes per level, globwind ef7cf27c). 1667 region A/B (z 6656..8320, 16 GT boxes, try9 fields, 2026-11-27):
+# joined ids 0.8193 -> 0.8293, paired box bootstrap +0.0100 [+0.0041, +0.0176], 14 / 16 boxes better (DESIGN "1667 comparison unrolls")
+refpool() { echo "--R 0 --pool 8 ${REFPH---phase-w 0.5 --wide 100,140 --wide-phase 15} --model-only 1 --model-stride ${MSTRIDE:-1} ${CFROBUST---cf-robust 8 --cf-robust-delta 0.02} ${REFX:-}"; }
 # refcz: the ref's chunk rows, fixed (REFCZ, 512; lead 2026-11-17): they had come from the free host memory (--mem-gb lowered to 60 % of
 # what was available) and change the ref (0332: 512 vs 640 rows, delta p99 0.017 turn, max 1.03, so two runs' joined models differed).
 # count-field takes fewer only when --mem-gb cannot hold them, with a DEFAULTED: line; the ref stage logs the rows it used
@@ -547,8 +597,11 @@ inkcal() {
   local box cal; box=$([ "$DRY" = 1 ] && echo ${BOX:-BOX} || cat $O/box.txt)
   cal=$(echo $box | awk -F, -v cz=${INKCALZ:-2048} '{ zc = $1 + int($4 / 2); z0 = zc - int(cz / 2); if (z0 < $1) z0 = $1; nz = cz; if (nz > $4) nz = $4; printf "%d,%d,%d,%d,%d,%d", z0, $2, $3, nz, $5, $6 }')
   local P="--um $UM --level $LV --shard 512 --ema 1 --q 32 --threads ${ITH:-12} --gpu $(lg $INKGPU) --axis $O/axis.json $(occlv)"
-  [ -s $O/ink/gn.bin ] || { X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window ${INKW:-auto} --halo ${INKH:-32} --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp &&
-                             { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || return 1; }
+  [ -s $O/ink/gn.bin ] && return 0
+  local shfd=; ctshell --box $box $LV   # (the whole ink box: the main pass reuses it; the statistics from the CT the pass reads)
+  X $O/logs/inkcal.log $U predict $INKCK $R $K $O/ink/gncal.zarr $P ${INKPX:-} --window ${INKW:-auto} --halo ${INKH:-32} --box $cal --full-grid 1 --levels 1 --no-out 1 --gn-save $O/ink/gn.tmp $SHX &&
+    { [ "$DRY" = 1 ] || { mv $O/ink/gn.tmp $O/ink/gn.bin; rm -rf $O/ink/gncal.zarr; }; } || { shclose; return 1; }
+  shclose
 }
 ink() {
   [ "$INKMODE" = r3 ] && { [ "$DRY" = 1 ] && echo "    (INKMODE=r3: no ink volume; the renders' ink is r3ink.sh on each surface, $R3W)"; return 0; }
@@ -571,8 +624,10 @@ ink() {
   # --seamless 2 by default (lead 11-27, DESIGN "R11P HOLD rows": PHerc1203 window-seam jump 4.76 plain -> 0.13 / 0.11 at offsets 0 / 256,
   # 1.3x a w832 / h160 pass, which only reaches 1.24): two tile grids sin^2-blended; INKSEAM=0 = the old single feathered pass (INKF voxels)
   local seam; [ "${INKSEAM:-2}" = 0 ] && seam="--feather ${INKF:-32}" || seam="--seamless ${INKSEAM:-2}"
+  local shfd=; ctshell --box $box $LV   # (CTSHELL / PSHELL: a lossless / q2 copy of the ink box from S3, predict --ct-shell)
   X $O/logs/ink.log $U predict $INKCK $R $K $INK $P ${INKPX:-} --box $box --window ${INKW:-auto} --halo ${INKH:-32} $seam --full-grid 1 --resume 1 --levels 4 \
-    --gn-frozen $O/ink/gn.bin || return 1
+    --gn-frozen $O/ink/gn.bin $SHX || { shclose; return 1; }
+  shclose
 }
 
 # --- slab fits: one lane per GPU, claims by flock (fd.sh lane) ---

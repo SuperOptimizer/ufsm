@@ -80,8 +80,21 @@ static void *enc_run(void *arg) {
     return nullptr;
 }
 
+/* --exact 1 (inkeval 11-27): the 128^3 chunks under the boxes alone, read one chunk per task (a shard's chunk list) */
+typedef struct { csrc *z; const int64_t *o; int SH; const int32_t *ci; int n; uint8_t *ct; _Atomic int next, failed; char err[256]; } chunk_job;
+static void *chunk_run(void *arg) {
+    chunk_job *J = arg; uint8_t *b = malloc(128 * 128 * 128); const int cg = J->SH / 128;
+    for (int t; b && (t = atomic_fetch_add(&J->next, 1)) < J->n && !atomic_load(&J->failed);) {
+        const int c = J->ci[t], cz = c / (cg * cg), cy = c / cg % cg, cx = c % cg; const int64_t o[3] = {J->o[0] + cz * 128, J->o[1] + cy * 128, J->o[2] + cx * 128}, n[3] = {128, 128, 128};
+        if (src_read(J->z, o, n, b, 1)) { if (!atomic_exchange(&J->failed, 1)) snprintf(J->err, sizeof J->err, "%s", src_error(J->z)); break; }
+        for (int zz = 0; zz < 128; zz++) for (int yy = 0; yy < 128; yy++)
+            memcpy(J->ct + ((size_t)(cz * 128 + zz) * J->SH + (size_t)(cy * 128 + yy)) * J->SH + (size_t)cx * 128, b + ((size_t)zz * 128 + yy) * 128, 128);
+    }
+    if (!b) atomic_store(&J->failed, 1);
+    free(b); return nullptr;
+}
 static int encode_level(store *st, const char *group, const char *lname, const char *outg, const lat_basis *lb, int C, float step, double sd_opt, int nth, int gpu,
-                        const char *cache, int resume, const long long (*boxv)[6], int nbox, const char *tables, double *tot_bytes, double *tot_vox, int v2, int shard_opt, double vq) {
+                        const char *cache, int resume, const long long (*boxv)[6], int nbox, const char *tables, double *tot_bytes, double *tot_vox, int v2, int shard_opt, double vq, int exact) {
     char key[1100], odir[1200], p[1400]; snprintf(key, sizeof key, "%s/%s", group, lname); snprintf(odir, sizeof odir, "%s/%s", outg, lname);
     csrc S = {0}, *z = &S; struct { int64_t shape[3]; } M, *m = &M;
     if (v2) {
@@ -177,6 +190,22 @@ static int encode_level(store *st, const char *group, const char *lname, const c
         if (S.z && z3_shard_present(S.z, sz, sy, sx) != 1) continue;
         double t1 = now();
         if (!nbox) { if (src_read(z, o, nn3, ct, nth)) { fprintf(stderr, "latvol: read failed: %s\n", src_error(z)); return 1; } rvox += ev; }
+        else if (exact) {   /* --exact 1: only the chunks under the boxes themselves (an ink-ext --shell-list file: chunk runs; the bounding region was 2.2x) */
+            const int cg1 = SH / 128; int32_t *ci = malloc((size_t)cg1 * cg1 * cg1 * sizeof *ci); uint8_t *mk = calloc((size_t)cg1 * cg1 * cg1, 1); int nci = 0;
+            for (int b = 0; b < nbox; b++) { int64_t ba[3], be[3]; int in = 1;
+                for (int d = 0; d < 3; d++) { ba[d] = boxv[b][d] > o[d] ? boxv[b][d] : o[d]; be[d] = boxv[b][d] + boxv[b][3 + d] < o[d] + SH ? boxv[b][d] + boxv[b][3 + d] : o[d] + SH;
+                    if (be[d] > m->shape[d]) be[d] = m->shape[d]; in &= be[d] > ba[d]; }
+                if (in) for (int64_t cz = (ba[0] - o[0]) / 128; cz <= (be[0] - 1 - o[0]) / 128; cz++) for (int64_t cy = (ba[1] - o[1]) / 128; cy <= (be[1] - 1 - o[1]) / 128; cy++)
+                    for (int64_t cx = (ba[2] - o[2]) / 128; cx <= (be[2] - 1 - o[2]) / 128; cx++) mk[(cz * cg1 + cy) * cg1 + cx] = 1; }
+            for (int i = 0; i < cg1 * cg1 * cg1; i++) if (mk[i]) ci[nci++] = i;
+            memset(ct, 0, sv3);
+            chunk_job J = {.z = z, .o = o, .SH = SH, .ci = ci, .n = nci, .ct = ct}; const int nt = nth < nci ? nth : nci > 0 ? nci : 1; pthread_t *CT = malloc((size_t)nt * sizeof *CT);
+            for (int t = 0; t < nt; t++) pthread_create(&CT[t], nullptr, chunk_run, &J);
+            for (int t = 0; t < nt; t++) pthread_join(CT[t], nullptr);
+            free(CT); free(ci); free(mk);
+            if (atomic_load(&J.failed)) { fprintf(stderr, "latvol: read failed: %s\n", J.err[0] ? J.err : "allocation"); return 1; }
+            rvox += (double)nci * 128 * 128 * 128;
+        }
         else {   /* boxes: only the chunks under the boxes' bounding region in this shard are read and written (the rest of the shard: absent) */
             int64_t a[3] = {INT64_MAX, INT64_MAX, INT64_MAX}, e[3] = {INT64_MIN, INT64_MIN, INT64_MIN};
             for (int b = 0; b < nbox; b++) { int64_t ba[3], be[3]; int in = 1;
@@ -225,10 +254,11 @@ static int encode_level(store *st, const char *group, const char *lname, const c
 
 int cmd_latvol(int argc, char **argv) {
     if (argc < 6) { fprintf(stderr, "usage: ufsm latvol BASIS.lcb ROOT CT-GROUP OUT-GROUP --levels L[,L..] [--c 29] [--step 0.25] [--sd S] [--gpu 0 | -1] [--threads N]\n"
-                                    "                   [--cache DIR] [--resume 1] [--box Z,Y,X,NZ,NY,NX] [--tables N]\n"
+                                    "                   [--cache DIR] [--resume 1] [--box Z,Y,X,NZ,NY,NX | --boxes FILE [--exact 1]] [--tables N]\n"
                                     "  the CT levels (group paths, e.g. 2,3) as latent cells of the BASIS (train --lat-fit; the first --c rows, quantiser step --step x the\n"
                                     "  level's sd, measured or --sd) in OUT-GROUP, a CT group in the same layout: train / predict read it as their CT (src/latvol.h).\n"
-                                    "  --gpu -1: the transform on the CPU. --box / --boxes FILE: only the chunks under those boxes (per shard their bounding region; voxels of\n"
+                                    "  --gpu -1: the transform on the CPU. --box / --boxes FILE: only the chunks under those boxes (per shard their bounding region, or with\n"
+                                    "  --exact 1 the 128^3 chunks the boxes touch, nothing else: ink-ext --shell-list chunk runs; voxels of\n"
                                     "  the first --levels entry, other levels: scaled; give the boxes with the predict halo). --resume 1: shards already written are kept,\n"
                                     "  with the store's own codec.\n"
                                     "  --zarr2 1: ROOT / CT-GROUP is the raw upstream zarr v2 pyramid (written in shards of --shard 1024; the group's zarr.json from\n"
@@ -241,14 +271,18 @@ int cmd_latvol(int argc, char **argv) {
     const int C = opt_atoi("--c", opt(argc, argv, "--c", "29")), nth = ufsm_threads(opt_atoi("--threads", opt(argc, argv, "--threads", "0")), 8), gpu = opt_atoi("--gpu", opt(argc, argv, "--gpu", "0")), resume = opt_atoi("--resume", opt(argc, argv, "--resume", "0"));
     const float step = (float)opt_atof("--step", opt(argc, argv, "--step", "0.25")); const double sd = opt_atof("--sd", opt(argc, argv, "--sd", "0"));
     if (C < 1 || C > LV_MAXC || !(step > 0)) { fprintf(stderr, "latvol: --c 1..64, --step > 0\n"); return 2; }
-    enum { MAXBOX = 4096 }; long long (*bx)[6] = malloc(MAXBOX * sizeof *bx), (*b2)[6] = malloc(MAXBOX * sizeof *b2); int nbox = 0;
+    long long (*bx)[6] = malloc(sizeof *bx), (*b2)[6] = nullptr; int nbox = 0, bcap = 1;   /* (any number of boxes: --exact chunk runs; 4096 before 11-27) */
     if (*opt(argc, argv, "--box", "")) { if (sscanf(opt(argc, argv, "--box", ""), "%lld,%lld,%lld,%lld,%lld,%lld", bx[0], bx[0] + 1, bx[0] + 2, bx[0] + 3, bx[0] + 4, bx[0] + 5) != 6) { fprintf(stderr, "latvol: --box Z,Y,X,NZ,NY,NX\n"); return 2; } nbox = 1; }
     if (*opt(argc, argv, "--boxes", "")) {   /* a file of boxes, one "z y x nz ny nx" (or comma separated) a line */
         FILE *bf = fopen(opt(argc, argv, "--boxes", ""), "r"); char ln[512]; if (!bf) { fprintf(stderr, "latvol: cannot read --boxes %s\n", opt(argc, argv, "--boxes", "")); return 2; }
-        while (nbox < MAXBOX && fgets(ln, sizeof ln, bf)) { for (char *c = ln; *c; c++) if (*c == ',' || *c == '\t') *c = ' ';
+        while (fgets(ln, sizeof ln, bf)) { for (char *c = ln; *c; c++) if (*c == ',' || *c == '\t') *c = ' ';
+            if (nbox == bcap) { bcap *= 2; bx = realloc(bx, (size_t)bcap * sizeof *bx); }
             if (sscanf(ln, "%lld %lld %lld %lld %lld %lld", bx[nbox], bx[nbox] + 1, bx[nbox] + 2, bx[nbox] + 3, bx[nbox] + 4, bx[nbox] + 5) == 6) nbox++; }
         fclose(bf); if (!nbox) { fprintf(stderr, "latvol: --boxes: no box read\n"); return 2; }
     }
+    b2 = malloc((size_t)(nbox ? nbox : 1) * sizeof *b2);
+    const int exact = opt_atoi("--exact", opt(argc, argv, "--exact", "0"));
+    if (exact && !nbox) { fprintf(stderr, "latvol: --exact 1 needs --box / --boxes\n"); return 2; }
     const int v2 = opt_atoi("--zarr2", opt(argc, argv, "--zarr2", "0")), shard_opt = opt_atoi("--shard", opt(argc, argv, "--shard", "1024")); const double vq = opt_atof("--volcomp", opt(argc, argv, "--volcomp", "-1"));
     if (shard_opt < 128 || shard_opt % 128) { fprintf(stderr, "latvol: --shard: a multiple of 128\n"); return 2; }
     {   /* the group's metadata as it is (level names, voxel sizes) */
@@ -265,7 +299,7 @@ int cmd_latvol(int argc, char **argv) {
     for (char *tok = strtok(lv, ","); tok; tok = strtok(nullptr, ",")) {
         const int L = atoi(tok); if (first < 0) first = L;
         for (int b = 0; b < nbox; b++) { const int sh = L - first; for (int i = 0; i < 6; i++) b2[b][i] = sh >= 0 ? (bx[b][i] + (i >= 3 ? (1ll << sh) - 1 : 0)) >> sh : bx[b][i] << -sh; }
-        const int rc = encode_level(st, group, tok, outg, lb, C, step, sd, nth, gpu, cache, resume, b2, nbox, opt(argc, argv, "--tables", nullptr), &tb, &tv, v2, shard_opt, vq);
+        const int rc = encode_level(st, group, tok, outg, lb, C, step, sd, nth, gpu, cache, resume, b2, nbox, opt(argc, argv, "--tables", nullptr), &tb, &tv, v2, shard_opt, vq, exact);
         if (rc) return rc;
     }
     printf("latvol: %s: %.3f GB in all (%.4f bytes per voxel)\n", outg, tb / 1e9, tv > 0 ? tb / tv : 0);

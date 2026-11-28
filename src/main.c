@@ -146,6 +146,7 @@ int cmd_phase_score(int argc, char **argv);
 int cmd_ink_splat(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_score(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_strat(int argc, char **argv);   /* src/inkstrat.c */
+int cmd_ct_shell_list(int argc, char **argv);   /* src/ctshell.c */
 int cmd_ink_runs(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach(int argc, char **argv);   /* src/inksplat.c */
 int cmd_ink_teach_up(int argc, char **argv);   /* src/inksplat.c */
@@ -235,6 +236,7 @@ static int usage(void) {
         "  ufsm jpeg-fit IN.jpg OUT.jpg --div 2 | --max-px N                  a finished JPEG shrunk (OUT may be IN)\n"
         "  ufsm tifxyz-sfc <src-dir> <dst-dir> [--error 0.25] [--every K]   tifxyz wraps -> surface-compressor .sfc (readers take .sfc wraps directly)\n"
         "  ufsm sheet-cut <wraps-dir> <out-dir> [--tol 0.3] [--min-cm2 0.25] [--max 8]   square flat sheets: largest isometric rectangles of each wrap\n"
+        "  ufsm ct-shell-list ROOT KEY OUT --level L --box B   the CT shell list of a predict box (latvol --exact 1, predict --ct-shell)\n"
         "  ufsm ink-ext --model v8in|hecate24|hecate96|reader3|ink9um --weights W --surface TIFXYZ --ct ROOT KEY --out DIR   external ink networks on a surface\n"
         "  ufsm ink-ensemble <out.tif> --ink [W:]INK.tif ..   per-model percentile-stretched weighted mean of ink renders\n"
         "  ufsm ink-splat <out-group> --surface TIFXYZ --labels L [--mask M] --ct ROOT KEY --ct-um U --iso I [--band -4,4] ..   published 2D ink labels -> sparse 3D label zarr\n"
@@ -364,6 +366,7 @@ static int usage(void) {
         "  ufsm fiber-trace <root> <key-prefix> <out.fib> --box Z,Y,X,NZ,NY,NX [--scaledown 3]   streamlines through a published fibre prediction (presence, nx, ny) -> UFIB\n"
         "  ufsm fiber-raster <fibres.afv|.fib> OUT --um U (--shape Z,Y,X | --ct ROOT KEY)   H / V fibre mask labels (prob254) on the CT grid\n"
         "  ufsm fiber-onfly <fibres.afv|.fib> --ct ROOT KEY [--ref H V KEY]   the fibre planes on the fly (sources \"fibre\" targets): ms / window, diffs\n"
+        "  ufsm field-label OUT FIELDS-A FIELDS-B [--gt ORACLE]   labels for the cells where two models disagree, from the sheet continuity of the agreeing cells (+ field-label-raster: a 9.6 um phase target)\n"
         "  ufsm field-disagree OUT FIELDS1 FIELDS2 .. [--gt ORACLE] [--labelled ROOT KEY --lab-um U] [--region 512 --frame-um U]   where models' fit fields disagree (position, normal wrap count, winding mod 4): volume + ranked labelling regions\n"
         "  ufsm field-blend <out> <fields1> <fields2> ... [--weights a,b,..] [--tile SZ,SY,SX --grids z,y,x:..] [--conf mean] [--paste F [--box z,y,x,nz,ny,nx]] [--plane-w GROUP=a,b,..:..]  fit fields averaged (phase: confidence-weighted complex mean; --tile: overlapping predicts, centre-weighted)\n"
         "  ufsm wind-score <sweep-dir> <codes-root> <codes-key>             the fit --codes score of a predict --cond-sweep winding raster\n"
@@ -5009,6 +5012,8 @@ int cmd_gt_anchors(int argc, char **argv);   /* src/anchors.c */
 int cmd_annot_regions(int argc, char **argv);
 int cmd_fields_oracle(int argc, char **argv);   /* src/fieldsoracle.c */
 int cmd_field_disagree(int argc, char **argv);   /* src/fielddis.c */
+int cmd_field_label(int argc, char **argv);   /* src/fielddis.c */
+int cmd_field_label_raster(int argc, char **argv);   /* src/fielddis.c */
 int cmd_flatten(int argc, char **argv);         /* src/flatten.c */
 int cmd_faces(int argc, char **argv);           /* src/faces_cli.c */
 int cmd_flatten_warp(int argc, char **argv);
@@ -5104,6 +5109,8 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "annot-regions")) return cmd_annot_regions(argc, argv);
     if (!strcmp(cmd, "fields-oracle")) return cmd_fields_oracle(argc, argv);
     if (!strcmp(cmd, "field-disagree")) return cmd_field_disagree(argc, argv);
+    if (!strcmp(cmd, "field-label")) return cmd_field_label(argc, argv);
+    if (!strcmp(cmd, "field-label-raster")) return cmd_field_label_raster(argc, argv);
     if (!strcmp(cmd, "flatten")) return cmd_flatten(argc, argv);
     if (!strcmp(cmd, "faces")) return cmd_faces(argc, argv);
     if (!strcmp(cmd, "flatten-warp")) return cmd_flatten_warp(argc, argv);
@@ -5181,6 +5188,7 @@ static int ufsm_main(int argc, char **argv) {
     if (!strcmp(cmd, "ink-splat")) return cmd_ink_splat(argc, argv);
     if (!strcmp(cmd, "ink-score")) return cmd_ink_score(argc, argv);
     if (!strcmp(cmd, "ink-strat")) return cmd_ink_strat(argc, argv);
+    if (!strcmp(cmd, "ct-shell-list")) return cmd_ct_shell_list(argc, argv);
     if (!strcmp(cmd, "ink-runs")) return cmd_ink_runs(argc, argv);
     if (!strcmp(cmd, "ink-teach")) return cmd_ink_teach(argc, argv);
     if (!strcmp(cmd, "ink-teach-up")) return cmd_ink_teach_up(argc, argv);

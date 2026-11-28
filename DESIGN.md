@@ -74,6 +74,270 @@ Runs: A, the coarse dev crops (inksdk/dev/crops, 7.9-9.4 um, 7 scans, 91 tiles);
 the control, F adds `--aug-fourier-p .3 --aug-fourier-cut .03`, G sets `--aug-gin-p 0`, B sets `--aug-blur-s 0.8` (G / B change the
 argv's own value: opt() takes the first occurrence). inkeval's ab.sh scores 1447 / 0841 per scroll, F − A paired by crop
 (LEVEL_0841 2, PWIN 288). Results will be added here.
+## Ink ensembles and the predict CT shell: reader3 + E2D2 mean loses on 1447, ties on 0841; shell quality auto (≤ 100 GB lossless), predict --ct-shell (2026-11-27, branch shellq-20261127, inkeval)
+
+**Ensemble (lead).** reader3 and E2D2-avg probability maps, weighted mean on the pixels both maps cover (`ink-score --fuse mean
+--weights`), paired by crop against each model alone on the same pixels. These are existing maps only:
+- 1447: reader3-ctx-m8 on lossless CT, and E2D2 on lossless CT (the q20 store);
+- 0841: reader3-ctx-m8 and E2D2-t8 (PICKS2 / PICKS3).
+
+| vs reader3 (± paired SE, crops up) | 1447 (28) | 0841 (8) |
+|---|---|---|
+| reader3 / E2D2 alone | .8057 / .7092 | .8908 / .8578 |
+| mean 0.5 / 0.5 | -.0255 ± .0076 (8/28) | +.0116 ± .0079 (6/8) |
+| 0.7 reader3 / 0.3 E2D2 | -.0114 ± .0049 (12/28) | +.0112 ± .0049 (6/8) |
+| 0.3 reader3 / 0.7 E2D2 | -.0443 ± .0104 (7/28) | +.0068 ± .0119 (6/8) |
+
+- No weighting beats reader3 on both scrolls. 1447 loses at every weight; on 0841 the best arm (0.7 / 0.3) is 2.3 SE up on 8 crops.
+- 1-view reader3 + E2D2 on lossless 1447 also loses at every weight (0.7 / 0.3: -.0096 ± .0064).
+- This repeats the 11-25 E0 / S2 fusion result. No ensemble goes into the unroll, so no cost estimate was written.
+- Rows: /vesuvius/ufsm/inkeval/{ens.sh, ens/rows.tsv}.
+
+**Shell quality, automatic (lead).**
+- `--shell-q auto` (the default, in ink-ext --shell-list and ct-shell-list) writes q 0 (lossless) while the estimate is ≤
+  `--shell-max-gb` 100. The estimate is chunks x 128^3 x 0.70 B: 1447 w058 measured 0.69 B per voxel lossless.
+- Above the limit it writes q 2 and prints `DEFAULTED: ctshell q2 (lossless est N GB > 100)`. The quality goes into the list header
+  (`# level L shard 1024 q Q`); unroll's ctshell reads it for latvol and logs the DEFAULTED line.
+- A quality change against `--shell-prev` puts every old shard into .redo, so a shell never mixes qualities.
+- SHELLQ (a number) overrides the rule; SHELLMAXGB sets the limit.
+- Why: /vesuvius has ~300 GB free, and a whole-scroll lossless shell (1447 ~240 GB) would starve the other runs.
+
+**predict --ct-shell ROOT (lead: 3-D ink is the goal net, and its lossless gain, +.0075 over q2, is the larger one).**
+- `ufsm ct-shell-list ROOT KEY OUT --level L --box B --shard 512 --pad 1024` lists every stored 128^3 chunk of the box, rounded to
+  predict's output shards and grown by the windows' reach. The list code is shared with ink-ext in src/ctshell.c.
+- predict reads ROOT/KEY/<level> instead of the main level only if its shell.boxes holds every stored main chunk within the
+  shard-rounded box ± (window + halo). Otherwise it prints `DEFAULTED: predict: --ct-shell ROOT: not used (N of M chunks ...)` and
+  reads the main level.
+- In the unroll, inkcal and ink run `ctshell --box $box $LV` into the same $SHD store as reader3: the lists merge and the quality is
+  decided over the union. CTSHELL auto turns it on for coarse scans; PSHELL=0 turns off the predict part.
+- Real check on 1447 w058_0, E2D2-avg tta 8: ct-shell-list + lossless latvol from S3 took 138 s for 3226 chunks (4.60 GB). predict read
+  all 3240 reach chunks from the shell, and the AUC was .6541 = the q20 lossless row, exactly.
+  - The first try padded only window + halo and missed the shard rounding: predict refused it (2426 of 3240 chunks missing) and fell
+    back to q8 (.6253). That is the failure the check exists for.
+- Whole-box cost: the 3-D ink box of a full 1447 unroll is ~1.7 Tvox at level 0. That is far over 100 GB lossless, so it gets q2 by the
+  rule: ~0.086 B per voxel over the stored chunks, and some hours of S3 reads at the 50-75 Mvox/s measured. This runs once per run.
+- Test: test_predict_shell (gpu, ~30 s). A lossless shell gives a byte-identical prediction; a q8 shell is read (the output differs); a
+  shell that misses reach chunks is refused with DEFAULTED and gives the same output as the main store; ct-shell-list picks q 0 / q 2
+  around the limit. test_ink_shell also checks the q header, the auto DEFAULTED line, explicit --shell-q, and the full .redo on a
+  quality change.
+
+## Lossless CT shell, chunk-exact: lossless beats q2 by +.0056 ± .0031 reader3 AUC on clean 1447, the shell 2.2x smaller per quality (2026-11-27, branch shellbox-20261127, inkeval)
+
+Lead: score q2 against lossless on 1447's 28 clean crops, paired; if q2 falls short by more than 1 SE, the shell goes lossless. Also cut the
+2.2x bounding-box overencoding of the q2 shell section below.
+
+**Paired, same crops, same settings.** Two box stores of 1447 level 0 from the S3 original over the 28 crops' boxes + 384 voxels: q2
+(2.06 GB, 410 s) and lossless q0 (16.96 GB, 467 s, 8.2x q2). reader3 ran 1 view, no context, --batch 8, as in the q2 section (its q8 and
+q2 rows reproduce exactly). E2D2-avg ran vox, window 288, halo 16, --tta 8, rendered at depth 2 (its PICKS2 / PICKS3 settings).
+
+| reader3, 28 crops | AUC | vs q2 (± SE, crops up) |
+|---|---|---|
+| q8 | .7637 | -.0275 ± .0069 (4/28) |
+| q2 | .7912 | |
+| lossless | .7968 | **+.0056 ± .0031 (19/28)** |
+
+- lossless − q2 is 1.8 SE: by the rule the shell is now lossless (unroll.sh `SHELLQ` default 0; `SHELLQ=2` keeps q2).
+- E2D2-avg on the same box stores: q8 .6822, q2 .7017, lossless .7092; lossless − q2 **+.0075 ± .0028 (20/28)**, 2.7 SE, so the same
+  sign and size as reader3. E2D2 does not read the shell, but a 3-D ink predict on a coarse scan should read lossless CT too.
+
+**Chunk-exact shells.**
+- `ink-ext --shell-list` writes the chunks as x runs of 128^3 chunks (128 x 128 x 128k boxes, each inside one 1024^3 shard), not one
+  bounding box per shard. `--shell-prev` merges chunk sets; a shard the old shell had that gains a chunk goes into .redo.
+- `latvol --exact 1` reads and writes only the 128^3 chunks its boxes touch, one chunk per task on --threads workers. `--boxes` takes
+  any number of boxes (was 4096). Without `--exact` the per-shard bounding region is read as before.
+- `ink-ext --ct-shell` builds a one-byte-per-chunk mask from any box file (old bounding-box shells read the same way). A box off the
+  128^3 grid is refused.
+- unroll.sh ctshell passes `--exact 1`. test_ink_shell adds a zarr v2 source with 1024^3 shards: `--exact 1` writes exactly the listed
+  chunks (11, read back through --ct-shell), the bounding region 16.
+
+| 1447 w058 (22 cm², 3590 chunks = 7.5 Gvox, S3, 6 threads) | encoded | shell | latvol |
+|---|---|---|---|
+| q2, bounding box per shard (before) | 16.7 Gvox | 1.43 GB | 236 s |
+| q2, exact | 7.5 Gvox | 0.64 GB | 179 s |
+| lossless, exact (the new default) | 7.5 Gvox | 5.19 GB | 131 s |
+| + w060 lossless (`--shell-prev`, 49 shards rewritten) | 8.6 Gvox | 5.94 GB | 163 s |
+
+- S3 read dominates (113-172 s for the same 7.5 Gvox: internet noise); encoding is 7 s (q2) / 18 s (lossless).
+- A segment-scale ink pass now costs ~0.24 GB and ~6 s per cm² lossless (q2 exact: 0.03 GB).
+- **Full-scroll cost at lossless.** A whole unroll's shell tends to the material-touched part of level 0: ~0.3 B/vox read (this store)
+  against q2's 0.037, so ~8x the q2 estimates below: 1447 ~240 GB, 0139 ~190 GB, 0172 ~570 GB, all 31 coarse scans ~6 TB. Such a run
+  should pass `SHELLQ=2` (or the lead picks per run); the gain over q2 is .0056.
+
+Files: /vesuvius/ufsm/inkeval/{q20.sh, q20b.sh, q20.out, q20/rows.tsv, shellmeas2.sh / .out (q2 exact), shellmeas3.sh / .out (lossless)}.
+
+## q2 CT shell for coarse-scan ink: built from S3 around the inked surfaces, reader3 +0.028 on clean 1447 (2026-11-27, branch ctshell-20261127, inkeval)
+
+Lead decision after the lossless addendum (per-scroll ink eval section): the unroll's ink stage on a coarse scan builds a q2 copy of
+level 0 around the surfaces it will ink, from the S3 original, and reads ink from it. Pooled-level reads (2.4 um scans at L2) are left
+alone, because the mirror's L2 is already q2.
+
+**How it works:**
+- `ink-ext --shell-list FILE` loads no net and needs no GPU. It writes the 128^3 chunks every `--surface` render reads (render_keys, the
+  renderer's own set) as one box per 1024^3 shard, under a header `# level L shard 1024`.
+- `--shell-prev OLD` merges an existing shell's boxes. Shards whose box grows are listed in FILE.redo: their shard file must go before
+  latvol rewrites it.
+- `latvol --volcomp 2 --boxes FILE --resume 1` encodes the shell from S3. latvol now refuses more than 4096 boxes; before, it dropped the
+  rest silently.
+- `ink-ext --ct-shell ROOT` reads ROOT/KEY/L for the chunks inside ROOT/KEY/shell.boxes and the main store for the rest, and the
+  prefetcher skips the shell's chunks. At the end it prints the counts, plus `DEFAULTED: ink-ext: N of M level-L CT chunks outside the
+  shell` when N > 0. An unusable shell (no shell.boxes, wrong shape or chunking) prints DEFAULTED and every chunk comes from the main store.
+- unroll.sh `r3pre` calls `ctshell` first. The shell lives at `$O/ink/ctshell`, under the unroll dir (/vesuvius or the NAS).
+  - Default CTSHELL=auto, which means on for UM >= 7, i.e. reader3 reads level 0.
+  - It is shared by the run's r3pre calls under `flock $SHD.lock`: exclusive while it grows, shared while ink-ext reads it.
+  - Any failure (list, group json, latvol, lock wait SHELLWAIT 7200 s) logs `DEFAULTED: ctshell: ... ink from the q8 store` and the
+    stage runs on q8.
+- `--render-only` no longer needs a GPU or weights either.
+- Test: test_ink_shell (CPU, fast tier). It uses a two-shard (z) volume with main 100 and shell 200 and checks:
+  - the per-shard boxes, the .redo list and the box-per-shard rule;
+  - rows inside the shell read 200 and rows outside read 100, with the DEFAULTED count;
+  - a full shell reads all 200 with no DEFAULTED;
+  - a missing shell gives DEFAULTED and all 100.
+- Bug caught on real data: the first grouping key overflowed (ckey << 22 lost the z shard), so boxes spanned z shards and the reader
+  refused them. The test volume now spans z shards.
+
+**Measured** (1447 w058 + w060, 8.64 um, the clean benchmark's segments, 2 x 22 cm², desk, S3 over the internet, 6 threads):
+
+| step | chunks read by ink | encoded (shard boxes) | shell | time |
+|---|---|---|---|---|
+| w058 alone | 3590 (7.5 Gvox) | 51 boxes, 16.7 Gvox | 1.43 GB | 236 s (S3 read 226 s, ~74 Mvox/s) |
+| + w060 (`--shell-prev`, 28 shards rewritten) | 4110 (8.6 Gvox) | 52 boxes, 18.5 Gvox | 1.58 GB | 157 s |
+| list step | | | | 0.1-0.2 s |
+| ink read through the shell | 7280 chunks from the shell, 0 from q8 | | | |
+
+- **Ink (paired by crop, 28 clean 1447 crops; reader3 1 view, no context, same binary):** q8 .7637, q2 shell .7912, **+.0275 ± .0069
+  (24/28 up)**. That is the lossless gain of the addendum (+.027 E2D2, +.035 reader3 ctx-m8), so q2 suffices on 1447 too.
+- **Per-scan cost of a full unroll.** A whole-scroll unroll's wraps fill the papyrus, so its shell tends to the whole level 0 at q2:
+  - size about 2.8x the q8 L0 (inkeval/llsize.out): 1447 ~29 GB, 0139 ~24 GB, 0841 ~25 GB, 1203 ~22 GB, 0490B ~15 GB, 1451 ~11 GB,
+    0009B ~4 GB, 0172 ~71 GB; all 31 coarse scans ~0.73 TB;
+  - time, upper bound at the measured 74 Mvox/s over the shard boxes (air included): 1447 ~6.4 h, 0172 ~4.8 h, 0139 ~3.5 h, 0490B
+    ~2.8 h, 0009B ~2.2 h. It runs once per run; later r3pre calls only add new shards.
+  - A segment-scale ink pass costs ~0.07 GB and ~11 s per cm² (w058).
+- **Open:** shard boxes encode ~2.2x the chunks ink reads (bounding box per 1024^3 shard). Reading box by box in latvol (or 512^3 shards)
+  would cut the segment-scale time. Full-scan q2 mirrors only on request.
+
+Files: /vesuvius/ufsm/inkeval/{shellmeas.sh, shellmeas.out, shellab.sh, shellab.out, shab/rows.tsv}.
+
+## Upstream villa's ray-slab winding net vs our counts on the wbench boxes: KILLED; count-field --method ray loses 0.55 GT ids (2026-11-27, rayslab)
+
+Question (lead): port villa's ray-slab winding-count net (`neural_tracing/winding_models`)? It is aimed at packed-sheet undercounting.
+The design is in /vesuvius/ufsm/rayslab/design.md:
+- the input is one 128² x 384 slab at ~9.6 um, along the sheet normal;
+- the encoder halves only the transverse axes, and 6 axial blocks attend along the ray (L 384) and across the plane;
+- the phase is cumsum(softplus), so it cannot decrease along the ray;
+- the loss is shift-invariant;
+- training uses 0139, 1667 and Paris 4.
+
+The published metrics (`scrollprize/winding_model_9um`) are in-sample only (validation_mode train_batch): a count error of 0.22-0.34
+windings per 3.7 mm column. A port is ~3 weeks, so S0 was a one-day kill test first.
+
+**S0, a measurement only.** The published checkpoint ran in inference only, in a PyTorch env outside ufsm, on the CPU (6 threads), with
+bf16 autocast as in villa's own inference. Nothing upstream entered ufsm.
+- **Harness:** /vesuvius/ufsm/rayslab/s0 (prep.sh, rs0.py, summ.py; rows in res/).
+- **Segments** are fit-compare's turn-count segments: 0.5 mm radial segments in z planes, the reference being the label oracle's phase
+  unwrapped along the segment. They are reimplemented in rs0.py and checked against fit-compare on 500P2-1 / try9 at stride 4:
+
+| | segments | phase off | phase off, packed | density off |
+|---|---|---|---|---|
+| rs0.py | 462 | 0.242 | 0.667 | 0.314 |
+| fit-compare | 461 | 0.243 | 0.690 | 0.312 |
+
+- **Slabs** are drawn on segments, two thirds of them packed (mean label spacing < 100 um). The ray is the radial direction, and the
+  slab frame is villa's own (slab_frame). Every 0.5 mm window along the central column that passes the fit-compare tests is scored.
+- **Villa's count** = phase(end) - phase(start) on the 4 centre columns.
+- **Our counts** use the same windows: try9 (`bl-t9`, cooled 33333) and u1 (`u1-fd615-ho`), each by phase and by density.
+- **Out of sample** = 0500P2 and 0814, which villa never trained on. They are held-out boxes for our nets.
+
+**Results.** Share of windows off by >= 1/2 turn, with 95 % CIs from a bootstrap resampled by slab. The paired difference is villa
+minus the best of our four counts on the same windows.
+
+| group | class | windows (slabs) | villa | try9 phase | try9 density | u1 phase | u1 density | villa - best ours | median error: villa / try9 density / u1 density |
+|---|---|---|---|---|---|---|---|---|---|
+| OOS 0500P2-1 | packed | 73 (67) | 0.77 | 0.67 | **0.48** | 0.52 | 0.52 | **+0.29 [+0.14, +0.42]** | -0.87 / +0.48 / +0.50 |
+| OOS 0500P2-1 | other | 51 (45) | 0.39 | 0.25 | 0.33 | 0.27 | 0.47 | +0.14 [-0.02, +0.31] | -0.35 / +0.35 / +0.38 |
+| OOS 0814 (8 boxes) | other | 135 (104) | 0.57 | - | - | 0.38 | 0.91 | +0.19 [+0.10, +0.28] | +0.77 / - / +1.91 |
+| in-sample P4 PH1-3 | packed | 236 (69) | 0.46 | 0.91 | 0.45 | 0.93 | **0.36** | +0.09 [+0.00, +0.19] | -0.25 / -0.30 / +0.08 |
+| in-sample P4 PH1-3 | other | 147 (52) | 0.44 | 0.70 | 0.39 | 0.68 | 0.63 | +0.05 [-0.11, +0.20] | +0.16 / +0.29 / +0.57 |
+| in-sample P4 HOLD | packed | 23 (13) | 0.26 | 0.78 | 0.39 | 0.70 | 0.48 | -0.13 [-0.39, +0.15] | +0.14 / +0.05 / +0.37 |
+
+**Kill rule** (pre-registered): villa must be >= 10 points better than our counts on out-of-sample packed segments. It is 29 points
+**worse** than try9's density on 0500P2. It undercounts packed sheets there, with a median of -0.87 turn per 0.5 mm, which is exactly
+the failure it was meant to fix. 0814 has only 2 packed windows (the boxes' packed share is 0-5.5 %, and all 0814 boxes are
+label-noise), so the out-of-sample packed evidence is 0500P2 alone. The kill stands anyway: villa is also worse on 0814's unpacked
+windows (+0.19, CI above 0).
+
+On Paris 4, where it trained, villa only matches our density counts:
+- on PH1-3 packed, 0.46 against try9 density 0.45 and u1 density 0.36;
+- it is far better than either net's phase count (0.91-0.93);
+- on HOLD it is 0.26 against 0.39, with the CI spanning 0 (n 23).
+
+So the architecture's gain over a local density head is not visible even in-sample. **The port (S1-S4) is not started.**
+
+**Caveats.**
+- Villa's input is our volcomp CT: q 8 at level 0 for 0814 / 0500P2 (9.362 um, 113 keV scans), and level 2 for Paris 4.
+- The ray is radial, not the sheet normal it trained along (+-3 deg).
+- Its output depends on the slab's orientation. On 4 packed 0500P2 segments, flipping H / W moved the count by 0.04-0.18 turn, and
+  swapping H and W moved it by up to 0.27. Rays at tens of degrees from the normal would add more. Neither effect is a 29-point one.
+
+**Side check: count-field --method ray vs ls**, the per-ray counting the design would have fed. This used the unroll's ref recipe
+(`--R 0 --pool 8 --phase-w 0.5 --wide 100,140 --wide-phase 15 --model-only 1 --iters 1200 --dir -1`) on try9's kept wbench fields of
+the 54 clean 1667 boxes. Each box was solved alone, then GT-scored with gtboxes.sh on the CPU. Script:
+/vesuvius/ufsm/rayslab/s0/cfray2.sh; rows in cf2/score.txt. The whole-band r3 fields of the 11-18 1667 run no longer hold their
+arrays, hence the per-box solves.
+- Voxel-weighted ids right: **ls 0.874, ray 0.329**.
+- ray is worse on all 54 boxes.
+- `--method ray` stays a tool, not a candidate.
+
+## 1667 comparison unrolls: robust (L1) count-field +0.010 GT ids, made the unroll default; fz-phbm fusion −0.033 (2026-11-27, unroll)
+
+Question (lead, for the user): what do the new ideas change in a real unroll, scored on GT? Same region and downstream steps for each
+arm, only the named input differs.
+
+**Setup:**
+- Region: PHerc1667 level-2 box z 6656..8320 × the whole section (16 mm of scroll), unrolled by scripts/unroll/unroll.sh at master
+  cf536c92 (NOINK, CLEAN=0). Pipeline: rectosp, MFREF, ref, slabs, join, check, wraps, snap, strip.
+- Scoring: the 16 wbench C boxes fully inside the region (cmp/gtboxes-z6656.tsv), GT ids of the joined model.
+  - Packed: C20, C21, C22.
+  - Label-noise: C1, C20, C67, C69.
+- Bootstrap: paired over boxes (voxel-weighted, 20000 resamples), unrollrun/sh/cmpboot.sh. Runs are in /vesuvius/ufsm/unrollrun/cmp/PHerc1667-{A,B,C}.
+
+**Arms:**
+- A: try9cool cooled-33333 fields (production).
+- B: fz-phbm. `field-blend` of A's fields with w24 snap/6000 fields (level 0, h 8, window 640 halo 64): `--weights 1,0 --plane-w
+  phase=1,1 --conf mean` (condnet's recipe).
+- C: A's fields, ref with `count-field --cf-robust 8 --cf-robust-delta 0.02` (globwind ef7cf27c, GPU solve).
+
+| arm | ids joined, 16 boxes | 12 clean | 3 packed | ids ref-cf | wraps |
+|---|---|---|---|---|---|
+| A try9 | 0.8193 | 0.8937 | 0.6921 | 0.7980 | 45 |
+| B fz-phbm | 0.7860 | 0.8518 | 0.6939 | 0.7630 | 45 |
+| C cf-robust | **0.8293** | **0.9049** | **0.6962** | **0.8133** | 44 |
+
+Paired differences against A (joined ids):
+
+| diff | set | mean | 95 % CI | boxes better |
+|---|---|---|---|---|
+| C − A | all | +0.0100 | [+0.0041, +0.0176] | 14 / 16 |
+| C − A | clean | +0.0112 | [+0.0038, +0.0207] | 11 / 12 |
+| C − A | packed | +0.0040 | [+0.0016, +0.0064] | 3 / 3 |
+| B − A | all | −0.0333 | [−0.0813, +0.0001] | 5 / 16 |
+| B − A | clean | −0.0419 | [−0.1031, +0.0022] | 4 / 12 |
+| B − A | packed | +0.0017 | [−0.0104, +0.0168] | 1 / 3 |
+
+**What the numbers show:**
+- C helps nearly everywhere and hurts nowhere by more than 0.002 (C67 0.728 -> 0.726). The largest gains are C62 +0.052, C70 +0.025
+  and C30 +0.023. The ref-cf itself gains +0.015.
+- B's loss is three open boxes: C28 0.931 -> 0.640, C58 0.903 -> 0.815 and C62 0.904 -> 0.864. The packed ones are flat (C22 +0.017,
+  C21 −0.002).
+- So the wbench per-box fusion gain on packed boxes does not carry into a region unroll at w24 6000. The blended phase seems to break
+  the count in some open stretches; this was not traced.
+
+Caveats: one region of one scroll, 16 boxes that are spatially correlated, so the CI understates the between-region variance.
+
+Decision (lead's rule: adopt if the CI excludes 0):
+- `--cf-robust 8 --cf-robust-delta 0.02` is the unroll ref's default: `CFROBUST` in scripts/unroll/unroll.sh refpool;
+  `CFROBUST=` gives the old L2 ref. Test: tests/test_unroll_cfrobust.sh.
+- fz-phbm is not adopted for unrolls.
+
 ## ATLAS-15k as extra labels: import, inventory, CPU quality audit; 58 % of its area passes a gate (2026-11-27, branch atlas-20261127, atlas)
 
 **Dataset.** huggingface.co/datasets/Qualzz20/ATLAS-15k (rev ac4b982a, CC BY-NC 4.0): 14,678 recto patches on 28 scrolls, 2,306 cm².
@@ -827,6 +1091,28 @@ and R1 last. E0 / S2 / E2D2 stay within .006 of each other. The 50 um band lifts
 
 Files: /vesuvius/ufsm/inkeval/{prep.sh (rows), table.sh, band.sh, leaks.tsv, table*.out, strat*.tsv, rows/}.
 
+**Addendum (11-27 afternoon): lossless vs volcomp q8 CT per scroll.** No new predicts. The rows are pullct's dev A/B (ab2d / ab2e: reader3
+ctx r8 median; E0-avg vox) and inksdk's PICKS3 amendment 1 (1447 / 0841), paired by crop with ink-strat (inkeval/ll.sh, ll-*.out).
+B − A ± SE (crops up / n):
+
+| scroll (read) | reader3 lossless − q8 | E0 lossless − q8 |
+|---|---|---|
+| 1447 (8.64 um L0) | **+.035 ± .009** (25/28) | E2D2-t8: **+.027 ± .008** (24/28) |
+| 0139 (9.36 um L0) | +.013 ± .003 (23/40) | +.001 ± .012 |
+| 0009B h116 (8.64 um L0) | +.010 ± .003 (41/48) | +.021 ± .006 |
+| 0343 (8.64 um L0) | +.002 ± .002 (ceiling .998) | +.030 ± .025 |
+| 0172 (7.91 um, 53 keV, L0) | −.002 ± .004 | +.015 ± .008 |
+| 0841 (2.403 um read at L2) | −.000 ± .003 | E2D2-t8: +.002 ± .004 |
+| HOLD 1667 / P4 (R1 at L2 of 1.129 um) | −.000 ± .009 / +.009 ± .006 (pullct ab3, ink-audit pairs) | |
+
+- **The gain is real on 1.2 m coarse scans read at native L0** (1447, 0139, 0009B).
+- **It is nil where the read is pooled.** The mirror is q 8 / 4 / 2 / 1 by level, so an L2 read is already q2.
+- **q2 is enough.** pullct's dev mean4: q8 → q2 +.0054 ± .0013, then q2 → lossless +.0004 ± .0004.
+- **Cost of the coarse L0 levels** (31 scans, 34.2 Tvox; the q8 mirror's L0 is 260 GB = .0076 B/vox):
+  - q2 ≈ 2.8x q8 ≈ 0.73 TB; lossless ≈ 19-23x ≈ 5-6 TB (pullct rate: material boxes .031 B/vox at q8, .086 at q2, .61-.79 at q0);
+  - built from S3 at the measured ~55 Mvox/s (65 s per 3.6 Gvox): about 1 week single-stream for all L0, or ~6 h per scan;
+  - a surface shell (pullct's context boxes: all 147 dev crops in 33 GB lossless) scales with the inked area, not with the scan.
+
 ## ufsm umbilicus: the umbilicus by sheet-normal voting, a villa vc_gen_umbilicus port (2026-11-27, branch axisfind-20261127, axisfind)
 
 `ufsm umbilicus OUT.json --um0 UM (--ct-root R --ct-key K --level L | --fields DIR)` (src/umbfind.c) ports villa's
@@ -888,6 +1174,55 @@ Per-z distance from the reference, mm (median / p90 / max; CPU, 6 threads, 1-3 m
   - The merges 26fd525 (jitpin), 7989bd1 (csetdev), 086574d (f4pdev), ce9ba2f (mvexit) and 92ce831 (mvpin).
   - Their PTX differs from the pin in 117 of the 132 units (every lp_*, most nn_*).
   - 285d308 itself has been in the pin since before 01873d0 (an ancestor). Only the note asking for its review is outside.
+
+## Semi-automatic labels for the disagreement worklist: sheet continuity only agrees with try9 (negative; 2026-11-27, branch disagree2-20261127, disagree)
+
+User plan (lead): label the 474 worklist regions from evidence other than the two disagreeing models, validate on GT first, and gate at accuracy >= 0.9.
+
+**Evidence available on 1667.**
+- Hand segments / wraps: none in the worklist regions. They are the GT, and the worklist excludes GT tiles.
+- ATLAS: has no 1667 patches (atlas kept/: 0306B, 0800, others).
+- Fit ref-snap count: not built.
+- That leaves sheet continuity.
+
+**`ufsm field-label OUT A B [--gt ORACLE]`** (src/fielddis.c), on A's cells:
+- Agreeing cells (|dphi| <= 0.1) give a consensus phase.
+- For a disagreement cell (|dphi| > 0.25), the consensus is sampled on its tangent plane: A's normal, radii 2-8 cells, 12 angles. Their circular mean E picks the model nearer arg E (error <= 0.2, margin >= 0.1, >= 8 samples, R >= 0.3); otherwise it abstains.
+- conf = R x margin / 0.5 x the sample share.
+- `field-label-raster` writes the labels of many boxes as one 9.6 um phase raster over listed regions (255 = unknown, i.e. the mask), for a sources "phase" target.
+- test_fielddis covers both, including a B-correct case with the grids swapped.
+
+**GT check** (the 20 wbench boxes, try9 = A, w24 snap 2000 = B; GT hidden from the labeller; a label is correct if within 0.25 turn of GT):
+
+| conf cut | disagreement cells labelled | accuracy | always try9 on the same cells | agree-cell labels: accuracy |
+|---|---|---|---|---|
+| 0.0 | 10.9 % | 0.893 | 0.894 | 0.952 (all) |
+| 0.2 | 7.0 % | 0.909 | 0.908 | 0.952 |
+| 0.3 | 2.9 % | 0.916 | 0.915 | 0.967 |
+| 0.4 | 1.0 % | 0.920 | 0.919 | 0.974 |
+
+Pooled over the 9.29 M disagreement cells: always try9 is right on 0.855, either model on 0.956.
+
+**Result.** Continuity adds nothing over trusting try9:
+- It picks try9 976k times and w24 40k times, and the w24 picks are right 59 %.
+- Of the 939k cells where try9 is wrong and w24 right, it picks w24 on 1.3 %.
+- The neighbouring agreeing cells carry try9's phase, so the tangent-plane estimate reproduces try9.
+- Wider rings (radius 4-16, 16 angles) label ~50 % of the cells, at accuracy 0.79-0.88, again ≈ always try9.
+
+The formal gate passes at cut 0.2 (0.909 on 7 % of the cells), but those labels would be try9's own phase, i.e. pseudo-labels with no new information. So the worklist was not labelled; that is the lead's call.
+
+The agree-cell labels (0.952, 0.98 at weight >= 0.5) are plain committee pseudo-labels. They label where the models already agree, not the disagreement regions.
+
+**Fibre continuity** (lead follow-up; `field-label --fibres H.fib,V.fib --fib-um 2.399`): each fibre polyline's agreeing cells (at least 3) vote for the disagreement cells on it, since a sheet's phase is constant along a fibre. Input: our 1667 traces, fibtrace/p1667 arm A, ungated (arm B is gated by a winding fit, which is not independent). They cover two of the GT boxes:
+
+| box | disagreement cells labelled | accuracy | always try9 (all) | w24 picked where it is right and try9 wrong |
+|---|---|---|---|---|
+| C12 | 0.7 % | 0.611 | 0.890 | 275 of 45.6k |
+| C2 | 1.0 % | 0.441 | 0.756 | 628 of 114k |
+
+This is worse than trusting try9, and the coverage is ~1 %. The traced fibres do not hold one sheet's phase across the disagreement (cf. the tracer ties that hurt count-field, -0.03). Stopped there (lead: <= 1 h).
+
+What would add information on 1667: human traces in the worklist regions (sparse, with a partial-label loss), or evidence the nets do not share, e.g. a fitter ref-snap count. Rows: /vesuvius/ufsm/disagree/labgt/base (labgt.sh, labsumm.awk).
 
 ## Model disagreement as a labelling query: `ufsm field-disagree`, checked against the GT; a labelling worklist (2026-11-27, branch disagree-20261127, disagree)
 

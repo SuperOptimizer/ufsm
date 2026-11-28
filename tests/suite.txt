@@ -47,6 +47,7 @@ test_slot_planes                               | gpu          |    30 | tests/te
 test_idle_release                              |              |     8 | tests/test_idle_release.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/idlerel
 test_scan_norm                                 | gpu          |    14 | tests/test_scan_norm.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/scannorm
 test_predict_guard                             | gpu          |    20 | tests/test_predict_guard.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predguard
+test_predict_shell                             | gpu          |    30 | tests/test_predict_shell.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predshell
 test_parity                                    | gpu          |    30 | tests/test_parity.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/parity
 test_parity~latdec                             | gpu          |    30 | UFSM_LATDEC_TEST_W2=2 tests/test_parity.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/parity_latdec "--lat-dec 32"
 test_predict_heads~part0of3                   | gpu          |    25 | UFSM_TEST_PART=0/3 tests/test_predict_heads.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/predheads
@@ -289,6 +290,7 @@ test_ink_ext_surfum                            |              |     2 | python3 
 test_ink_devcrops                              |              |     2 | python3 tests/test_ink_devcrops.py
 test_ink_fuse                                  |              |     2 | python3 tests/test_ink_fuse.py
 test_ink_band                                  |              |     2 | python3 tests/test_ink_band.py
+test_ink_shell                                 |              |     5 | python3 tests/test_ink_shell.py
 test_ink_strat                                 |              |     2 | python3 tests/test_ink_strat.py
 test_ink_runs                                  |              |     2 | python3 tests/test_ink_runs.py
 test_dvprobe                                   |              |     3 | ./$B/test_dvprobe
@@ -479,6 +481,7 @@ test_retain                                    |              |     1 | bash tes
 test_evwatch                                   |              |     1 | bash tests/test_evwatch.sh
 test_podscripts                                |              |     1 | bash tests/test_podscripts.sh
 test_unroll_cards                              |              |     1 | bash tests/test_unroll_cards.sh
+test_unroll_cfrobust                           |              |     1 | bash tests/test_unroll_cfrobust.sh
 test_split_ab                                  | gpu2,slow    |   150 | tests/test_split_ab.sh ./$B/ufsm ./$B/make_wind_fixture $TMPDIR/splitab
 test_wbench_gpulock                            |              |     1 | tests/test_wbench_gpulock.sh
 test_wbench_fail                               |              |     2 | tests/test_wbench_fail.sh
