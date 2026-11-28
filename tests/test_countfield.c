@@ -175,7 +175,7 @@ static void defaulted_dir(const char *dir) {
    everywhere. Least squares spreads the lens' missing / extra turns over the sector beyond it; the L1 (IRLS) edges carry the count
    around the lens. Returns the share of sector cells beyond the lens (r rb + 2 .. 44 cells, theta 0.4..1.2) whose W is > 0.5 turn
    off (gauge from the defect-free lower half); *inside: the same inside the lens */
-static double lens_err(const char *dir, const char *tag, double fac, double ra, double rb, const char *rk, double *inside) {
+static double lens_err(const char *dir, const char *tag, double fac, double ra, double rb, const char *rk, int cut, double *inside) {
     const size_t n = (size_t)D * H * W; uint8_t *a[10]; for (int k = 0; k < 10; k++) a[k] = calloc(n, 1);
     for (int z = 0; z < D; z++) for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
         const size_t i = ((size_t)z * H + y) * W + x; const double py = (y + 0.5) * h, px = (x + 0.5) * h, ry = py - cy0, rx = px - cx0, r = hypot(ry, rx);
@@ -188,11 +188,11 @@ static double lens_err(const char *dir, const char *tag, double fac, double ra, 
     }
     const int na = D * h + 1; float cy[D * h + 1], cx[D * h + 1]; for (int k = 0; k < na; k++) { cy[k] = (float)cy0; cx[k] = (float)cx0; }
     const long long org[3] = {0, 0, 0}; const int shp[3] = {D, H, W};
-    char in[600], o[700], pth[800]; snprintf(in, sizeof in, "%s/in_lens_%s", dir, tag); snprintf(o, sizeof o, "%s/out_lens_%s_%s", dir, tag, rk);
+    char in[600], o[700], pth[800]; snprintf(in, sizeof in, "%s/in_lens_%s", dir, tag); snprintf(o, sizeof o, "%s/out_lens_%s_%s%s", dir, tag, rk, cut ? "c" : "");
     CHECK(!fit_fields_save(in, org, shp, h, 9.6, a, cy, cx, na), "save the lens fields");
     for (int k = 0; k < 10; k++) free(a[k]);
-    char *av[] = {"ufsm", "count-field", in, o, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", "--cf-robust", (char *)rk, nullptr};
-    CHECK(cmd_count_field(18, av) == 0, "count-field (lens %s, --cf-robust %s) failed", tag, rk);
+    char *av[] = {"ufsm", "count-field", in, o, "--R", "0", "--dir", "1", "--pool", "1", "--threads", "4", "--rmin-um", "0", "--cf-gpu", "0", "--cf-robust", (char *)rk, "--cf-cut", cut ? "1" : "0", nullptr};
+    CHECK(cmd_count_field(20, av) == 0, "count-field (lens %s, --cf-robust %s) failed", tag, rk);
     snprintf(pth, sizeof pth, "%s/wc.f32", o); size_t nw = 0; float *w3 = read_f32(pth, &nw);
     if (!w3 || nw != n) { CHECK(0, "no wc.f32 (lens %s)", tag); free(w3); *inside = 1; return 1; }
     double gs = 0; int gc = 0, ne = 0, nb = 0, ni = 0, nbi = 0;
@@ -214,9 +214,10 @@ static double lens_err(const char *dir, const char *tag, double fac, double ra, 
 static void robust_lens(const char *dir) {
     static const struct { const char *tag; double fac, ra, rb; } L[] = {{"merge4", 4, 16, 28}, {"merge2", 2, 16, 28}, {"extra", 0.5, 16, 28}, {"miss1", 2, 20, 28}};
     for (int c = 0; c < 4; c++) {
-        double i0, i1; const double e0 = lens_err(dir, L[c].tag, L[c].fac, L[c].ra, L[c].rb, "0", &i0), e1 = lens_err(dir, L[c].tag, L[c].fac, L[c].ra, L[c].rb, "8", &i1);
-        printf("test_countfield: lens %-6s (sp x %.2g, r %.0f..%.0f cells): W off > 0.5 turn beyond the lens: L2 %.3f, --cf-robust 8 %.3f; inside %.3f / %.3f\n",
-               L[c].tag, L[c].fac, L[c].ra, L[c].rb, e0, e1, i0, i1);
+        double i0, i1, i2; const double e0 = lens_err(dir, L[c].tag, L[c].fac, L[c].ra, L[c].rb, "0", 0, &i0), e1 = lens_err(dir, L[c].tag, L[c].fac, L[c].ra, L[c].rb, "8", 0, &i1);
+        const double e2 = lens_err(dir, L[c].tag, L[c].fac, L[c].ra, L[c].rb, "8", 1, &i2);
+        printf("test_countfield: lens %-6s (sp x %.2g, r %.0f..%.0f cells): W off > 0.5 turn beyond the lens: L2 %.3f, --cf-robust 8 %.3f, + --cf-cut %.3f; inside %.3f / %.3f / %.3f\n",
+               L[c].tag, L[c].fac, L[c].ra, L[c].rb, e0, e1, e2, i0, i1, i2);
         CHECK(e1 < 0.05, "lens %s: --cf-robust leaves %.3f of the cells beyond the lens > 0.5 turn off (L2 %.3f)", L[c].tag, e1, e0);
         if (c == 0 || c == 2) CHECK(e0 > 0.5, "lens %s: the defect should break L2 beyond the lens (%.3f off)", L[c].tag, e0);
     }

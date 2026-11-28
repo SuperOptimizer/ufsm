@@ -32,6 +32,7 @@
 #define CFGPU_WEAK __attribute__((weak))   /* src/nn_cf.cu: a binary without it runs the CPU code */
 #include "cfgpu.h"
 #include "afv.h"
+#include "l1pot.h"
 #include <limits.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
@@ -265,6 +266,80 @@ static void cf_rob_run(void *a, long z0, long z1, int t) {
         }
     }
     R->bad[t] = bad; R->wsum[t] = ws;
+}
+/* --cf-cut 1 (globwind 2026-11-27, research/graph.md idea 1): a layered min-cut over the solve grid with ordering / spacing arcs.
+   Unknowns: an integer turn shift s per solve cell on top of the solved U (U' = U + s). Energy (convex, piecewise linear in the
+   differences s_b - s_a, so the PUMA graph-cut moves of src/l1pot reach its exact minimum, as an Ishikawa layered cut would):
+   - smoothness: every grid edge votes s_b - s_a = 0 with its count weight (keep the solved shape);
+   - spacing arcs: from cell a, the cell b at D solve cells along its outward sheet normal must lie at least D / (f sp_lo) turns
+     outward, with sp_lo the median over +-2 blocks (B cells each) of the blocks' q-quantile spacing. A merged patch's
+     spacing reads ~1.4-1.75x too wide (pseudolab 11-18), so a count below the neighbourhood's spacing prior is lifted there, by an
+     integer jump placed where the cut is cheapest. One-sided (a lower bound: merges hide sheets, the nets add almost none). */
+typedef struct { const cf_lvl *L; const float *S, *G[3]; const float *splo; int B, nbz, nby, nbx, D, sub; double f, wsp, K, eps; l1_vote *v[CF_MAXT]; size_t nv[CF_MAXT], cv[CF_MAXT], nlift[CF_MAXT]; } cf_cut;
+static void cf_cut_push(cf_cut *C, int t, uint32_t a, uint32_t b, int32_t d, int64_t w, int64_t wn) {
+    if (C->nv[t] == C->cv[t]) { C->cv[t] = C->cv[t] ? 2 * C->cv[t] : 65536; C->v[t] = realloc(C->v[t], C->cv[t] * sizeof(l1_vote)); if (!C->v[t]) abort(); }
+    C->v[t][C->nv[t]++] = (l1_vote){a, b, d, w, wn};
+}
+static double cf_cut_sp(const cf_cut *C, size_t i) {   /* sheet spacing at a solve cell (solve cells per turn; 0: no data) */
+    const double s = C->S[i]; if (!(s > 0)) return 0;
+    const double gz = C->G[0][i] / s, gy = C->G[1][i] / s, gx = C->G[2][i] / s, rho = sqrt(gz * gz + gy * gy + gx * gx) * C->L->P;
+    return rho > 1e-6 ? 1 / rho : 0;
+}
+static void cf_cut_run(void *a, long z0, long z1, int t) {
+    cf_cut *C = a; const cf_lvl *L = C->L; const size_t st[3] = {(size_t)L->hh * L->w, (size_t)L->w, 1}; const int dm[3] = {L->d, L->hh, L->w};
+    for (long z = z0; z < z1; z++) for (int y = 0; y < L->hh; y++) for (int x = 0; x < L->w; x++) {
+        const size_t i = ((size_t)z * L->hh + y) * L->w + x; const int c0[3] = {(int)z, y, x};
+        for (int ax = 0; ax < 3; ax++) if (c0[ax] + 1 < dm[ax]) {
+            const int64_t w = (int64_t)llround(C->K * L->wt[ax][i]); if (w >= 1) cf_cut_push(C, t, (uint32_t)i, (uint32_t)(i + st[ax]), 0, w, w);
+        }
+        if ((z % C->sub) || (y % C->sub) || (x % C->sub) || !(C->S[i] > 0)) continue;
+        const float sl = C->splo[((size_t)(z / C->B) * C->nby + y / C->B) * C->nbx + x / C->B]; if (!(sl > 0)) continue;
+        const double s = C->S[i], gz = C->G[0][i] / s, gy = C->G[1][i] / s, gx = C->G[2][i] / s, gl = sqrt(gz * gz + gy * gy + gx * gx); if (gl < 1e-9) continue;
+        const int bz = (int)lround(z + C->D * gz / gl), by = (int)lround(y + C->D * gy / gl), bx = (int)lround(x + C->D * gx / gl);
+        if (bz < 0 || by < 0 || bx < 0 || bz >= L->d || by >= L->hh || bx >= L->w) continue;
+        const size_t j = ((size_t)bz * L->hh + by) * L->w + bx; if (!(C->S[j] > 0)) continue;
+        const double dist = sqrt((double)(bz - z) * (bz - z) + (double)(by - y) * (by - y) + (double)(bx - x) * (bx - x));
+        const double need = dist / (C->f * sl) - (L->U[j] - L->U[i]); if (need < 0.5) continue;
+        const int64_t wn = (int64_t)llround(C->wsp * C->K * fmin(1, s / ((double)L->P * L->P * L->P))); if (wn < 1) continue;
+        cf_cut_push(C, t, (uint32_t)i, (uint32_t)j, (int32_t)lround(need), 1, wn); C->nlift[t]++;
+    }
+}
+static int cf_cut_solve(cf_lvl *L, const float *S, float *const G[3], int D, int B, double q, double f, double wsp, int sub) {
+    const double t0 = cf_now(); cf_cut C = {L, S, {G[0], G[1], G[2]}, nullptr, B, (L->d + B - 1) / B, (L->hh + B - 1) / B, (L->w + B - 1) / B, D, sub, f, wsp, 1000, 0, {0}, {0}, {0}, {0}};
+    const size_t nb = (size_t)C.nbz * C.nby * C.nbx; float *med = calloc(nb, sizeof(float)), *splo = calloc(nb, sizeof(float)); if (!med || !splo) return -1;
+    /* per block: the q-quantile of its cells' spacing, then the min over the +-1 block neighbourhood of those (the local spacing prior) */
+    float *buf = malloc((size_t)B * B * B * sizeof(float)); double ssum = 0; size_t sn = 0;
+    for (int Z = 0; Z < C.nbz; Z++) for (int Y = 0; Y < C.nby; Y++) for (int X = 0; X < C.nbx; X++) {
+        int n = 0;
+        for (int z = Z * B; z < (Z + 1) * B && z < L->d; z++) for (int y = Y * B; y < (Y + 1) * B && y < L->hh; y++) for (int x = X * B; x < (X + 1) * B && x < L->w; x++) {
+            const double sp = cf_cut_sp(&C, ((size_t)z * L->hh + y) * L->w + x); if (sp > 0) buf[n++] = (float)sp; }
+        if (n < B * B) continue;   /* too little data for a prior */
+        qsort(buf, n, sizeof(float), cf_cmpf); med[((size_t)Z * C.nby + Y) * C.nbx + X] = buf[(int)(q * (n - 1))]; ssum += buf[n / 2]; sn++;
+    }
+    free(buf);
+    const int Rb = 2; float nbv[(2 * 2 + 1) * (2 * 2 + 1) * (2 * 2 + 1)];
+    for (int Z = 0; Z < C.nbz; Z++) for (int Y = 0; Y < C.nby; Y++) for (int X = 0; X < C.nbx; X++) {
+        int n = 0;
+        for (int a = Z - Rb; a <= Z + Rb; a++) for (int b = Y - Rb; b <= Y + Rb; b++) for (int c = X - Rb; c <= X + Rb; c++) {
+            if (a < 0 || b < 0 || c < 0 || a >= C.nbz || b >= C.nby || c >= C.nbx) continue;
+            const float v = med[((size_t)a * C.nby + b) * C.nbx + c]; if (v > 0) nbv[n++] = v; }
+        if (n) qsort(nbv, n, sizeof(float), cf_cmpf);
+        splo[((size_t)Z * C.nby + Y) * C.nbx + X] = n ? nbv[n / 2] : 0;   /* the median over +-2 blocks: a defect patch smaller than half of it cannot set its own prior */
+    }
+    free(med); C.splo = splo;
+    if (D <= 0) D = C.D = (int)lround(3 * (sn ? ssum / sn : 8));   /* default: ~3 median turns along the normal */
+    cf_par(L->d, cf_cut_run, &C);
+    size_t nv = 0, nl = 0; for (int t = 0; t < CF_MAXT; t++) { nv += C.nv[t]; nl += C.nlift[t]; }
+    l1_vote *V = malloc((nv + 1) * sizeof *V); if (!V) return -1; size_t o = 0;
+    for (int t = 0; t < CF_MAXT; t++) { if (C.nv[t]) memcpy(V + o, C.v[t], C.nv[t] * sizeof *V); o += C.nv[t]; free(C.v[t]); }
+    nv = l1_votes_merge(V, nv);
+    int32_t *s = calloc(L->n, sizeof *s); l1_stats stt = {0}; if (!s) return -1;
+    const int rc = l1_solve((uint32_t)L->n, V, nv, s, 64, &stt);
+    size_t nmov = 0; long smin = 0, smax = 0;
+    if (!rc) for (size_t i = 0; i < L->n; i++) { if (s[i]) { nmov++; L->U[i] += (float)s[i]; } if (s[i] < smin) smin = s[i]; if (s[i] > smax) smax = s[i]; }
+    fprintf(stderr, "count-field: --cf-cut: D %d solve cells, spacing prior q %.2f x f %.2f (blocks %d), %zu lift arcs, %zu votes; L1 energy %lld -> %lld in %d moves%s; %zu of %zu cells shifted (%ld..%+ld turns), %.1f s\n",
+            C.D, q, f, B, nl, nv, (long long)stt.e0, (long long)stt.e1, stt.moves, stt.capped ? " (work budget)" : "", nmov, L->n, smin, smax, cf_now() - t0);
+    free(s); free(V); free(splo); return rc;
 }
 typedef struct { cf_pairs *R; const float *u; } cf_pq;
 static void cf_pairs_q_run(void *a, long p0, long p1, int t_) {
@@ -1108,6 +1183,11 @@ int cmd_count_field(int argc, char **argv) {
     }
     fprintf(stderr, "count-field: solve %.0f s\n", cf_now() - tst1);
     cf_lvl *L = &lv[0];
+    if (opt_atoi("--cf-cut", cf_opt(argc, argv, "--cf-cut", "0")) && !spiral && strcmp(meth, "ray")) {   /* the layered min-cut on top of the solve (cf_cut_solve) */
+        if (cf_cut_solve(L, Sfine, Gfine, opt_atoi("--cf-cut-d", cf_opt(argc, argv, "--cf-cut-d", "0")), opt_atoi("--cf-cut-b", cf_opt(argc, argv, "--cf-cut-b", "8")),
+                         opt_atof("--cf-cut-q", cf_opt(argc, argv, "--cf-cut-q", "0.25")), opt_atof("--cf-cut-f", cf_opt(argc, argv, "--cf-cut-f", "1.25")),
+                         opt_atof("--cf-cut-w", cf_opt(argc, argv, "--cf-cut-w", "4")), opt_atoi("--cf-cut-sub", cf_opt(argc, argv, "--cf-cut-sub", "2")))) { fprintf(stderr, "count-field: --cf-cut failed (memory)\n"); return 1; }
+    }
     if (spiral) {   /* the villa spiral model fitted to the level-0 targets, anchored to U (src/nn_spiral.cu); U <- its U' */
         const double cn = (double)P * P * P, rmin = rmin_um / g.um; size_t nd = 0;
         for (size_t i = 0; i < L->n; i++) if (Sfine[i] > 0) nd++;
